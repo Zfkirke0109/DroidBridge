@@ -83,12 +83,13 @@ pub mod process {
         let canonical_base = PathBuf::from("/data/user_de/0")
             .join(package)
             .join("files/droidbridge");
-        // The daemon's stderr outlives the process that wrote it: it is the only record of a panic,
-        // which the fault store reports as an exit code alone. The log lives in the App's canonical
-        // base, which the App alone creates, so stderr is kept only once that base exists.
-        let log_directory = canonical_base.is_dir().then(|| canonical_base.join("logs"));
         let mut backoff = RestartBackoff::default();
         loop {
+            // The daemon's stderr outlives the process that wrote it: it is the only record of a
+            // panic, which the fault store reports as an exit code alone. The log lives in the App's
+            // canonical base, which the App alone creates, so stderr is kept once that base exists,
+            // checked again for every start because the App may create it after boot.
+            let log_directory = canonical_base.is_dir().then(|| canonical_base.join("logs"));
             let started = Instant::now();
             let mut command = Command::new(&daemon);
             command

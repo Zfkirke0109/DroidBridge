@@ -88,7 +88,8 @@ App 内的 **执行环境与权限** 页会逐项引导：每一项都有直达�
 
 1. 在 [OpenAI 平台](https://platform.openai.com/settings/organization/tunnels) 创建安全隧道，并创建一个可使用该隧道的 [API Key](https://platform.openai.com/api-keys)。
 2. 在卓爱桥打开 **智能体连接 → ChatGPT 连接**，粘贴 Tunnel ID 和 Key，打开隧道。Key 由 Android Keystore 加密保存，之后不再显示。
-3. 在电脑浏览器打开 ChatGPT 设置，开启开发者模式，新建连接器，连接方式选择 **Tunnel** 并选中你的隧道。App 页面上有这两个页面的直达按钮。
+3. 在电脑浏览器打开 [ChatGPT 安全设置](https://chatgpt.com/settings/security)，开启 **开发者模式**（对 Plus 账号仍在灰度测试）。
+   再在 [ChatGPT 插件页](https://chatgpt.com/plugins) 点 **添加 → 创建 MCP 应用**，用你的隧道连接，认证选 **无**。App 页面上有这两个页面的链接。
 4. 让 ChatGPT 使用卓爱桥，第一次调用会显示在 App 里。
 
 ## 连接本地智能体

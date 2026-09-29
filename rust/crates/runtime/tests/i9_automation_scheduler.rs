@@ -488,6 +488,8 @@ async fn i9_g08_busy_event_arrivals_are_dropped_not_queued() {
 struct RecordingProjection {
     arms: Mutex<Vec<Option<AutomationWakeDue>>>,
     fired: Notify,
+    /// Arms that fail before the projection starts accepting them, as a host timer can.
+    failing_arms: AtomicU64,
 }
 
 impl RecordingProjection {
@@ -512,6 +514,18 @@ impl RecordingProjection {
 
 impl AutomationWakeProjection for RecordingProjection {
     fn arm(&self, due: Option<&AutomationWakeDue>) -> Result<bool, DomainError> {
+        if self
+            .failing_arms
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(DomainError::new(
+                ErrorCode::IoError,
+                "wake alarm timer arm failed",
+            ));
+        }
         if let Some(due) = due {
             assert_eq!(
                 due.unix_millis,
@@ -605,6 +619,45 @@ fn completed_executions(persistence: &FakePersistence) -> usize {
         .iter()
         .filter(|execution| execution.summary.state == AutomationExecutionState::Completed)
         .count()
+}
+
+#[tokio::test]
+async fn a_failed_pass_is_reported_and_the_scheduler_keeps_serving_dues() {
+    let (core, persistence) = make_core();
+    save(
+        &core,
+        1,
+        "minutely",
+        true,
+        json!({"type": "interval", "every_ms": 60_000}),
+    )
+    .await;
+    let clock = ManualClock::at(&at_minutes(0));
+    let reported = Arc::new(Mutex::new(Vec::<ErrorCode>::new()));
+    let sink = Arc::clone(&reported);
+    let scheduler = Arc::new(
+        AutomationScheduler::new(core.clone(), Arc::clone(&clock)).reporting_faults(Arc::new(
+            move |error: &DomainError| sink.lock().unwrap().push(error.code),
+        )),
+    );
+    let projection = Arc::new(RecordingProjection::default());
+    projection.failing_arms.store(1, Ordering::SeqCst);
+    let loop_task = run_scheduler(&scheduler, &projection);
+
+    // The first arm fails like a host timer can; the loop reports it and arms again.
+    eventually("the retried arm", || {
+        projection.last_arm() == Some(Some(at_minutes(1)))
+    })
+    .await;
+    assert_eq!(*reported.lock().unwrap(), vec![ErrorCode::IoError]);
+
+    clock.set(&at_minutes(1));
+    projection.fire();
+    eventually("the due served after the failure", || {
+        completed_executions(&persistence) == 1
+    })
+    .await;
+    loop_task.abort();
 }
 
 #[tokio::test]

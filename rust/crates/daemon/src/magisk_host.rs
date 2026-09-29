@@ -902,7 +902,15 @@ fn spawn_automation_scheduler(
     wake_alarm_ready: bool,
     fault: Arc<StdMutex<Option<DomainError>>>,
 ) {
-    let scheduler = AutomationScheduler::new(core, Arc::new(BoottimeClock));
+    // A failed pass is retried by the loop itself; the supervisor keeps this stderr line.
+    let scheduler = AutomationScheduler::new(core, Arc::new(BoottimeClock)).reporting_faults(
+        Arc::new(|error: &DomainError| {
+            eprintln!(
+                "droidbridged: automation scheduler pass failed: {:?} {}",
+                error.code, error.reason
+            );
+        }),
+    );
     async_runtime.spawn(async move {
         let ended = async {
             scheduler.publish_runtime_ready().await?;

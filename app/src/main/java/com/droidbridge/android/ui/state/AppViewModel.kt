@@ -4,6 +4,8 @@ import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.droidbridge.android.client.ClientState
+import com.droidbridge.android.client.ModuleInstallOutcome
+import com.droidbridge.android.client.ModuleInstallResult
 import com.droidbridge.android.client.SetupRoute
 import com.droidbridge.android.client.DroidBridgeClient
 import com.droidbridge.android.product.maintenance.MaintenanceReplies
@@ -36,6 +38,8 @@ data class AppUiState(
     val moduleAbsent: Boolean = false,
     /** How the user chose to run DroidBridge on this phone; null until first setup commits one. */
     val setupRoute: SetupRoute? = null,
+    /** This APK's module was installed during the current boot and takes effect after a reboot. */
+    val moduleRebootPending: Boolean = false,
 )
 
 class AppViewModel(
@@ -44,6 +48,7 @@ class AppViewModel(
 ) : ViewModel() {
     private val maintenance = MutableStateFlow<MaintenanceState?>(null)
     private val moduleAbsent = MutableStateFlow(false)
+    private val moduleRebootPending = MutableStateFlow(false)
 
     val state: StateFlow<AppUiState> = combine(
         settings.onboardingCompleted,
@@ -57,6 +62,7 @@ class AppViewModel(
         .combine(settings.backgroundConfirmations) { state, confirmations -> state.copy(backgroundConfirmations = confirmations) }
         .combine(moduleAbsent) { state, absent -> state.copy(moduleAbsent = absent) }
         .combine(settings.setupRoute) { state, route -> state.copy(setupRoute = route) }
+        .combine(moduleRebootPending) { state, pending -> state.copy(moduleRebootPending = pending) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), AppUiState())
 
     init {
@@ -76,6 +82,7 @@ class AppViewModel(
         viewModelScope.launch {
             client.state.collect { connection ->
                 if (connection is ClientState.Available || connection is ClientState.Unavailable) refreshMaintenance()
+                if (connection is ClientState.Available) refreshModuleRebootPending()
             }
         }
     }
@@ -96,6 +103,24 @@ class AppViewModel(
     /** A preference the device cannot store stays as it was; it never ends the App. */
     private fun edit(write: suspend () -> Unit) {
         viewModelScope.launch { runCatching { write() } }
+    }
+
+    suspend fun installModule(): ModuleInstallResult {
+        val result = runCatching { client.installEmbeddedModule() }
+            .getOrElse { ModuleInstallResult(ModuleInstallOutcome.Failed, listOfNotNull(it.message)) }
+        refreshModuleRebootPending()
+        client.recheck()
+        return result
+    }
+
+    fun rebootForModule() {
+        viewModelScope.launch { runCatching { client.rebootForModule() } }
+    }
+
+    private fun refreshModuleRebootPending() {
+        viewModelScope.launch {
+            runCatching { client.moduleRebootPending() }.getOrNull()?.let { moduleRebootPending.value = it }
+        }
     }
 
     /** Requeries the owner; an unbound Service leaves the previous maintenance facts in place. */

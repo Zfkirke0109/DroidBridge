@@ -12,7 +12,6 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
-import com.droidbridge.android.BuildConfig
 import com.droidbridge.android.client.BackgroundFacts
 import java.io.File
 
@@ -20,7 +19,36 @@ import java.io.File
  * Reads the device facts the setup guide needs and opens the settings pages it points to. Every
  * opener falls back to a page that exists on every device, so a button never does nothing.
  */
+/** A root manager the App can name. KernelSU and APatch grant root from their own Superuser list, not a prompt. */
+enum class RootManager(val label: String, val packages: List<String>, val grantsInManager: Boolean) {
+    Magisk("Magisk", listOf("com.topjohnwu.magisk", "io.github.huskydg.magisk", "io.github.vvb2060.magisk"), false),
+    KernelSu("KernelSU", listOf("me.weishu.kernelsu"), true),
+    APatch("APatch", listOf("me.bmax.apatch"), true),
+}
+
 object DeviceSetup {
+    /** The root module this APK carries, installed through the root manager from the App. */
+    const val MODULE_ASSET = "droidbridge-module.zip"
+
+    /** The installed root manager, when exactly one of them is installed. */
+    fun rootManager(context: Context): RootManager? =
+        RootManager.entries.filter { manager -> manager.packages.any { installed(context, it) } }.singleOrNull()
+
+    fun openRootManager(context: Context, manager: RootManager) {
+        manager.packages.firstNotNullOfOrNull { context.packageManager.getLaunchIntentForPackage(it) }
+            ?.let { runCatching { context.startActivity(it) } }
+    }
+
+    /** The file name the exported module is offered under, the same as the published release asset. */
+    fun moduleFileName(context: Context): String {
+        val version = context.packageManager.getPackageInfo(context.packageName, 0).versionName.orEmpty()
+        return if (context.packageName.endsWith(".debug")) {
+            "droidbridge-debug-magisk-$version.zip"
+        } else {
+            "droidbridge-magisk-$version.zip"
+        }
+    }
+
     fun backgroundFacts(context: Context, autostartConfirmed: Boolean, recentsLockConfirmed: Boolean) = BackgroundFacts(
         batteryUnrestricted = context.getSystemService(PowerManager::class.java)
             .isIgnoringBatteryOptimizations(context.packageName),
@@ -79,10 +107,6 @@ object DeviceSetup {
     }
 
     /** The project's release page, where the Magisk/KernelSU-compatible module ZIP is published. */
-    fun openModuleDownload(context: Context) {
-        open(context, Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/${BuildConfig.GITHUB_OWNER}/${BuildConfig.GITHUB_REPO}/releases/latest")))
-    }
-
     private fun open(context: Context, vararg candidates: Intent) {
         for (intent in candidates) {
             val started = runCatching {

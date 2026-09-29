@@ -53,8 +53,8 @@ import com.droidbridge.android.R
 import com.droidbridge.android.ui.common.RowIcon
 import com.droidbridge.android.client.ClientState
 import com.droidbridge.android.client.DroidBridgeClient
-import com.droidbridge.android.product.mcp.CHATGPT_APPS_SETTINGS_URL
-import com.droidbridge.android.product.mcp.CHATGPT_CREATE_PLUGIN_URL
+import com.droidbridge.android.product.mcp.CHATGPT_DEVELOPER_SETTINGS_URL
+import com.droidbridge.android.product.mcp.CHATGPT_PLUGINS_URL
 import com.droidbridge.android.product.mcp.OPENAI_API_KEYS_URL
 import com.droidbridge.android.product.mcp.OPENAI_TUNNELS_URL
 import com.droidbridge.android.product.mcp.TUNNEL_PLUGIN_NAME
@@ -180,7 +180,7 @@ fun TunnelRoute(
     var confirmClear by remember { mutableStateOf(false) }
     var pendingConnect by remember { mutableStateOf<Pair<String, String>?>(null) }
     var enforceFirstSetupOrder by rememberSaveable { mutableStateOf<Boolean?>(null) }
-    var openedPluginSettings by rememberSaveable { mutableStateOf(false) }
+    var openedDeveloperSettings by rememberSaveable { mutableStateOf(false) }
     var pluginConfirmed by rememberSaveable { mutableStateOf(false) }
     var connectedOnce by rememberSaveable { mutableStateOf(false) }
     var confirmPlugin by remember { mutableStateOf(false) }
@@ -207,8 +207,8 @@ fun TunnelRoute(
         isTunnelPluginCreationReady(runtimeReady, it.state)
     } == true
     val orderedSetup = enforceFirstSetupOrder != false
-    val pluginSettingsEnabled = isTunnelStepActionEnabled(orderedSetup, creationReady)
-    val createPluginEnabled = isTunnelStepActionEnabled(orderedSetup, creationReady && openedPluginSettings)
+    val developerSettingsEnabled = isTunnelStepActionEnabled(orderedSetup, creationReady)
+    val createPluginEnabled = isTunnelStepActionEnabled(orderedSetup, creationReady && openedDeveloperSettings)
     // A first configuration is shown one step at a time: the plugin once the tunnel is connected,
     // the first call once the plugin is confirmed. Setup and a first configuration finish only on a
     // call ChatGPT actually made.
@@ -448,6 +448,27 @@ fun TunnelRoute(
                     )
                 }
                 if (pluginStepVisible) {
+                    if (orderedSetup) item { StepTitle(R.string.tunnel_step_developer_mode, "tunnel:step:developer_mode") }
+                    item {
+                        Column(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text(
+                                stringResource(R.string.tunnel_developer_mode_title),
+                                style = MaterialTheme.typography.titleMedium,
+                            )
+                            Text(stringResource(R.string.tunnel_developer_mode_instructions))
+                            Button(
+                                onClick = {
+                                    openedDeveloperSettings = true
+                                    context.openWebPage(CHATGPT_DEVELOPER_SETTINGS_URL)
+                                },
+                                enabled = developerSettingsEnabled,
+                                modifier = Modifier.fillMaxWidth().testTag("tunnel:open_developer_settings"),
+                            ) { Text(stringResource(R.string.tunnel_open_developer_settings)) }
+                        }
+                    }
                     if (orderedSetup) item { StepTitle(R.string.tunnel_step_plugin, "tunnel:step:plugin") }
                     item {
                         Column(
@@ -459,16 +480,8 @@ fun TunnelRoute(
                                 style = MaterialTheme.typography.titleMedium,
                             )
                             Text(stringResource(R.string.tunnel_create_plugin_instructions))
-                            OutlinedButton(
-                                onClick = {
-                                    openedPluginSettings = true
-                                    context.openWebPage(CHATGPT_APPS_SETTINGS_URL)
-                                },
-                                enabled = pluginSettingsEnabled,
-                                modifier = Modifier.fillMaxWidth().testTag("tunnel:open_plugin_settings"),
-                            ) { Text(stringResource(R.string.tunnel_open_plugin_settings)) }
                             Button(
-                                onClick = { context.openWebPage(CHATGPT_CREATE_PLUGIN_URL) },
+                                onClick = { context.openWebPage(CHATGPT_PLUGINS_URL) },
                                 enabled = createPluginEnabled,
                                 modifier = Modifier.fillMaxWidth().testTag("tunnel:open_create_plugin"),
                             ) { Text(stringResource(R.string.tunnel_open_create_plugin)) }
@@ -491,12 +504,12 @@ fun TunnelRoute(
                             ) { context.copyText(TUNNEL_PLUGIN_NAME) }
                         }
                         item {
-                            ListItem(
-                                headlineContent = { Text(stringResource(R.string.tunnel_id)) },
-                                leadingContent = { RowIcon(R.drawable.ic_badge) },
-                                supportingContent = { Text(settings.tunnelId.orEmpty()) },
-                                modifier = Modifier.testTag("tunnel:plugin_tunnel_id"),
-                            )
+                            CopyValueRow(
+                                title = R.string.tunnel_id,
+                                icon = R.drawable.ic_badge,
+                                value = settings.tunnelId.orEmpty(),
+                                tag = "tunnel:copy_plugin_tunnel_id",
+                            ) { context.copyText(settings.tunnelId.orEmpty()) }
                         }
                     }
                     if (orderedSetup && !pluginConfirmed) {

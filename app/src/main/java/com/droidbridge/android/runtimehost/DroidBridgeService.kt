@@ -32,6 +32,7 @@ import org.json.JSONObject
 
 class DroidBridgeService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val moduleInstaller by lazy { EmbeddedModuleInstaller(this) }
     private val events = RemoteCallbackList<IRuntimeEventCallback>()
     private val requests = ConcurrentHashMap<String, PendingRequest>()
     private lateinit var hostController: RuntimeHostController
@@ -220,6 +221,21 @@ class DroidBridgeService : Service() {
         override fun cancelUpdate(updateId: String?): String {
             verifyCaller()
             return hostController.cancelUpdate(requireNotNull(updateId)).also { publishHint(PROJECTION_CONTEXT) }
+        }
+
+        override fun installEmbeddedModule(): String {
+            verifyCaller()
+            return moduleInstaller.install().also { publishHint(PROJECTION_CONTEXT) }
+        }
+
+        override fun isModuleRebootPending(): Boolean {
+            verifyCaller()
+            return moduleInstaller.rebootPending()
+        }
+
+        override fun rebootForModule(): Boolean {
+            verifyCaller()
+            return moduleInstaller.reboot()
         }
 
         override fun continueWithoutModule(updateId: String?): String {

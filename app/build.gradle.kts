@@ -326,3 +326,32 @@ fun registerMagiskModule(variant: String, debugModule: Boolean) {
 
 registerMagiskModule("stable", false)
 registerMagiskModule("debug", true)
+
+// Each APK carries the module of its own build identity, written by the same deterministic ZIP
+// writer the release publishes, so the module the App installs is byte-for-byte the released one.
+fun registerEmbeddedModule(buildType: String, variant: String) {
+    val capitalizedVariant = variant.replaceFirstChar(Char::uppercase)
+    val staging = layout.buildDirectory.dir("generated/magiskModule/$variant")
+    val output = layout.buildDirectory.dir("generated/embeddedModule/$buildType")
+    val java = File(System.getProperty("java.home"), "bin/java").absolutePath
+    val embed = tasks.register<Exec>("embed${capitalizedVariant}MagiskModule") {
+        dependsOn("stage${capitalizedVariant}MagiskModule")
+        inputs.dir(staging)
+        inputs.file(rootProject.file("tools/ReleaseTool.java"))
+        outputs.dir(output)
+        workingDir(rootProject.projectDir)
+        val target = output.get().asFile
+        doFirst { target.mkdirs() }
+        commandLine(
+            java, "tools/ReleaseTool.java", "module-zip",
+            staging.get().asFile.absolutePath,
+            File(target, "droidbridge-module.zip").absolutePath,
+        )
+    }
+    android.sourceSets.named(buildType) { assets.srcDir(output.get().asFile) }
+    val mergeAssets = "merge${buildType.replaceFirstChar(Char::uppercase)}Assets"
+    tasks.matching { it.name == mergeAssets }.configureEach { dependsOn(embed) }
+}
+
+registerEmbeddedModule("release", "stable")
+registerEmbeddedModule("debug", "debug")

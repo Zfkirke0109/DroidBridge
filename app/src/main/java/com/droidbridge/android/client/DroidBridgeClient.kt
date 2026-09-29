@@ -169,6 +169,20 @@ class DroidBridgeClient(
 
     suspend fun clearStrandedExecutions(): String = mcpCall(IDroidBridgeRuntime::clearStrandedExecutions)
 
+    /** Installs the root module this APK carries; returns only when the root manager has answered. */
+    suspend fun installEmbeddedModule(): ModuleInstallResult =
+        ModuleInstallResult.decode(mcpCall(IDroidBridgeRuntime::installEmbeddedModule))
+
+    suspend fun moduleRebootPending(): Boolean {
+        val service = runtime ?: error("Runtime unavailable")
+        return withContext(Dispatchers.IO) { service.isModuleRebootPending }
+    }
+
+    suspend fun rebootForModule(): Boolean {
+        val service = runtime ?: error("Runtime unavailable")
+        return withContext(Dispatchers.IO) { service.rebootForModule() }
+    }
+
     suspend fun resetRuntimeHostToApk(): String = mcpCall(IDroidBridgeRuntime::resetRuntimeHostToApk)
 
     /** The S-UPD-002 `{schema_version,configured,module,privileged_install,installed_version_code,record}` reply. */

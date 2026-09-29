@@ -40,6 +40,9 @@ pub trait AutomationWakeProjection: Send + Sync {
     fn wait<'a>(&'a self) -> PortFuture<'a, Result<(), DomainError>>;
 }
 
+/// How a host hears about a failed scheduler pass.
+pub type FaultReport = Arc<dyn Fn(&DomainError) + Send + Sync>;
+
 pub struct AutomationScheduler<P, A, E, C, H, K> {
     core: RuntimeCore<P, A, E, C, H>,
     clock: Arc<K>,
@@ -47,6 +50,7 @@ pub struct AutomationScheduler<P, A, E, C, H, K> {
     busy_dropped: AtomicU64,
     rejected: AtomicU64,
     network_events_unavailable: StdMutex<Option<DomainError>>,
+    fault_report: Option<FaultReport>,
 }
 
 impl<P, A, E, C, H, K> AutomationScheduler<P, A, E, C, H, K>
@@ -66,7 +70,15 @@ where
             busy_dropped: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             network_events_unavailable: StdMutex::new(None),
+            fault_report: None,
         }
+    }
+
+    /// Tells the host about every failed pass. A failed pass never ends the loop: the next pass
+    /// starts again from canonical truth after a bounded pause.
+    pub fn reporting_faults(mut self, report: FaultReport) -> Self {
+        self.fault_report = Some(report);
+        self
     }
 
     /// Admits every persisted due at the current wall time, starts each admitted execution, and
@@ -92,7 +104,8 @@ where
     /// The host's resident scheduling loop. Each pass admits dues, re-arms the projection only
     /// when the next due changed, and keeps the sole default-network subscription exactly while
     /// an enabled network Automation requires it; it then waits for the wake, a canonical change
-    /// or a network event. No pass is periodic. It returns only on a fault, which the host owns.
+    /// or a network event. No pass is periodic. A pass that fails is reported and retried, so one
+    /// transient store or timer failure cannot leave every later due unserved.
     pub async fn run<W: AutomationWakeProjection>(
         &self,
         projection: &W,
@@ -113,33 +126,60 @@ where
         let changes = self.core.canonical_changes();
         let mut armed: Option<Option<String>> = None;
         let mut network: Option<NetworkDefaultSubscription> = None;
+        let mut failures = 0_u32;
         loop {
-            // Requested runs need no time wake: the request itself is the canonical change.
-            self.admit_requested_runs().await?;
-            if let Some(projection) = projection {
-                let next = self.wake().await?;
-                if armed.as_ref() != Some(&next) {
-                    let due = next.as_deref().map(wake_due).transpose()?;
-                    armed = projection.arm(due.as_ref())?.then_some(next);
-                }
-            }
-            self.reconcile_network_subscription(&mut network).await?;
-            tokio::select! {
-                fired = wait_for_wake(projection) => {
-                    fired?;
-                    // A fired or clock-cancelled wake is re-armed from canonical truth.
-                    armed = None;
-                }
-                () = changes.notified() => {}
-                event = next_network_event(&mut network) => match event {
-                    Some(event) => {
-                        self.observe_network_default_changed(event).await?;
+            match self
+                .pass(projection, &changes, &mut armed, &mut network)
+                .await
+            {
+                Ok(()) => failures = 0,
+                Err(error) => {
+                    // Every admission commits whole or not at all, so nothing is half done: the
+                    // wake is re-armed from canonical truth once the pause is over.
+                    if let Some(report) = &self.fault_report {
+                        report(&error);
                     }
-                    // The plane invalidated this subscription; the next pass resubscribes.
-                    None => network = None,
-                },
+                    armed = None;
+                    failures = failures.saturating_add(1);
+                    tokio::time::sleep(retry_delay(failures)).await;
+                }
             }
         }
+    }
+
+    async fn pass<W: AutomationWakeProjection>(
+        &self,
+        projection: Option<&W>,
+        changes: &tokio::sync::Notify,
+        armed: &mut Option<Option<String>>,
+        network: &mut Option<NetworkDefaultSubscription>,
+    ) -> Result<(), DomainError> {
+        // Requested runs need no time wake: the request itself is the canonical change.
+        self.admit_requested_runs().await?;
+        if let Some(projection) = projection {
+            let next = self.wake().await?;
+            if armed.as_ref() != Some(&next) {
+                let due = next.as_deref().map(wake_due).transpose()?;
+                *armed = projection.arm(due.as_ref())?.then_some(next);
+            }
+        }
+        self.reconcile_network_subscription(network).await?;
+        tokio::select! {
+            fired = wait_for_wake(projection) => {
+                fired?;
+                // A fired or clock-cancelled wake is re-armed from canonical truth.
+                *armed = None;
+            }
+            () = changes.notified() => {}
+            event = next_network_event(network) => match event {
+                Some(event) => {
+                    self.observe_network_default_changed(event).await?;
+                }
+                // The plane invalidated this subscription; the next pass resubscribes.
+                None => *network = None,
+            },
+        }
+        Ok(())
     }
 
     /// Admits every run requested outside a trigger and starts each admitted execution.
@@ -331,6 +371,11 @@ async fn next_network_event(
         Some(subscription) => subscription.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// The pause before the pass after `failures` consecutive failed ones: 1 s doubling to 60 s.
+fn retry_delay(failures: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((1_u64 << failures.saturating_sub(1).min(6)).min(60))
 }
 
 fn wake_due(instant: &str) -> Result<AutomationWakeDue, DomainError> {

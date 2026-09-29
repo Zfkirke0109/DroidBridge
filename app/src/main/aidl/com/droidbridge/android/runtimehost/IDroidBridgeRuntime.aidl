@@ -31,4 +31,7 @@ interface IDroidBridgeRuntime {
     String continueWithoutModule(String updateId);
     int getStrandedExecutions();
     String clearStrandedExecutions();
+    String installEmbeddedModule();
+    boolean isModuleRebootPending();
+    boolean rebootForModule();
 }

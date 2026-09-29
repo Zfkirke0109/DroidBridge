@@ -482,7 +482,14 @@ fn spawn_automation_scheduler(
     wake: Arc<crate::ApkAutomationWake>,
     fault: AutomationFaultContext,
 ) {
-    let scheduler = AutomationScheduler::new(core, Arc::new(BoottimeClock));
+    let fault = Arc::new(fault);
+    let pass_fault = Arc::clone(&fault);
+    // A failed pass is retried by the loop itself; the fault file keeps the record of it.
+    let scheduler = AutomationScheduler::new(core, Arc::new(BoottimeClock)).reporting_faults(
+        Arc::new(move |error: &DomainError| {
+            let _recorded = record_scheduler_fault(&pass_fault, error, "automation_scheduler_pass");
+        }),
+    );
     async_runtime.spawn(async move {
         let ended = async {
             scheduler.publish_runtime_ready().await?;
@@ -492,7 +499,7 @@ fn spawn_automation_scheduler(
         if let Err(error) = ended {
             // The fault file is the last channel a detached scheduler has; if it cannot be
             // written either, the stopped scheduler still leaves persisted dues unchanged.
-            let _recorded = record_scheduler_fault(&fault, &error);
+            let _recorded = record_scheduler_fault(&fault, &error, "automation_scheduler_run");
         }
     });
 }
@@ -500,6 +507,7 @@ fn spawn_automation_scheduler(
 fn record_scheduler_fault(
     fault: &AutomationFaultContext,
     error: &DomainError,
+    phase: &str,
 ) -> Result<(), DomainError> {
     let now = chrono::Utc::now();
     let now_ms = u64::try_from(now.timestamp_millis())
@@ -510,7 +518,7 @@ fn record_scheduler_fault(
             at: now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             component: "automation_scheduler".to_owned(),
             code: crate::error_code_token(error.code).to_owned(),
-            phase: "automation_scheduler_run".to_owned(),
+            phase: phase.to_owned(),
             product_version: fault.product_version.clone(),
             boot_id: fault.boot_id.clone(),
             runtime_instance_id: Some(fault.runtime_instance_id.clone()),

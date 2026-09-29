@@ -3,8 +3,8 @@ package com.droidbridge.android
 import com.droidbridge.android.product.mcp.TunnelRuntimeState
 import com.droidbridge.android.product.mcp.TunnelSettingsReplies
 import com.droidbridge.android.product.mcp.TunnelSettingsError
-import com.droidbridge.android.product.mcp.CHATGPT_APPS_SETTINGS_URL
-import com.droidbridge.android.product.mcp.CHATGPT_CREATE_PLUGIN_URL
+import com.droidbridge.android.product.mcp.CHATGPT_DEVELOPER_SETTINGS_URL
+import com.droidbridge.android.product.mcp.CHATGPT_PLUGINS_URL
 import com.droidbridge.android.product.mcp.OPENAI_API_KEYS_URL
 import com.droidbridge.android.product.mcp.OPENAI_TUNNELS_URL
 import com.droidbridge.android.product.mcp.TUNNEL_PLUGIN_NAME
@@ -62,11 +62,8 @@ class I13_TunnelProjectionTest {
     fun setup_links_use_the_official_https_surfaces() {
         assertEquals("https://platform.openai.com/settings/organization/tunnels", OPENAI_TUNNELS_URL)
         assertEquals("https://platform.openai.com/api-keys", OPENAI_API_KEYS_URL)
-        assertEquals("https://chatgpt.com/plugins#settings/Plugins", CHATGPT_APPS_SETTINGS_URL)
-        assertEquals(
-            "https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins",
-            CHATGPT_CREATE_PLUGIN_URL,
-        )
+        assertEquals("https://chatgpt.com/settings/security", CHATGPT_DEVELOPER_SETTINGS_URL)
+        assertEquals("https://chatgpt.com/plugins", CHATGPT_PLUGINS_URL)
         assertEquals("DroidBridge", TUNNEL_PLUGIN_NAME)
     }
 

@@ -25,9 +25,8 @@ data class TunnelSettingsView(
 
 const val OPENAI_TUNNELS_URL = "https://platform.openai.com/settings/organization/tunnels"
 const val OPENAI_API_KEYS_URL = "https://platform.openai.com/api-keys"
-const val CHATGPT_APPS_SETTINGS_URL = "https://chatgpt.com/plugins#settings/Plugins"
-const val CHATGPT_CREATE_PLUGIN_URL =
-    "https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins"
+const val CHATGPT_DEVELOPER_SETTINGS_URL = "https://chatgpt.com/settings/security"
+const val CHATGPT_PLUGINS_URL = "https://chatgpt.com/plugins"
 const val TUNNEL_PLUGIN_NAME = "DroidBridge"
 
 fun isTunnelPluginCreationReady(

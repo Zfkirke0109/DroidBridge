@@ -97,8 +97,10 @@ verify its own updates.
    Secure MCP Tunnel, and an [API key](https://platform.openai.com/api-keys) allowed to use it.
 2. In DroidBridge open **Agent connection → ChatGPT connection**, paste the Tunnel ID and the key,
    and turn the tunnel on. The key is encrypted with the Android Keystore and never shown again.
-3. On a computer browser, open ChatGPT settings, enable developer mode, and create a connector with
-   the **Tunnel** connection type pointing at your tunnel. The app page has buttons for both pages.
+3. On a computer browser, turn on **Developer mode** in [ChatGPT security settings](https://chatgpt.com/settings/security)
+   (it is still rolling out to Plus accounts). Then on [ChatGPT plugins](https://chatgpt.com/plugins)
+   tap **Add → Create MCP app**, connect it through your tunnel with Authentication set to **None**.
+   The app page has links to both.
 4. Ask ChatGPT to use DroidBridge. The first call shows up in the app.
 
 ## Connect a local agent

@@ -91,6 +91,17 @@ $secondHash = (Get-FileHash $second -Algorithm SHA256).Hash
 Remove-Item $second
 if ($firstHash -ne $secondHash) { Fail 'module ZIP is byte-identical across two consecutive builds' }
 Pass "module ZIP is byte-identical across two consecutive builds ($($firstHash.ToLowerInvariant()))"
+$apkZip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path $unsignedApk))
+try {
+    $embedded = $apkZip.GetEntry('assets/droidbridge-module.zip')
+    if (-not $embedded) { Fail 'APK carries the root module at assets/droidbridge-module.zip' }
+    $stream = $embedded.Open()
+    try {
+        $embeddedHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($stream)).Replace('-', '')
+    } finally { $stream.Dispose() }
+} finally { $apkZip.Dispose() }
+if ($embeddedHash -ne $firstHash) { Fail 'the module inside the APK equals the published module ZIP' }
+Pass 'the module inside the APK equals the published module ZIP'
 
 # 6. Third-party notices regenerate byte-identically.
 $notices = Join-Path $dist 'THIRD_PARTY_NOTICES.txt'

@@ -144,6 +144,8 @@ import com.droidbridge.android.ui.tasks.TaskDetailRoute
 import com.droidbridge.android.ui.tasks.TaskDetailViewModel
 import com.droidbridge.android.ui.theme.DroidBridgeTheme
 import com.droidbridge.android.ui.onboarding.SetupChoiceFacts
+import com.droidbridge.android.ui.setup.ModuleDialog
+import com.droidbridge.android.ui.setup.ModuleInstallDialogs
 import com.droidbridge.android.ui.onboarding.SetupChoiceRoute
 import com.droidbridge.android.ui.updates.UpdatesRoute
 import com.droidbridge.android.ui.updates.UpdatesViewModel
@@ -233,6 +235,7 @@ private data class DeviceSetupState(
     val rootDetected: Boolean,
     val moduleAbsent: Boolean,
     val shizukuInstalled: Boolean,
+    val moduleRebootPending: Boolean,
 )
 
 @Composable
@@ -246,7 +249,7 @@ private fun rememberDeviceSetup(state: AppUiState): DeviceSetupState {
     )
     var facts by remember(confirmations) { mutableStateOf(read()) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { facts = read() }
-    return DeviceSetupState(facts.first, facts.second, state.moduleAbsent, facts.third)
+    return DeviceSetupState(facts.first, facts.second, state.moduleAbsent, facts.third, state.moduleRebootPending)
 }
 
 @Composable
@@ -283,8 +286,13 @@ private fun LoadingRoute(@StringRes title: Int, tag: String) {
 @Composable
 @OptIn(ExperimentalMaterial3AdaptiveApi::class)
 private fun NavigationRoot(state: AppUiState, viewModel: AppViewModel, graph: AppGraph) {
-    val initial = if (state.onboardingCompleted == true) Main else Welcome
-    val backStack = rememberNavBackStack(initial)
+    // First setup left for the reboot a module install needs resumes at its chosen step, with the
+    // steps before it still reachable by Back.
+    val backStack = when {
+        state.onboardingCompleted == true -> rememberNavBackStack(Main)
+        state.setupRoute != null -> rememberNavBackStack(Welcome, SetupChoice, Capabilities)
+        else -> rememberNavBackStack(Welcome)
+    }
     var selectedTab by rememberSaveable { mutableIntStateOf(HOME_TAB) }
     val navigate: (NavKey) -> Unit = { destination ->
         val tab = primaryDestinations.indexOfFirst { it.key == destination }
@@ -365,7 +373,9 @@ private fun NavigationRoot(state: AppUiState, viewModel: AppViewModel, graph: Ap
                 val snapshot = (state.clientState as? ClientState.Available)?.snapshot
                 val connectionEnabled = homeState.tunnel?.enabled == true ||
                     homeState.projection?.mcp?.let { it != HomeMcpRow.Off } == true
-                val rows = snapshot?.let { CapabilityRows.project(it, setup.rootDetected, setup.moduleAbsent) }.orEmpty()
+                val rows = snapshot?.let {
+                    CapabilityRows.project(it, setup.rootDetected, setup.moduleAbsent, setup.moduleRebootPending)
+                }.orEmpty()
                 val attention = rows.filter { it.action != null && it.state !in settledCapabilityStates } +
                     BackgroundRows.attention(setup.background, BackgroundRows.keeper(snapshot), connectionEnabled)
                 // Without a snapshot nothing has been checked yet, which is not the same as all set.
@@ -647,7 +657,9 @@ private fun CapabilitiesScreen(
     val snapshot = available?.snapshot
     val unavailableReason = (state.clientState as? ClientState.Unavailable)?.reason
     val setup = rememberDeviceSetup(state)
-    val rows = snapshot?.let { CapabilityRows.project(it, setup.rootDetected, setup.moduleAbsent) } ?: listOf(
+    val rows = snapshot?.let {
+        CapabilityRows.project(it, setup.rootDetected, setup.moduleAbsent, setup.moduleRebootPending)
+    } ?: listOf(
         CapabilityRow(
             CapabilityRowKey.Runtime,
             if (state.clientState is ClientState.Unavailable) CapabilityRowState.Unavailable else CapabilityRowState.Starting,
@@ -832,6 +844,13 @@ private fun rememberCapabilityActionHandler(
     }
     val localNetwork = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { viewModel.recheckRuntime() }
     var dialog by remember { mutableStateOf<SetupDialog?>(null) }
+    var moduleDialog by remember { mutableStateOf<ModuleDialog?>(null) }
+    ModuleInstallDialogs(
+        dialog = moduleDialog,
+        setDialog = { moduleDialog = it },
+        install = viewModel::installModule,
+        reboot = viewModel::rebootForModule,
+    )
     // Android cannot report the vendor autostart switch, so returning from that page asks the user.
     var awaitingAutostart by remember { mutableStateOf(false) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
@@ -889,8 +908,10 @@ private fun rememberCapabilityActionHandler(
             CapabilityAction.Retry, CapabilityAction.Recheck -> viewModel.recheckRuntime()
             CapabilityAction.Authorize -> viewModel.requestShizukuAuthorization()
             CapabilityAction.Diagnostics -> navigate(Diagnostics)
-            CapabilityAction.InstallModule -> DeviceSetup.openModuleDownload(context)
-            CapabilityAction.UpdateModule -> navigate(Updates)
+            CapabilityAction.InstallModule -> moduleDialog = ModuleDialog.Explain(update = false)
+            CapabilityAction.UpdateModule -> moduleDialog = ModuleDialog.Explain(update = true)
+            CapabilityAction.Reboot -> viewModel.rebootForModule()
+            CapabilityAction.OpenUpdates -> navigate(Updates)
             CapabilityAction.InstallShizuku -> context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://shizuku.rikka.app/download/")))
             CapabilityAction.OpenShizuku -> context.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")?.let(context::startActivity)
             CapabilityAction.Allow -> {
@@ -994,6 +1015,7 @@ private fun RouteFrame(@StringRes title: Int, tag: String, back: (() -> Unit)? =
     CapabilityRowState.KeptByShizuku -> R.string.state_kept_by_shizuku
     CapabilityRowState.NotConfirmed -> R.string.state_not_confirmed
     CapabilityRowState.Confirmed -> R.string.state_confirmed
+    CapabilityRowState.PendingReboot -> R.string.state_module_pending_reboot
 }
 
 @StringRes private fun actionText(action: CapabilityAction): Int = when (action) {
@@ -1013,6 +1035,8 @@ private fun RouteFrame(@StringRes title: Int, tag: String, back: (() -> Unit)? =
     CapabilityAction.OpenAppDetails -> R.string.action_open_app_details
     CapabilityAction.OpenAutostart -> R.string.action_open_settings
     CapabilityAction.ShowRecentsLockHelp -> R.string.action_show_how
+    CapabilityAction.Reboot -> R.string.action_reboot
+    CapabilityAction.OpenUpdates -> R.string.action_update_module
 }
 
 @StringRes private fun rowReason(row: CapabilityRow): Int? {
@@ -1024,7 +1048,7 @@ private fun RouteFrame(@StringRes title: Int, tag: String, back: (() -> Unit)? =
     CapabilityRowState.Ready, CapabilityRowState.Connected, CapabilityRowState.Active,
     CapabilityRowState.KeptByModule, CapabilityRowState.KeptByShizuku, CapabilityRowState.Confirmed -> R.drawable.ic_status_success
     CapabilityRowState.NotConfirmed -> R.drawable.ic_status_unknown
-    CapabilityRowState.Starting, CapabilityRowState.Connecting -> R.drawable.ic_status_schedule
+    CapabilityRowState.Starting, CapabilityRowState.Connecting, CapabilityRowState.PendingReboot -> R.drawable.ic_status_schedule
     CapabilityRowState.Unknown -> R.drawable.ic_status_unknown
     else -> R.drawable.ic_status_error
 }
