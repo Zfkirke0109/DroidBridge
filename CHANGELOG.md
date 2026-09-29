@@ -1,5 +1,42 @@
 # Changelog / 更新日志
 
+## 0.4.2
+
+### English
+
+**New**
+- The app installs the root module itself. The APK carries the module; tap **Install module**
+  (or **Update module**), allow DroidBridge in your root manager, then reboot. KernelSU and APatch
+  do not ask: allow DroidBridge in their Superuser list first. If an install fails, the module ZIP
+  can be exported and installed in the manager by hand.
+- ChatGPT setup follows ChatGPT's current flow: turn on Developer mode in ChatGPT's Security
+  settings (still rolling out to some Plus accounts), then on the plugins page tap Add → Create MCP
+  app and set Authentication to None.
+- Settings is grouped on cards, and each row shows its current state.
+
+**Fixed**
+- Time-triggered automations could stop for good after a single failed step of the scheduler,
+  while DroidBridge still showed as running; the scheduler now retries.
+- First setup forgot ChatGPT's first call when the app restarted.
+- The root daemon's error log could be silently discarded after clearing the app's data, and
+  storage errors now record the underlying system error, so failures can be diagnosed.
+- The root daemon's log files were world-writable; they are now readable by root only.
+
+### 中文
+
+**新增**
+- 应用内安装 Root 模块：APK 已内置模块，点「安装模块」（或「更新模块」），在 root 管理器中允许卓爱桥，然后重启即可。
+  KernelSU 和 APatch 不会弹出授权请求，请先在它们的「超级用户」中允许卓爱桥。安装失败时可以导出模块 ZIP，在管理器中手动安装。
+- ChatGPT 设置按 ChatGPT 当前流程更新：在 ChatGPT「安全」设置中打开开发者模式（部分 Plus 账号仍在灰度），
+  再在插件页点「添加 → 创建 MCP 应用」，认证选「无」。
+- 设置页改为卡片分组，每一项都显示当前状态。
+
+**修复**
+- 调度器某一步出错一次后，定时自动化会永久停止，而卓爱桥仍显示运行中；现在出错后会自动重试。
+- 应用重启后，首次设置会忘记 ChatGPT 已经调用过。
+- 清除应用数据后，Root 守护进程的错误日志可能被静默丢弃；存储出错时现在会记录具体的系统错误，便于排查。
+- Root 守护进程的日志文件原本所有人可写，现在仅 root 可读写。
+
 ## 0.4.1
 
 ### English

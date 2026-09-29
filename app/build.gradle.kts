@@ -8,6 +8,8 @@ import org.gradle.api.tasks.bundling.Zip
 import org.gradle.api.tasks.compile.JavaCompile
 import org.gradle.jvm.toolchain.JavaLanguageVersion
 import org.gradle.jvm.toolchain.JavaToolchainService
+import org.gradle.process.ExecOperations
+import javax.inject.Inject
 
 plugins {
     alias(libs.plugins.android.application)
@@ -327,31 +329,52 @@ fun registerMagiskModule(variant: String, debugModule: Boolean) {
 registerMagiskModule("stable", false)
 registerMagiskModule("debug", true)
 
-// Each APK carries the module of its own build identity, written by the same deterministic ZIP
-// writer the release publishes, so the module the App installs is byte-for-byte the released one.
-fun registerEmbeddedModule(buildType: String, variant: String) {
-    val capitalizedVariant = variant.replaceFirstChar(Char::uppercase)
-    val staging = layout.buildDirectory.dir("generated/magiskModule/$variant")
-    val output = layout.buildDirectory.dir("generated/embeddedModule/$buildType")
-    val java = File(System.getProperty("java.home"), "bin/java").absolutePath
-    val embed = tasks.register<Exec>("embed${capitalizedVariant}MagiskModule") {
-        dependsOn("stage${capitalizedVariant}MagiskModule")
-        inputs.dir(staging)
-        inputs.file(rootProject.file("tools/ReleaseTool.java"))
-        outputs.dir(output)
-        workingDir(rootProject.projectDir)
-        val target = output.get().asFile
-        doFirst { target.mkdirs() }
-        commandLine(
-            java, "tools/ReleaseTool.java", "module-zip",
-            staging.get().asFile.absolutePath,
-            File(target, "droidbridge-module.zip").absolutePath,
-        )
+/** Writes one staged module as the APK asset, with the deterministic writer the release publishes. */
+abstract class EmbedModuleTask : DefaultTask() {
+    @get:InputDirectory
+    abstract val staging: DirectoryProperty
+
+    @get:InputFile
+    abstract val releaseTool: RegularFileProperty
+
+    @get:Input
+    abstract val javaExecutable: Property<String>
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @get:Inject
+    abstract val execOperations: ExecOperations
+
+    @TaskAction
+    fun embed() {
+        val target = outputDirectory.get().asFile
+        target.mkdirs()
+        execOperations.exec {
+            commandLine(
+                javaExecutable.get(), releaseTool.get().asFile.absolutePath, "module-zip",
+                staging.get().asFile.absolutePath, File(target, "droidbridge-module.zip").absolutePath,
+            )
+        }
     }
-    android.sourceSets.named(buildType) { assets.srcDir(output.get().asFile) }
-    val mergeAssets = "merge${buildType.replaceFirstChar(Char::uppercase)}Assets"
-    tasks.matching { it.name == mergeAssets }.configureEach { dependsOn(embed) }
 }
 
-registerEmbeddedModule("release", "stable")
-registerEmbeddedModule("debug", "debug")
+// Each APK carries the module of its own build identity, so the module the App installs is
+// byte-for-byte the released one. Registered as generated assets, every task reading the
+// variant's assets depends on it.
+val embeddedModules = mapOf("stable" to false, "debug" to true).mapValues { (variant, _) ->
+    val capitalizedVariant = variant.replaceFirstChar(Char::uppercase)
+    tasks.register<EmbedModuleTask>("embed${capitalizedVariant}MagiskModule") {
+        dependsOn("stage${capitalizedVariant}MagiskModule")
+        staging.set(layout.buildDirectory.dir("generated/magiskModule/$variant"))
+        releaseTool.set(rootProject.layout.projectDirectory.file("tools/ReleaseTool.java"))
+        javaExecutable.set(File(System.getProperty("java.home"), "bin/java").absolutePath)
+    }
+}
+
+androidComponents {
+    onVariants { variant ->
+        val module = embeddedModules.getValue(if (variant.buildType == "debug") "debug" else "stable")
+        variant.sources.assets?.addGeneratedSourceDirectory(module, EmbedModuleTask::outputDirectory)
+    }
+}
