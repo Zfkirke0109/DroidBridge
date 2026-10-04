@@ -8,6 +8,7 @@ mod command;
 mod guard;
 mod mcp_listener;
 mod network;
+mod runtime_health;
 mod tunnel;
 mod visual;
 
@@ -1064,15 +1065,26 @@ fn dispatch_android_execution_for_with_descriptor(
             "Android execution dispatcher is unavailable",
         )
     })?;
-    let vm = JavaVM::singleton()
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "Java VM is unavailable"))?;
+    let instance = &execution.executor.fence.runtime_instance_id;
+    let vm = JavaVM::singleton().map_err(|_| {
+        runtime_health::latch_bridge_fault(instance);
+        DomainError::new(ErrorCode::InternalError, "Java VM is unavailable")
+    })?;
     let (error_code, result) = vm
         .attach_current_thread(|env| {
             dispatch_android_execution_jni(
                 env, dispatcher, key, primitive, payload, execution, descriptor,
             )
         })
-        .map_err(|_| DomainError::new(ErrorCode::IoError, "Android execution bridge failed"))?;
+        .map_err(|error| {
+            // An executor's own exception fails that operation; any other JNI failure means the
+            // path every Android primitive shares is broken, which the next health probe reports.
+            let caught = matches!(error, jni::errors::Error::CaughtJavaException { .. });
+            if runtime_health::bridge_failure_latches(caught) {
+                runtime_health::latch_bridge_fault(instance);
+            }
+            DomainError::new(ErrorCode::IoError, "Android execution bridge failed")
+        })?;
     if let Some(error_code) = error_code {
         return Err(DomainError::new(
             android_execution_error_code(&error_code),
@@ -2312,30 +2324,260 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
         .with_env(|owned| -> jni::errors::Result<jboolean> {
             let code = code.mutf8_chars(owned)?.to_str().into_owned();
             let phase = phase.mutf8_chars(owned)?.to_str().into_owned();
-            let result = with_host(|host| {
-                let now = Utc::now();
-                let now_ms = u64::try_from(now.timestamp_millis()).map_err(|_| {
-                    DomainError::new(ErrorCode::InternalError, "clock is before epoch")
-                })?;
-                FaultFileStore::new(&host.base, FaultRole::Host).append(
-                    FaultRecord {
-                        record_id: new_uuid()?,
-                        at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
-                        component: "apk_host_controller".to_owned(),
-                        code,
-                        phase,
-                        product_version: host.product_version.clone(),
-                        boot_id: host.boot_id.clone(),
-                        runtime_instance_id: Some(host.runtime_instance_id.clone()),
-                        execution_id: None,
-                        exit_code: None,
-                        signal: None,
-                        repeat_count: 1,
-                    },
-                    now_ms,
-                )
-            });
+            let result =
+                with_host(|host| append_host_fault(host, "apk_host_controller", code, phase));
             Ok(if result.is_ok() { JNI_TRUE } else { JNI_FALSE })
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
+    }
+}
+
+fn append_host_fault(
+    host: &NativeHost,
+    component: &str,
+    code: String,
+    phase: String,
+) -> Result<(), DomainError> {
+    let now = Utc::now();
+    let now_ms = u64::try_from(now.timestamp_millis())
+        .map_err(|_| DomainError::new(ErrorCode::InternalError, "clock is before epoch"))?;
+    FaultFileStore::new(&host.base, FaultRole::Host).append(
+        FaultRecord {
+            record_id: new_uuid()?,
+            at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            component: component.to_owned(),
+            code,
+            phase,
+            product_version: host.product_version.clone(),
+            boot_id: host.boot_id.clone(),
+            runtime_instance_id: Some(host.runtime_instance_id.clone()),
+            execution_id: None,
+            exit_code: None,
+            signal: None,
+            repeat_count: 1,
+        },
+        now_ms,
+    )
+}
+
+/// The live instance the fence names, or none when the slot is empty or holds another instance.
+fn fenced_host(fence: &runtime_health::ExpectedFence<'_>) -> Option<Arc<NativeHost>> {
+    host_slot()
+        .lock()
+        .ok()?
+        .clone()
+        .filter(|host| fence.names(host._lease.live()))
+}
+
+/// Issue #2 health probe. Side-effect-free: it reads the slot, the lease records, the descriptor
+/// table and (deep) the store, writes and removes one scratch file, and asks the executor registry
+/// over JNI whether its framework executor is registered. Nothing is executed.
+fn probe_runtime_health(
+    fence: &runtime_health::ExpectedFence<'_>,
+    deep: bool,
+) -> runtime_health::HealthClass {
+    use runtime_health::HealthClass;
+    let Some(host) = host_slot().lock().ok().and_then(|slot| slot.clone()) else {
+        return HealthClass::HostMissing;
+    };
+    if !fence.names(host._lease.live()) {
+        return HealthClass::FenceMismatch;
+    }
+    let admission = runtime_health::first_unhealthy([
+        runtime_health::lease_class(host.store.validate_lease(&host._lease)),
+        if runtime_health::bridge_fault_latched(&host.runtime_instance_id) {
+            HealthClass::BridgeFault
+        } else {
+            HealthClass::Healthy
+        },
+        runtime_health::descriptor_class(runtime_health::descriptor_headroom(
+            Path::new("/proc/self/fd"),
+            runtime_health::descriptor_soft_limit(),
+        )),
+    ]);
+    if admission != HealthClass::Healthy || !deep {
+        return admission;
+    }
+    runtime_health::first_unhealthy([
+        match host.store.load(&host._lease) {
+            Ok(_) => HealthClass::Healthy,
+            Err(_) => HealthClass::StoreUnreadable,
+        },
+        match runtime_health::probe_store_writable(&host.base, &host.runtime_instance_id) {
+            Ok(()) => HealthClass::Healthy,
+            Err(_) => HealthClass::StoreUnwritable,
+        },
+        probe_execution_bridge(fence.host_generation),
+    ])
+}
+
+/// One registry read through the cached dispatcher class and the same JNI attach real dispatch
+/// uses, so a bridge that would fail an execution fails this read instead.
+#[cfg(target_os = "android")]
+fn probe_execution_bridge(host_generation: u64) -> runtime_health::HealthClass {
+    use runtime_health::HealthClass;
+    let Some(dispatcher) = ANDROID_EXECUTION_DISPATCHER.get() else {
+        return HealthClass::BridgeFault;
+    };
+    let Ok(generation) = i64::try_from(host_generation) else {
+        return HealthClass::ExecutorMissing;
+    };
+    let Ok(vm) = JavaVM::singleton() else {
+        return HealthClass::BridgeFault;
+    };
+    match vm.attach_current_thread(|env| -> jni::errors::Result<bool> {
+        let key = env.new_string("android.framework")?;
+        env.call_static_method(
+            &**dispatcher,
+            jni_str!("probeExecutor"),
+            jni_sig!("(Ljava/lang/String;J)Z"),
+            &[JValue::Object(key.as_ref()), JValue::Long(generation)],
+        )?
+        .z()
+    }) {
+        Ok(true) => HealthClass::Healthy,
+        Ok(false) => HealthClass::ExecutorMissing,
+        Err(_) => HealthClass::BridgeFault,
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn probe_execution_bridge(_host_generation: u64) -> runtime_health::HealthClass {
+    runtime_health::HealthClass::Healthy
+}
+
+/// Closes admission on the instance the fence names and releases it from the slot. Requests that
+/// already hold it finish on it; its lifetime lease is released with its last reference, off the
+/// caller's thread, because stopping its reactor waits for its blocking executions.
+fn quarantine_host(fence: &runtime_health::ExpectedFence<'_>) -> Result<bool, DomainError> {
+    let mut slot = host_slot()
+        .lock()
+        .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?;
+    if !slot
+        .as_ref()
+        .is_some_and(|host| fence.names(host._lease.live()))
+    {
+        return Ok(false);
+    }
+    let Some(host) = slot.take() else {
+        return Ok(false);
+    };
+    drop(slot);
+    host.admission_open.store(false, Ordering::SeqCst);
+    // If the thread cannot start, the closure and the instance it holds are dropped right here.
+    let _ = std::thread::Builder::new()
+        .name("droidbridge-host-release".to_owned())
+        .spawn(move || drop(host));
+    Ok(true)
+}
+
+fn expected_fence_strings(
+    env: &mut jni::Env<'_>,
+    runtime_epoch: &JString,
+    runtime_instance_id: &JString,
+) -> jni::errors::Result<(String, String)> {
+    Ok((
+        runtime_epoch.mutf8_chars(env)?.to_str().into_owned(),
+        runtime_instance_id.mutf8_chars(env)?.to_str().into_owned(),
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeProbeRuntimeHealth(
+    mut env: EnvUnowned,
+    _class: JClass,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+    deep: jboolean,
+) -> jstring {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jstring> {
+            let (epoch, instance) =
+                expected_fence_strings(owned, &runtime_epoch, &runtime_instance_id)?;
+            let class = match u64::try_from(host_generation) {
+                Ok(host_generation) => probe_runtime_health(
+                    &runtime_health::ExpectedFence {
+                        runtime_epoch: &epoch,
+                        host_generation,
+                        runtime_instance_id: &instance,
+                    },
+                    deep == JNI_TRUE,
+                ),
+                Err(_) => runtime_health::HealthClass::FenceMismatch,
+            };
+            Ok(owned.new_string(class.encode())?.into_raw())
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
+    }
+}
+
+/// Records one health fault under exactly the instance the fence names, while it still holds the
+/// slot; a different or released instance records nothing and answers false.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeRecordRuntimeHealthFault(
+    mut env: EnvUnowned,
+    _class: JClass,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+    code: JString,
+    phase: JString,
+) -> jboolean {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jboolean> {
+            let (epoch, instance) =
+                expected_fence_strings(owned, &runtime_epoch, &runtime_instance_id)?;
+            let code = code.mutf8_chars(owned)?.to_str().into_owned();
+            let phase = phase.mutf8_chars(owned)?.to_str().into_owned();
+            let recorded = u64::try_from(host_generation)
+                .ok()
+                .and_then(|host_generation| {
+                    fenced_host(&runtime_health::ExpectedFence {
+                        runtime_epoch: &epoch,
+                        host_generation,
+                        runtime_instance_id: &instance,
+                    })
+                });
+            let recorded = recorded.is_some_and(|host| {
+                append_host_fault(&host, "apk_runtime_health", code, phase).is_ok()
+            });
+            Ok(if recorded { JNI_TRUE } else { JNI_FALSE })
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeQuarantineHost(
+    mut env: EnvUnowned,
+    _class: JClass,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+) -> jboolean {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jboolean> {
+            let (epoch, instance) =
+                expected_fence_strings(owned, &runtime_epoch, &runtime_instance_id)?;
+            let released = u64::try_from(host_generation).is_ok_and(|host_generation| {
+                quarantine_host(&runtime_health::ExpectedFence {
+                    runtime_epoch: &epoch,
+                    host_generation,
+                    runtime_instance_id: &instance,
+                })
+                .unwrap_or(false)
+            });
+            Ok(if released { JNI_TRUE } else { JNI_FALSE })
         })
         .into_outcome()
     {

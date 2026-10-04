@@ -131,6 +131,7 @@ pub(super) fn start_host(
         pid: std::process::id(),
         start_ticks: read_start_ticks(Path::new("/proc/self/stat"))?,
     };
+    await_released_lifetime(&base)?;
     let lease = Arc::new(store.acquire_lifetime(live)?);
     activate_app_host(
         &mut slot,
@@ -143,6 +144,25 @@ pub(super) fn start_host(
         runtime_instance_id,
         None,
     )
+}
+
+/// A quarantined instance (issue #2) keeps its lifetime lock until the last request it already
+/// admitted ends. The next instance waits a bounded time for that release, then fails this start as
+/// unavailable instead of blocking every caller of the start behind it; a later request starts it.
+fn await_released_lifetime(base: &Path) -> Result<(), DomainError> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if persistence::FileLock::try_acquire(&base.join("runtime-live.lock"))?.is_some() {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(DomainError::new(
+                ErrorCode::CapabilityUnavailable,
+                "the previous Runtime instance is still releasing",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }
 
 pub(super) fn recover_dead_magisk_host(

@@ -81,6 +81,30 @@ internal object NativeRuntime {
     external fun nativeSettleShizukuGuardProof(executionId: String): String
     external fun nativeAbortShizukuGuardProof(executionId: String): Boolean
     external fun nativeRecordHostFault(code: String, phase: String): Boolean
+
+    /** Issue #2: side-effect-free health of the instance the fence names, as `{"class":…}`. */
+    external fun nativeProbeRuntimeHealth(
+        runtimeEpoch: String,
+        hostGeneration: Long,
+        runtimeInstanceId: String,
+        deep: Boolean,
+    ): String?
+
+    /** Records one health fault only while the fenced instance still holds the slot. */
+    external fun nativeRecordRuntimeHealthFault(
+        runtimeEpoch: String,
+        hostGeneration: Long,
+        runtimeInstanceId: String,
+        code: String,
+        phase: String,
+    ): Boolean
+
+    /** Closes admission on the fenced instance and releases it; false when it is not the live one. */
+    external fun nativeQuarantineHost(
+        runtimeEpoch: String,
+        hostGeneration: Long,
+        runtimeInstanceId: String,
+    ): Boolean
     external fun nativeRunAppCommand(executionId: String, requestJson: String): String?
     external fun nativeCancelAppCommand(executionId: String): Boolean
     external fun nativeAdoptCompanionGuardScope(

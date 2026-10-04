@@ -7,6 +7,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
+import com.droidbridge.android.execution.android.ANDROID_FRAMEWORK_EXECUTOR_KEY
 import com.droidbridge.android.execution.android.NativeAndroidExecutionDispatcher
 import com.droidbridge.android.execution.android.NetworkDefaultObservation
 import com.droidbridge.android.BuildConfig
@@ -130,6 +132,50 @@ internal class RuntimeHostController(
     private val canonicalBase = File(deviceContext.filesDir, "droidbridge")
     private val json = Json { ignoreUnknownKeys = false }
 
+    /**
+     * Issue #2: proves the live APK instance can still execute before each request it serves,
+     * under this controller's monitor so a withdrawal and [start] never interleave.
+     */
+    private val health = RuntimeHealthGate(
+        session = runtimeSession,
+        lock = this,
+        port = object : RuntimeHealthPort {
+            override fun probe(fence: RuntimeFence, depth: RuntimeProbeDepth): RuntimeHealthClass {
+                // The registry the native dispatch reads; the deep probe asks it again over JNI.
+                if (!NativeAndroidExecutionDispatcher.probeExecutor(ANDROID_FRAMEWORK_EXECUTOR_KEY, fence.hostGeneration)) {
+                    return RuntimeHealthClass.ExecutorMissing
+                }
+                val reply = NativeRuntime.nativeProbeRuntimeHealth(
+                    fence.runtimeEpoch,
+                    fence.hostGeneration,
+                    fence.runtimeInstanceId,
+                    depth == RuntimeProbeDepth.Deep,
+                ) ?: return RuntimeHealthClass.ProbeFailed
+                return RuntimeHealthClass.decode(runCatching { JSONObject(reply).optString("class") }.getOrNull())
+            }
+
+            override fun recordFault(
+                fence: RuntimeFence,
+                healthClass: RuntimeHealthClass,
+                phase: RuntimeHealthPhase,
+            ): Boolean = NativeRuntime.nativeRecordRuntimeHealthFault(
+                fence.runtimeEpoch,
+                fence.hostGeneration,
+                fence.runtimeInstanceId,
+                healthClass.faultCode,
+                runtimeHealthFaultPhase(phase, healthClass, fence.hostGeneration),
+            )
+
+            override fun quarantine(fence: RuntimeFence): Boolean = NativeRuntime.nativeQuarantineHost(
+                fence.runtimeEpoch,
+                fence.hostGeneration,
+                fence.runtimeInstanceId,
+            )
+        },
+        nowMillis = SystemClock::elapsedRealtime,
+        onWithdrawn = { hintSink.get()?.invoke("context.status") },
+    )
+
     /** One bounded worker for S-UI-017 status reads; a timed-out read never blocks the next caller. */
     private val diagnosticsReads = Executors.newSingleThreadExecutor { task ->
         Thread(task, "droidbridge-diagnostics").apply { isDaemon = true }
@@ -204,6 +250,14 @@ internal class RuntimeHostController(
         val observedSession = runtimeSession.get()
         if (observedSession.started) return true
         if (!shouldAttemptRuntimeStart(observedSession)) return false
+        if (health.establishmentBlocked()) {
+            // Repeated unhealthy instances wait out the breaker instead of restarting in a loop.
+            runtimeSession.compareAndSet(
+                observedSession,
+                inactiveSession(observedSession.host, DaemonErrorToken.CapabilityUnavailable.wire),
+            )
+            return false
+        }
         val packageInfo = application.packageManager.getPackageInfo(application.packageName, 0)
         val environment = JSONObject()
             .put("sdk_int", Build.VERSION.SDK_INT)
@@ -304,6 +358,21 @@ internal class RuntimeHostController(
             generation,
             result.getString("runtime_instance_id"),
         )
+        val activatedFence = requireNotNull(activated.activeFence)
+        if (health.rejectsEstablishment(activatedFence)) {
+            // An instance withdrawn as unhealthy that still holds the slot is released, never re-adopted.
+            NativeRuntime.nativeQuarantineHost(
+                activatedFence.runtimeEpoch,
+                activatedFence.hostGeneration,
+                activatedFence.runtimeInstanceId,
+            )
+            runtimeSession.compareAndSet(
+                observedSession,
+                inactiveSession(DaemonHostToken.ApkRuntime, DaemonErrorToken.CapabilityUnavailable.wire),
+            )
+            startCompanion()
+            return false
+        }
         if (!runtimeSession.compareAndSet(observedSession, activated)) {
             NativeRuntime.nativeRecordHostFault(
                 DaemonErrorToken.StaleAuthority.wire,
@@ -312,6 +381,7 @@ internal class RuntimeHostController(
             startCompanion()
             return runtimeSession.get().started
         }
+        health.onEstablished(activatedFence)
         startCompanion()
         replayCompanionFacts()
         registerPlatformFacts()
@@ -405,7 +475,10 @@ internal class RuntimeHostController(
         val fence = session.activeFence ?: throw RuntimeStartException(session.startFailure)
         frameworkReadySink.get()?.invoke(fence.hostGeneration)
         registerPlatformFacts()
-        if (session.host == DaemonHostToken.ApkRuntime) return NativeRuntime.nativeSubmit(envelope)
+        if (session.host == DaemonHostToken.ApkRuntime) {
+            // Admitted only after the health probe; dispatched exactly once; never replayed (issue #2).
+            return health.serveApk(session) { NativeRuntime.nativeSubmit(envelope) }
+        }
         val connection = companion.connection()
             ?: throw RuntimeStartException(DaemonErrorToken.CapabilityUnavailable.wire)
         val owner = observeOwner()
@@ -458,6 +531,7 @@ internal class RuntimeHostController(
         val session = runtimeSession.get()
         session.activeFence ?: throw RuntimeStartException(session.startFailure)
         if (session.host == DaemonHostToken.ApkRuntime) {
+            health.admit(session)
             val slot = intArrayOf(-1)
             val payload = NativeRuntime.nativeQueryArtifacts(query, slot)
             val descriptor = slot[0].takeIf { it >= 0 }?.let(ParcelFileDescriptor::adoptFd)
@@ -688,6 +762,7 @@ internal class RuntimeHostController(
                 if (!session.started) put("start_failure", session.startFailure)
             })
             status?.let { put("status", it) }
+            put("health", health.snapshot())
         }.toString()
     }
 
@@ -719,6 +794,13 @@ internal class RuntimeHostController(
             if (!demoted.started || demoted.host != DaemonHostToken.ApkRuntime) {
                 return@onTransitionExecutor maintenanceFailure(DaemonErrorToken.HostTransitionPending.wire)
             }
+        }
+        val idle = runtimeSession.get()
+        if (!idle.started && idle.host == DaemonHostToken.ApkRuntime) {
+            // An instance withdrawn as unhealthy (issue #2) leaves none to record the reset under.
+            // Reset is the user's explicit recovery, so it establishes one first, past the breaker.
+            health.clearBreaker()
+            start()
         }
         val source = runtimeSession.get()
         val withdrawn = inactiveSession(DaemonHostToken.ApkRuntime, DaemonErrorToken.HostTransitionPending.wire)
@@ -760,6 +842,7 @@ internal class RuntimeHostController(
     }
 
     private fun activateAfterMaintenance(): String {
+        health.clearBreaker()
         runtimeSession.updateAndGet { current ->
             if (current.started) current else inactiveSession(DaemonHostToken.ApkRuntime, "RUNTIME_UNAVAILABLE")
         }
@@ -1251,6 +1334,7 @@ internal class RuntimeHostController(
                     result.getString("runtime_instance_id"),
                 )
                 if (!runtimeSession.compareAndSet(observedSession, activated)) return@execute
+                activated.activeFence?.let(health::onEstablished)
                 replayCompanionFacts()
                 registerPlatformFacts()
                 val guard = File(
@@ -1562,6 +1646,7 @@ internal class RuntimeHostController(
             instance,
         )
         if (!runtimeSession.compareAndSet(observedSession, targetSession)) return
+        targetSession.activeFence?.let(health::onEstablished)
         replayCompanionFacts()
         registerPlatformFacts()
         publishFrameworkPrimitives(activated.getLong("host_generation"))
@@ -1777,7 +1862,14 @@ internal class HostPromotionState {
     }
 }
 
-internal class RuntimeStartException(val code: String) : IllegalStateException(code)
+/**
+ * A submission this process refused before dispatch. [detail] is a bounded, secret-free reason the
+ * caller reads next to the code; it never carries request content.
+ */
+internal class RuntimeStartException(
+    val code: String,
+    val detail: String? = null,
+) : IllegalStateException(code)
 
 /**
  * The one failure envelope this process answers for a submission it could not serve. It is the
@@ -1820,7 +1912,7 @@ internal fun runtimeFailureCode(failure: Throwable): String =
  * a caller learns what happened without reading a duplicate of the code it already has.
  */
 internal fun runtimeFailureMessage(failure: Throwable): String? {
-    if (failure is RuntimeStartException) return null
+    if (failure is RuntimeStartException) return failure.detail?.take(MAX_FAILURE_MESSAGE_CHARS)
     val detail = failure.message.orEmpty()
     val named = failure::class.java.simpleName
     val text = if (detail.isEmpty()) named else "$named: $detail"

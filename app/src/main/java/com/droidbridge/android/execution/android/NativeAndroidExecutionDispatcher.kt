@@ -188,6 +188,15 @@ internal object NativeAndroidExecutionDispatcher {
         )
     }
 
+    /**
+     * Issue #2 health probe target. The native Runtime calls this through the same cached class and
+     * JNI attach its real dispatch uses, so a broken bridge fails here too; it only reads the
+     * registry and never runs an executor.
+     */
+    @JvmStatic
+    fun probeExecutor(key: String, generation: Long): Boolean =
+        key == ANDROID_FRAMEWORK_EXECUTOR_KEY && frameworkExecutorPresent(registry.get(), generation)
+
     private fun dispatch(
         executor: AndroidExecutionBridge,
         request: AndroidExecutionRequest,
@@ -201,3 +210,12 @@ internal object NativeAndroidExecutionDispatcher {
         AndroidExecutionResult(byteArrayOf(), errorCode = "CANCELLED")
     }
 }
+
+/**
+ * Whether the App framework executor the native Runtime dispatches through is registered at the
+ * live host generation. A read of the registry only: nothing is executed and nothing changes.
+ */
+internal fun frameworkExecutorPresent(registry: AndroidExecutionRegistry?, generation: Long): Boolean =
+    generation > 0 && registry?.executor(ANDROID_FRAMEWORK_EXECUTOR_KEY, generation) != null
+
+internal const val ANDROID_FRAMEWORK_EXECUTOR_KEY = "android.framework"
