@@ -558,4 +558,3 @@ internal fun BackButton(tag: String, @StringRes description: Int, back: () -> Un
         Icon(painterResource(R.drawable.ic_arrow_back), stringResource(description))
     }
 }
-
