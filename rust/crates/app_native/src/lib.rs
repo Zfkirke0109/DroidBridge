@@ -8,6 +8,7 @@ mod command;
 mod guard;
 mod mcp_listener;
 mod network;
+mod remote_relay;
 mod runtime_health;
 mod tunnel;
 mod visual;

@@ -30,7 +30,7 @@ use tokio::{
 use uuid::Uuid;
 
 const API_BASE_URL: &str = "https://api.openai.com/";
-const CLIENT_NAME: &str = "droidbridge-android";
+pub(crate) const CLIENT_NAME: &str = "droidbridge-android";
 const WIRE_PROTOCOL_VERSION: &str = "2026-08-25";
 const POLL_LIMIT: usize = 8;
 const POLL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -54,7 +54,7 @@ static TUNNEL: Mutex<Option<TunnelRuntime>> = Mutex::new(None);
 /// instead of reqwest's default policy. The default is the Android platform verifier, whose
 /// revocation pass reports genuine public chains without OCSP responders as revoked and refuses
 /// to connect, which is why the tunnel must not fall back to it.
-fn transport() -> reqwest::ClientBuilder {
+pub(crate) fn transport() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
@@ -142,7 +142,8 @@ impl fmt::Display for TunnelError {
     }
 }
 
-struct TunnelRuntime {
+/// One running long-poll client: the OpenAI tunnel, or the Claude relay, which speaks the same wire.
+pub(crate) struct TunnelRuntime {
     runtime: tokio::runtime::Runtime,
     shutdown: watch::Sender<bool>,
     ready: Arc<AtomicBool>,
@@ -152,10 +153,13 @@ struct TunnelRuntime {
 }
 
 impl TunnelRuntime {
-    fn start(client: TunnelClient<KotlinMcpHost>) -> Result<Self, TunnelError> {
+    pub(crate) fn start(
+        client: TunnelClient<KotlinMcpHost>,
+        thread_name: &'static str,
+    ) -> Result<Self, TunnelError> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("droidbridge-tunnel")
+            .thread_name(thread_name)
             .enable_all()
             .build()
             .map_err(|_| TunnelError::RuntimeUnavailable)?;
@@ -181,7 +185,7 @@ impl TunnelRuntime {
         })
     }
 
-    fn state(&self) -> &'static str {
+    pub(crate) fn state(&self) -> &'static str {
         if self.failed.load(Ordering::SeqCst) {
             "failed"
         } else if self.ready.load(Ordering::SeqCst) {
@@ -191,9 +195,19 @@ impl TunnelRuntime {
         }
     }
 
-    fn stop(self) {
+    pub(crate) fn stop(self) {
         let _ = self.shutdown.send(true);
         self.runtime.shutdown_timeout(Duration::from_secs(2));
+    }
+
+    /// The token of the control plane's last failure, e.g. `transport_timeout_45s`, or None.
+    pub(crate) fn last_error(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|error| error.clone())
+    }
+
+    /// When the last command arrived, in epoch milliseconds, or 0.
+    pub(crate) fn last_call_epoch_ms(&self) -> i64 {
+        self.last_call_epoch_ms.load(Ordering::SeqCst)
     }
 }
 
@@ -216,7 +230,7 @@ fn start_tunnel(
     let facade = kotlin_facade(port, product_version.clone())
         .map_err(|_| TunnelError::InvalidConfig("MCP port or product version is invalid"))?;
     let client = TunnelClient::new(facade, &tunnel_id, &api_key, &product_version)?;
-    *slot = Some(TunnelRuntime::start(client)?);
+    *slot = Some(TunnelRuntime::start(client, "droidbridge-tunnel")?);
     Ok(())
 }
 
@@ -375,15 +389,9 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 ) -> jstring {
     match env
         .with_env(|owned| -> jni::errors::Result<jstring> {
-            let last = tunnel_slot().ok().and_then(|slot| {
-                slot.as_ref().and_then(|runtime| {
-                    runtime
-                        .last_error
-                        .lock()
-                        .ok()
-                        .and_then(|error| error.clone())
-                })
-            });
+            let last = tunnel_slot()
+                .ok()
+                .and_then(|slot| slot.as_ref().and_then(TunnelRuntime::last_error));
             Ok(match last {
                 Some(token) => owned.new_string(token)?.into_raw(),
                 None => ptr::null_mut(),
@@ -403,10 +411,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 ) -> jlong {
     tunnel_slot()
         .ok()
-        .and_then(|slot| {
-            slot.as_ref()
-                .map(|runtime| runtime.last_call_epoch_ms.load(Ordering::SeqCst))
-        })
+        .and_then(|slot| slot.as_ref().map(TunnelRuntime::last_call_epoch_ms))
         .unwrap_or(0)
 }
 
@@ -472,15 +477,6 @@ impl<H: McpHost + 'static> TunnelClient<H> {
         if !valid_tunnel_id(tunnel_id) {
             return Err(TunnelError::InvalidConfig("tunnel ID is invalid"));
         }
-        if api_key.is_empty() || !api_key.bytes().all(|byte| byte.is_ascii_graphic()) {
-            return Err(TunnelError::InvalidConfig("API key is invalid"));
-        }
-        if product_version.is_empty()
-            || product_version.len() > 64
-            || !product_version.bytes().all(|byte| byte.is_ascii_graphic())
-        {
-            return Err(TunnelError::InvalidConfig("product version is invalid"));
-        }
         let base = Url::parse(base_url)
             .map_err(|_| TunnelError::InvalidConfig("control-plane URL is invalid"))?;
         let secure = base.scheme() == "https";
@@ -500,10 +496,30 @@ impl<H: McpHost + 'static> TunnelClient<H> {
         let response_url = base
             .join(&format!("v1/tunnels/{tunnel_id}/response"))
             .map_err(|_| TunnelError::InvalidConfig("response URL is invalid"))?;
+        Self::from_urls(facade, poll_url, response_url, api_key, product_version)
+    }
 
+    /// A client polling `poll_url` and answering at `response_url` with `bearer`. The URLs are
+    /// already validated by the caller; the OpenAI tunnel and the Claude relay differ only here.
+    pub(crate) fn from_urls(
+        facade: McpFacade<H>,
+        poll_url: Url,
+        response_url: Url,
+        bearer: &str,
+        product_version: &str,
+    ) -> Result<Self, TunnelError> {
+        if bearer.is_empty() || !bearer.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(TunnelError::InvalidConfig("API key is invalid"));
+        }
+        if product_version.is_empty()
+            || product_version.len() > 64
+            || !product_version.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(TunnelError::InvalidConfig("product version is invalid"));
+        }
         let instance_id = Uuid::new_v4();
         let mut common_headers = HeaderMap::new();
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {bearer}"))
             .map_err(|_| TunnelError::InvalidConfig("API key is invalid"))?;
         authorization.set_sensitive(true);
         common_headers.insert(header::AUTHORIZATION, authorization);
@@ -1155,7 +1171,7 @@ fn insert_header(
     Ok(())
 }
 
-async fn read_bounded(
+pub(crate) async fn read_bounded(
     response: &mut reqwest::Response,
     limit: usize,
 ) -> Result<Vec<u8>, TunnelError> {
@@ -1180,7 +1196,7 @@ async fn read_bounded(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use contract::ErrorCode;
     use domain::DomainError;
@@ -1216,10 +1232,10 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct CapturedRequest {
-        path: String,
-        headers: String,
-        body: Vec<u8>,
+    pub(crate) struct CapturedRequest {
+        pub(crate) path: String,
+        pub(crate) headers: String,
+        pub(crate) body: Vec<u8>,
     }
 
     fn client(base_url: &str) -> TunnelClient<NoopHost> {
@@ -1440,7 +1456,7 @@ mod tests {
     }
 
     /// Reads one HTTP request frame, head and body, as the tunnel's transport writes it.
-    fn read_request(stream: &mut TcpStream) -> CapturedRequest {
+    pub(crate) fn read_request(stream: &mut TcpStream) -> CapturedRequest {
         let mut raw = Vec::new();
         let mut block = [0_u8; 4096];
         let header_end = loop {
@@ -1483,7 +1499,11 @@ mod tests {
     /// closed the connection its own shutdown ended, so a refused write is where this script's
     /// part in that connection ends; every assertion in this module is on the requests it
     /// captured, never on an answer a gone client refused.
-    fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+    pub(crate) fn write_response(
+        stream: &mut TcpStream,
+        status: u16,
+        body: &str,
+    ) -> std::io::Result<()> {
         let reason = match status {
             200 => "OK",
             204 => "No Content",
@@ -1500,17 +1520,17 @@ mod tests {
 
     /// A host whose submissions wait for the test, so a command can be held in flight.
     #[derive(Clone, Default)]
-    struct GateHost {
+    pub(crate) struct GateHost {
         started: Arc<AtomicUsize>,
         gate: Arc<Notify>,
     }
 
     impl GateHost {
-        fn started(&self) -> usize {
+        pub(crate) fn started(&self) -> usize {
             self.started.load(Ordering::SeqCst)
         }
 
-        fn release_one(&self) {
+        pub(crate) fn release_one(&self) {
             self.gate.notify_one();
         }
     }
@@ -1543,8 +1563,8 @@ mod tests {
     /// Serves the tunnel's control plane from one script: the first poll answers with `commands`,
     /// every later poll waits briefly and answers 204 like a real long poll, and each response POST
     /// answers with the next status from `response_statuses` (the last one repeats).
-    struct ScriptedControlPlane {
-        base_url: String,
+    pub(crate) struct ScriptedControlPlane {
+        pub(crate) base_url: String,
         address: SocketAddr,
         captured: Arc<Mutex<Vec<CapturedRequest>>>,
         stop: Arc<AtomicBool>,
@@ -1552,7 +1572,7 @@ mod tests {
     }
 
     impl ScriptedControlPlane {
-        fn new(commands: Vec<Value>, response_statuses: Vec<u16>) -> Self {
+        pub(crate) fn new(commands: Vec<Value>, response_statuses: Vec<u16>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
             let captured = Arc::new(Mutex::new(Vec::new()));
@@ -1606,7 +1626,11 @@ mod tests {
             }
         }
 
-        fn request_count(&self, fragment: &str) -> usize {
+        pub(crate) fn captured(&self) -> Vec<CapturedRequest> {
+            self.captured.lock().unwrap().clone()
+        }
+
+        pub(crate) fn request_count(&self, fragment: &str) -> usize {
             self.captured
                 .lock()
                 .unwrap()
@@ -1615,7 +1639,7 @@ mod tests {
                 .count()
         }
 
-        fn stop(mut self) {
+        pub(crate) fn stop(mut self) {
             self.stop.store(true, Ordering::SeqCst);
             let _ = TcpStream::connect(self.address);
             if let Some(handle) = self.handle.take() {
@@ -1636,7 +1660,7 @@ mod tests {
         .unwrap()
     }
 
-    fn tools_call(request_id: &str, rpc_id: &str) -> Value {
+    pub(crate) fn tools_call(request_id: &str, rpc_id: &str) -> Value {
         let mut built = command(json!({
             "jsonrpc": "2.0",
             "id": rpc_id,
@@ -1655,7 +1679,7 @@ mod tests {
         built
     }
 
-    async fn wait_for(condition: impl Fn() -> bool) {
+    pub(crate) async fn wait_for(condition: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !condition() {
             assert!(
