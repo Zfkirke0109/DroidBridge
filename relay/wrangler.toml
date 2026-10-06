@@ -1,0 +1,27 @@
+name = "droidbridge-relay"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# One Durable Object instance ("relay") holds the phone's parked poll, the hand-off list and
+# the OAuth state. SQLite-backed Durable Objects are available on the Workers free plan.
+[[durable_objects.bindings]]
+name = "RELAY"
+class_name = "RelayObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RelayObject"]
+
+[vars]
+# Seconds the phone may take to answer one request (clamped to 10..900).
+RESPONSE_TIMEOUT_SECONDS = "240"
+# Hosts whose client ID metadata documents may be fetched.
+CIMD_ALLOWED_HOSTS = "claude.ai,claude.com"
+# Extra exact redirect URIs to allow, comma separated (https, or http on a loopback host).
+EXTRA_REDIRECT_URIS = ""
+# The public origin, e.g. "https://relay.example.com". Empty means the origin of each request.
+PUBLIC_ORIGIN = ""
+
+# DEVICE_KEY_SHA256 is a secret. Set it with:
+#   npx wrangler@4 secret put DEVICE_KEY_SHA256
+# Never put it in this file.

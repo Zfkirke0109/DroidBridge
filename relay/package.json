@@ -1,0 +1,11 @@
+{
+  "name": "droidbridge-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude connector relay for DroidBridge: a Cloudflare Worker + Durable Object you deploy to your own account.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "deploy": "npx wrangler@4 deploy"
+  }
+}
