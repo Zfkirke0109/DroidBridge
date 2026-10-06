@@ -65,6 +65,8 @@ import com.droidbridge.android.product.home.HomeMcpRow
 import com.droidbridge.android.product.home.HomeProjection
 import com.droidbridge.android.product.home.HomeUsability
 import com.droidbridge.android.product.mcp.McpSettingsReplies
+import com.droidbridge.android.product.mcp.ClaudeRelaySettingsReplies
+import com.droidbridge.android.product.mcp.ClaudeRelaySettingsView
 import com.droidbridge.android.product.mcp.TunnelSettingsReplies
 import com.droidbridge.android.product.mcp.TunnelRuntimeState
 import com.droidbridge.android.product.mcp.TunnelSettingsView
@@ -100,7 +102,8 @@ internal fun HomeUiState.agentSummary(): AgentConnectionSummary? = projection?.l
     HomeProjection.agentConnections(
         mcp = it.mcp,
         tunnelRunning = tunnel?.state == TunnelRuntimeState.Running,
-        readFailed = mcpFailed || tunnelFailed,
+        readFailed = mcpFailed || tunnelFailed || claudeRelayFailed,
+        claudeRelayRunning = claudeRelay?.state == TunnelRuntimeState.Running,
     )
 }
 
@@ -112,6 +115,9 @@ data class HomeUiState(
     /** The tunnel is the other connection way; the one agent-connection row states whether either is up. */
     val tunnel: TunnelSettingsView? = null,
     val tunnelFailed: Boolean = false,
+    /** The Claude connector is a third connection way, read the same way. */
+    val claudeRelay: ClaudeRelaySettingsView? = null,
+    val claudeRelayFailed: Boolean = false,
     /** Executions a lost instance left running, when that authority has answered. */
     val strandedExecutions: Int? = null,
     val strandedReadFailed: Boolean = false,
@@ -135,16 +141,20 @@ class HomeViewModel(
             val ended = async { tasks.list(TaskFilter.Completed, HomeProjection.ENDED_TASK_LIMIT) }
             val mcp = async { runCatching { client.mcpSettings() }.getOrNull()?.let(McpSettingsReplies::settings) }
             val tunnel = async { runCatching { client.tunnelSettings() }.getOrNull() }
+            val claudeRelay = async { runCatching { client.claudeRelaySettings() }.getOrNull() }
             val stranded = async { runCatching { client.strandedExecutions() }.getOrNull() }
             val activeTasks = active.await() as? PublicResult.Success
             val endedTasks = ended.await() as? PublicResult.Success
             val settings = mcp.await()
             val tunnelSettings = tunnel.await()?.let(TunnelSettingsReplies::settings)
+            val claudeRelaySettings = claudeRelay.await()?.let(ClaudeRelaySettingsReplies::settings)
             val strandedExecutions = stranded.await()?.coerceAtLeast(0)
             mutableState.update { current ->
                 val tunnelFacts = current.copy(
                     tunnel = tunnelSettings ?: current.tunnel,
                     tunnelFailed = tunnelSettings == null,
+                    claudeRelay = claudeRelaySettings ?: current.claudeRelay,
+                    claudeRelayFailed = claudeRelaySettings == null,
                     strandedExecutions = strandedExecutions ?: current.strandedExecutions,
                     strandedReadFailed = strandedExecutions == null,
                 )

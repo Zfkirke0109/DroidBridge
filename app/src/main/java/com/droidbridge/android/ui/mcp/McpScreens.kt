@@ -48,6 +48,8 @@ import com.droidbridge.android.ui.common.RowIcon
 import com.droidbridge.android.client.ClientState
 import com.droidbridge.android.client.DroidBridgeClient
 import com.droidbridge.android.product.home.HomeProjection
+import com.droidbridge.android.product.mcp.ClaudeRelaySettingsReplies
+import com.droidbridge.android.product.mcp.ClaudeRelaySettingsView
 import com.droidbridge.android.product.mcp.McpListenerState
 import com.droidbridge.android.product.mcp.McpSettingsReplies
 import com.droidbridge.android.product.mcp.McpSettingsView
@@ -65,6 +67,8 @@ data class McpUiState(
     val tunnelSettings: TunnelSettingsView? = null,
     /** A tunnel read that failed is not the same fact as a tunnel that is not configured. */
     val tunnelFailed: Boolean = false,
+    val claudeRelaySettings: ClaudeRelaySettingsView? = null,
+    val claudeRelayFailed: Boolean = false,
     val loading: Boolean = true,
     val failed: Boolean = false,
     /** Present only after an explicit Reveal; dropped with this route's ViewModel. */
@@ -88,11 +92,15 @@ class McpViewModel(private val client: DroidBridgeClient) : ViewModel() {
         viewModelScope.launch {
             val settings = runCatching { client.mcpSettings() }.getOrNull()?.let(McpSettingsReplies::settings)
             val tunnelSettings = runCatching { client.tunnelSettings() }.getOrNull()?.let(TunnelSettingsReplies::settings)
+            val claudeRelaySettings = runCatching { client.claudeRelaySettings() }.getOrNull()
+                ?.let(ClaudeRelaySettingsReplies::settings)
             mutableState.update { current ->
                 current.copy(
                     settings = settings ?: current.settings,
                     tunnelSettings = tunnelSettings ?: current.tunnelSettings,
                     tunnelFailed = tunnelSettings == null,
+                    claudeRelaySettings = claudeRelaySettings ?: current.claudeRelaySettings,
+                    claudeRelayFailed = claudeRelaySettings == null,
                     loading = false,
                     failed = settings == null,
                 )
@@ -129,6 +137,8 @@ class McpViewModel(private val client: DroidBridgeClient) : ViewModel() {
                     settings = settings ?: current.settings,
                     tunnelSettings = current.tunnelSettings,
                     tunnelFailed = current.tunnelFailed,
+                    claudeRelaySettings = current.claudeRelaySettings,
+                    claudeRelayFailed = current.claudeRelayFailed,
                     loading = false,
                     failed = settings == null,
                     revealedToken = if (remask || settings == null) null else current.revealedToken,

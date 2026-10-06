@@ -28,8 +28,8 @@ import com.droidbridge.android.product.home.HomeProjection
 import com.droidbridge.android.ui.settings.BackButton
 
 /**
- * The parent level of the agent connection: Local MCP and the ChatGPT tunnel are peers under this one
- * entry, and a later way is one more row here. Home and Settings both open this same page.
+ * The parent level of the agent connection: Local MCP, the ChatGPT tunnel and the Claude connector are
+ * peers under this one entry, and a later way is one more row here. Home and Settings both open this same page.
  */
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
@@ -37,6 +37,7 @@ fun AgentConnectionRoute(
     viewModel: McpViewModel,
     openMcp: () -> Unit,
     openTunnel: () -> Unit,
+    openClaude: () -> Unit,
     back: () -> Unit,
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -46,6 +47,11 @@ fun AgentConnectionRoute(
         settings == null -> null
         state.tunnelFailed -> R.string.state_error
         else -> tunnelStatusLabel(state.tunnelSettings)
+    }
+    val claudeLabel = when {
+        settings == null -> null
+        state.claudeRelayFailed -> R.string.state_error
+        else -> claudeStatusLabel(state.claudeRelaySettings)
     }
     Scaffold(
         modifier = Modifier.testTag("route:AgentConnections"),
@@ -72,6 +78,7 @@ fun AgentConnectionRoute(
             }
             item { WayRow(R.string.home_mcp, R.drawable.ic_lan, mcpLabel, "agent:local_mcp", openMcp) }
             item { WayRow(R.string.mcp_chatgpt_connection, R.drawable.ic_cloud, tunnelLabel, "agent:chatgpt", openTunnel) }
+            item { WayRow(R.string.claude_title, R.drawable.ic_cloud, claudeLabel, "agent:claude", openClaude) }
         }
     }
     LaunchedEffect(Unit) { viewModel.refresh() }
@@ -105,6 +112,7 @@ internal fun agentConnectionLabel(summary: AgentConnectionSummary): String = whe
                 when (agent) {
                     ConnectedAgent.LocalMcp -> R.string.home_mcp
                     ConnectedAgent.ChatGpt -> R.string.agent_name_chatgpt
+                    ConnectedAgent.Claude -> R.string.agent_name_claude
                 },
             )
         }

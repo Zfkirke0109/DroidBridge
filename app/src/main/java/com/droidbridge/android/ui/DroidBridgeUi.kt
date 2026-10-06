@@ -129,6 +129,8 @@ import com.droidbridge.android.ui.home.HomeViewModel
 import com.droidbridge.android.ui.maintenance.MaintenanceRecoveryRoute
 import com.droidbridge.android.ui.maintenance.MaintenanceViewModel
 import com.droidbridge.android.ui.mcp.AgentConnectionRoute
+import com.droidbridge.android.ui.mcp.ClaudeConnectorRoute
+import com.droidbridge.android.ui.mcp.ClaudeConnectorViewModel
 import com.droidbridge.android.ui.mcp.McpRoute
 import com.droidbridge.android.ui.mcp.McpViewModel
 import com.droidbridge.android.ui.mcp.TunnelRoute
@@ -164,6 +166,7 @@ import kotlinx.serialization.Serializable
 @Serializable data object AgentConnections : NavKey
 @Serializable data object MCP : NavKey
 @Serializable data object TunnelSetup : NavKey
+@Serializable data object ClaudeConnector : NavKey
 @Serializable data object Diagnostics : NavKey
 @Serializable data object Settings : NavKey
 @Serializable data object Updates : NavKey
@@ -494,6 +497,7 @@ private fun NavigationRoot(state: AppUiState, viewModel: AppViewModel, graph: Ap
                     viewModel = viewModel { McpViewModel(graph.client) },
                     openMcp = { backStack.add(MCP) },
                     openTunnel = { backStack.add(TunnelSetup) },
+                    openClaude = { backStack.add(ClaudeConnector) },
                 ) { backStack.removeLastOrNull() }
             }
             entry<MCP> {
@@ -505,6 +509,9 @@ private fun NavigationRoot(state: AppUiState, viewModel: AppViewModel, graph: Ap
                     shouldRequestNotifications = { shouldRequestPostNotifications(context) },
                     finishSetup = finishSetup,
                 ) { backStack.removeLastOrNull() }
+            }
+            entry<ClaudeConnector> {
+                ClaudeConnectorRoute(viewModel { ClaudeConnectorViewModel(graph.client) }) { backStack.removeLastOrNull() }
             }
             entry<TunnelSetup> {
                 val context = LocalContext.current
