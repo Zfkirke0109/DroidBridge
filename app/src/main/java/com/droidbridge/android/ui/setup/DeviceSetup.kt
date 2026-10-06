@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import com.droidbridge.android.client.BackgroundFacts
+import com.droidbridge.android.execution.shizuku.ShizukuManager
 import java.io.File
 
 /**
@@ -63,8 +64,12 @@ object DeviceSetup {
     fun rootDetected(context: Context): Boolean =
         ROOT_MANAGERS.any { installed(context, it) } || SU_PATHS.any { runCatching { File(it).exists() }.getOrDefault(false) }
 
-    /** The Shizuku app is installed; whether it runs and authorizes this App is a Runtime fact. */
-    fun shizukuInstalled(context: Context): Boolean = installed(context, SHIZUKU_MANAGER)
+    /** A Shizuku app is installed; whether it runs and authorizes this App is a Runtime fact. */
+    fun shizukuInstalled(context: Context): Boolean = shizukuManager(context) != null
+
+    /** The installed Shizuku manager (stock Shizuku or Shizuku+), or null. */
+    internal fun shizukuManager(context: Context): ShizukuManager? =
+        ShizukuManager.installed { packageName -> installed(context, packageName) }
 
     /** Installed from a file or browser rather than a store, so Android restricts its accessibility switch. */
     fun restrictedSettingsApply(context: Context): Boolean = Build.VERSION.SDK_INT >= 33 && runCatching {
@@ -153,8 +158,6 @@ object DeviceSetup {
         ApplicationExitInfo.REASON_OTHER,
         REASON_FREEZER,
     )
-
-    private const val SHIZUKU_MANAGER = "moe.shizuku.privileged.api"
 
     private val ROOT_MANAGERS = listOf(
         "com.topjohnwu.magisk",

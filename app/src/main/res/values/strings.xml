@@ -12,6 +12,7 @@
     <string name="cap_runtime_title">DroidBridge Runtime</string>
     <string name="cap_root_backend_title">Root backend</string>
     <string name="cap_shizuku_title">Shizuku</string>
+    <string name="cap_shizuku_plus_title" translatable="false">Shizuku+</string>
     <string name="cap_local_network_title">Local network</string>
     <string name="cap_notification_access_title">Notification access</string>
     <string name="cap_exact_schedules_title">Exact schedules</string>

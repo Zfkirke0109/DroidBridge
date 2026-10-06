@@ -1,5 +1,6 @@
 package com.droidbridge.android.ui
 
+import com.droidbridge.android.execution.shizuku.ShizukuManager
 import com.droidbridge.android.ui.home.agentSummary
 import com.droidbridge.android.ui.settings.SettingsStatus
 import android.Manifest
@@ -797,7 +798,7 @@ internal fun CapabilityListItem(
     val reason = rowReason(row)
     val loadingDescription = stringResource(R.string.state_loading)
     ListItem(
-        headlineContent = { Text(stringResource(rowTitle(row.key))) },
+        headlineContent = { Text(stringResource(rowTitle(row.key, LocalContext.current))) },
         supportingContent = {
             Column {
                 Text(stringResource(rowState(row)))
@@ -929,7 +930,9 @@ private fun rememberCapabilityActionHandler(
             CapabilityAction.Reboot -> viewModel.rebootForModule()
             CapabilityAction.OpenUpdates -> navigate(Updates)
             CapabilityAction.InstallShizuku -> context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://shizuku.rikka.app/download/")))
-            CapabilityAction.OpenShizuku -> context.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")?.let(context::startActivity)
+            CapabilityAction.OpenShizuku -> DeviceSetup.shizukuManager(context)
+                ?.let { manager -> context.packageManager.getLaunchIntentForPackage(manager.packageName) }
+                ?.let(context::startActivity)
             CapabilityAction.Allow -> {
                 if (row == CapabilityRowKey.LocalNetwork) {
                     if (Build.VERSION.SDK_INT >= 37) localNetwork.launch(localNetworkPermission())
@@ -987,10 +990,15 @@ private fun RouteFrame(@StringRes title: Int, tag: String, back: (() -> Unit)? =
     ) { padding -> Column(Modifier.fillMaxSize().padding(padding)) { content() } }
 }
 
-@StringRes private fun rowTitle(key: CapabilityRowKey): Int = when (key) {
+@StringRes private fun rowTitle(key: CapabilityRowKey, context: Context): Int = when (key) {
     CapabilityRowKey.Runtime -> R.string.cap_runtime_title
     CapabilityRowKey.RootBackend -> R.string.cap_root_backend_title
-    CapabilityRowKey.Shizuku -> R.string.cap_shizuku_title
+    // The row names the Shizuku app the user actually has.
+    CapabilityRowKey.Shizuku -> if (DeviceSetup.shizukuManager(context) == ShizukuManager.ShizukuPlus) {
+        R.string.cap_shizuku_plus_title
+    } else {
+        R.string.cap_shizuku_title
+    }
     CapabilityRowKey.LocalNetwork -> R.string.cap_local_network_title
     CapabilityRowKey.NotificationAccess -> R.string.cap_notification_access_title
     CapabilityRowKey.ExactAlarm -> R.string.cap_exact_schedules_title
