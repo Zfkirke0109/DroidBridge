@@ -1,10 +1,13 @@
 package com.droidbridge.android
 
 import com.droidbridge.android.execution.android.AndroidExecutionBridge
+import com.droidbridge.android.execution.android.AndroidExecutionException
+import com.droidbridge.android.execution.android.AndroidExecutionRequest
 import com.droidbridge.android.execution.android.AndroidExecutionRegistry
 import com.droidbridge.android.execution.android.AndroidExecutionResult
 import com.droidbridge.android.execution.android.AndroidPrimitive
 import com.droidbridge.android.execution.android.CapabilityRegistration
+import com.droidbridge.android.execution.android.NativeAndroidExecutionDispatcher
 import com.droidbridge.android.execution.android.RegisteredCapabilityState
 import com.droidbridge.android.execution.android.frameworkExecutorPresent
 import com.droidbridge.android.runtimehost.DaemonErrorToken
@@ -16,11 +19,13 @@ import com.droidbridge.android.runtimehost.RuntimeHealthPhase
 import com.droidbridge.android.runtimehost.RuntimeHealthPort
 import com.droidbridge.android.runtimehost.RuntimeProbeDepth
 import com.droidbridge.android.runtimehost.RuntimeSessionState
+import com.droidbridge.android.runtimehost.RuntimeSettlement
 import com.droidbridge.android.runtimehost.RuntimeStartException
-import com.droidbridge.android.runtimehost.responseIndicatesInfrastructureFailure
 import com.droidbridge.android.runtimehost.runtimeFailureMessage
 import com.droidbridge.android.runtimehost.runtimeHealthFaultPhase
+import com.droidbridge.android.runtimehost.runtimeSettlement
 import com.droidbridge.android.runtimehost.serveApk
+import com.droidbridge.android.runtimehost.submissionProvesExecution
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -28,7 +33,9 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
@@ -132,7 +139,7 @@ class I16_RuntimeHealthGateTest {
     fun i16_healthyStartedApkHostIsReusedWithoutAuthorityChange() {
         val harness = Harness(active(first))
         val observed = harness.session.get()
-        val response = harness.gate.serveApk(observed) {
+        val response = harness.gate.serveApk(observed, true) {
             harness.dispatches.incrementAndGet()
             ok()
         }
@@ -150,7 +157,7 @@ class I16_RuntimeHealthGateTest {
             val harness = Harness(active(first))
             harness.port.verdict = { _, _ -> unhealthy }
             val refused = expectRefused {
-                harness.gate.serveApk(harness.session.get()) {
+                harness.gate.serveApk(harness.session.get(), true) {
                     harness.dispatches.incrementAndGet()
                     ok()
                 }
@@ -219,7 +226,7 @@ class I16_RuntimeHealthGateTest {
             }
         }
         val original = failed(DaemonErrorToken.IoError.wire)
-        val response = harness.gate.serveApk(harness.session.get()) {
+        val response = harness.gate.serveApk(harness.session.get(), true) {
             harness.dispatches.incrementAndGet()
             original
         }
@@ -230,7 +237,7 @@ class I16_RuntimeHealthGateTest {
         assertEquals(listOf(RuntimeHealthPhase.Settlement), harness.port.recordedPhases.toList())
         // The withdrawn session refuses the next request instead of replaying anything on it.
         val next = harness.session.get()
-        expectRefused { harness.gate.serveApk(next) { harness.dispatches.incrementAndGet(); ok() } }
+        expectRefused { harness.gate.serveApk(next, true) { harness.dispatches.incrementAndGet(); ok() } }
         assertEquals(1, harness.dispatches.get())
     }
 
@@ -249,7 +256,7 @@ class I16_RuntimeHealthGateTest {
                 ready.countDown()
                 go.await()
                 try {
-                    harness.gate.serveApk(observed) { harness.dispatches.incrementAndGet(); ok() }
+                    harness.gate.serveApk(observed, true) { harness.dispatches.incrementAndGet(); ok() }
                 } catch (_: RuntimeStartException) {
                     refused.incrementAndGet()
                 }
@@ -295,11 +302,11 @@ class I16_RuntimeHealthGateTest {
         harness.session.set(active(second))
         harness.gate.onEstablished(second)
         harness.port.depths.clear()
-        val response = harness.gate.serveApk(harness.session.get()) { harness.dispatches.incrementAndGet(); ok() }
+        val response = harness.gate.serveApk(harness.session.get(), true) { harness.dispatches.incrementAndGet(); ok() }
         assertArrayEquals(ok(), response)
         assertEquals(1, harness.dispatches.get())
         assertEquals(listOf(RuntimeProbeDepth.Deep), harness.port.depths.toList())
-        harness.gate.serveApk(harness.session.get()) { harness.dispatches.incrementAndGet(); ok() }
+        harness.gate.serveApk(harness.session.get(), true) { harness.dispatches.incrementAndGet(); ok() }
         assertEquals(listOf(RuntimeProbeDepth.Deep, RuntimeProbeDepth.Admission), harness.port.depths.toList())
     }
 
@@ -347,7 +354,7 @@ class I16_RuntimeHealthGateTest {
         harness.port.verdict = { _, _ -> RuntimeHealthClass.BridgeFault }
         // context.status is a request like any other: it is not served from the stale projection.
         val refused = expectRefused {
-            harness.gate.serveApk(harness.session.get()) { harness.dispatches.incrementAndGet(); ok() }
+            harness.gate.serveApk(harness.session.get(), true) { harness.dispatches.incrementAndGet(); ok() }
         }
         assertEquals(DaemonErrorToken.CapabilityUnavailable.wire, refused.code)
         assertEquals(0, harness.dispatches.get())
@@ -369,7 +376,7 @@ class I16_RuntimeHealthGateTest {
     fun i16_ordinaryOperationFailuresDoNotProbeOrReset() {
         val harness = Harness(active(first))
         for (code in listOf("NOT_FOUND", "PERMISSION_DENIED", "EXECUTION_FAILED", "CAPABILITY_UNAVAILABLE", "TIMEOUT")) {
-            harness.gate.serveApk(harness.session.get()) { failed(code) }
+            harness.gate.serveApk(harness.session.get(), true) { failed(code) }
         }
         assertEquals(listOf(RuntimeProbeDepth.Admission).let { a -> List(5) { a[0] } }, harness.port.depths.toList())
         assertTrue(harness.session.get().started)
@@ -378,8 +385,8 @@ class I16_RuntimeHealthGateTest {
     @Test
     fun i16_infrastructureFailureOnAHealthyInstanceKeepsIt() {
         val harness = Harness(active(first))
-        val response = harness.gate.serveApk(harness.session.get()) { failed(DaemonErrorToken.IoError.wire) }
-        assertTrue(responseIndicatesInfrastructureFailure(response))
+        val response = harness.gate.serveApk(harness.session.get(), true) { failed(DaemonErrorToken.IoError.wire) }
+        assertEquals(RuntimeSettlement.Suspicious, runtimeSettlement(response, provesExecution = true))
         assertEquals(listOf(RuntimeProbeDepth.Admission, RuntimeProbeDepth.Deep), harness.port.depths.toList())
         assertTrue(harness.session.get().started)
         assertEquals(0, harness.port.quarantines.get())
@@ -388,10 +395,10 @@ class I16_RuntimeHealthGateTest {
     @Test
     fun i16_settlementDeepProbesAreBoundedPerInstance() {
         val harness = Harness(active(first))
-        repeat(5) { harness.gate.serveApk(harness.session.get()) { failed(DaemonErrorToken.IoError.wire) } }
+        repeat(5) { harness.gate.serveApk(harness.session.get(), true) { failed(DaemonErrorToken.IoError.wire) } }
         assertEquals(1, harness.port.depths.count { it == RuntimeProbeDepth.Deep })
         harness.clock.addAndGet(60_000)
-        harness.gate.serveApk(harness.session.get()) { failed(DaemonErrorToken.IoError.wire) }
+        harness.gate.serveApk(harness.session.get(), true) { failed(DaemonErrorToken.IoError.wire) }
         assertEquals(2, harness.port.depths.count { it == RuntimeProbeDepth.Deep })
     }
 
@@ -438,7 +445,7 @@ class I16_RuntimeHealthGateTest {
         }
         expectRefused { harness.gate.admit(harness.session.get()) }
         harness.session.set(active(second))
-        harness.gate.serveApk(harness.session.get()) { ok() }
+        harness.gate.serveApk(harness.session.get(), true) { ok() }
         assertEquals(0L, harness.gate.snapshot()["consecutive_withdrawals"]!!.jsonPrimitive.long)
     }
 
@@ -467,25 +474,164 @@ class I16_RuntimeHealthGateTest {
             ),
         )
         assertTrue(frameworkExecutorPresent(registry, 1))
+        // Every App capability the companion can publish goes away and comes back, the way Shizuku
+        // death and rebind, Accessibility toggles and permission changes reach the registry: the
+        // executor the probe checks never moves.
+        val capabilityKeys = listOf(
+            "shizuku.shell", "execution.shell_guard", "execution.app_guard", "visual.accessibility",
+            "visual.media_projection_session", "android.notifications", "android.notification_listener",
+            "android.local_network", "automation.exact_alarm",
+        )
+        capabilityKeys.forEachIndexed { index, key ->
+            assertTrue(
+                registry.register(
+                    CapabilityRegistration(key, RegisteredCapabilityState.Unavailable, "LOST", 10L + index),
+                ),
+            )
+            assertTrue(key, frameworkExecutorPresent(registry, 1))
+            assertTrue(
+                registry.register(
+                    CapabilityRegistration(key, RegisteredCapabilityState.Available, null, 20L + index),
+                ),
+            )
+            assertTrue(key, frameworkExecutorPresent(registry, 1))
+        }
+        // Only the executor's own generation decides: a host transition republishes it.
         assertFalse(frameworkExecutorPresent(registry, 2))
+        assertTrue(
+            registry.register(
+                CapabilityRegistration(
+                    key = "android.framework",
+                    state = RegisteredCapabilityState.Available,
+                    reason = null,
+                    sourceGeneration = 2,
+                    executor = framework,
+                    primitives = setOf(AndroidPrimitive.ShizukuProcessStart),
+                ),
+            ),
+        )
+        assertTrue(frameworkExecutorPresent(registry, 2))
+        assertFalse(frameworkExecutorPresent(registry, 1))
         assertFalse(frameworkExecutorPresent(null, 1))
         // No health class names a capability: the gate cannot reset the Runtime for one.
         assertTrue(RuntimeHealthClass.entries.none { it.wire.contains("shizuku") || it.wire.contains("capability") })
     }
 
     @Test
-    fun i16_responseClassificationOnlyFlagsInfrastructureCodes() {
-        assertTrue(responseIndicatesInfrastructureFailure(failed("IO_ERROR")))
-        assertTrue(responseIndicatesInfrastructureFailure(failed("INTERNAL_ERROR")))
-        assertFalse(responseIndicatesInfrastructureFailure(ok()))
-        assertFalse(responseIndicatesInfrastructureFailure(failed("NOT_FOUND")))
-        assertFalse(responseIndicatesInfrastructureFailure("not json".encodeToByteArray()))
-        assertFalse(responseIndicatesInfrastructureFailure(byteArrayOf()))
-        assertFalse(
-            responseIndicatesInfrastructureFailure(
-                """{"outcome":"success","result":{"text":"IO_ERROR"}}""".encodeToByteArray(),
-            ),
+    fun i16_replyClassificationSeparatesProofFromSuspicion() {
+        assertEquals(RuntimeSettlement.Suspicious, runtimeSettlement(failed("IO_ERROR"), true))
+        assertEquals(RuntimeSettlement.Suspicious, runtimeSettlement(failed("INTERNAL_ERROR"), true))
+        assertEquals(RuntimeSettlement.Served, runtimeSettlement(ok(), true))
+        // A status read is served from projection: issue #2's false green is exactly that answer.
+        assertEquals(RuntimeSettlement.Inconclusive, runtimeSettlement(ok(), false))
+        assertEquals(RuntimeSettlement.Inconclusive, runtimeSettlement(failed("NOT_FOUND"), true))
+        assertEquals(RuntimeSettlement.Inconclusive, runtimeSettlement(failed("CAPABILITY_UNAVAILABLE"), true))
+        // A reply nobody can read proves nothing was answered.
+        assertEquals(RuntimeSettlement.Suspicious, runtimeSettlement("not json".encodeToByteArray(), true))
+        assertEquals(RuntimeSettlement.Suspicious, runtimeSettlement(byteArrayOf(), true))
+        assertEquals(
+            RuntimeSettlement.Served,
+            runtimeSettlement("""{"outcome":"success","result":{"text":"IO_ERROR"}}""".encodeToByteArray(), true),
         )
+        fun submission(tool: String) =
+            """{"protocol_version":1,"request_id":"r","payload":{"tool":"$tool","action":"x","input":{}}}"""
+                .encodeToByteArray()
+        assertFalse(submissionProvesExecution(submission("context")))
+        assertFalse(submissionProvesExecution(submission("task_control")))
+        assertTrue(submissionProvesExecution(submission("command")))
+        assertTrue(submissionProvesExecution(submission("filesystem")))
+        assertFalse(submissionProvesExecution("not json".encodeToByteArray()))
+    }
+
+    @Test
+    fun i16_noReplyAfterWithdrawalCanCloseTheBreakerOrResetItsCount() {
+        val harness = Harness(active(first))
+        val f1 = RuntimeFence(epoch, 1, "00000000-0000-4000-8000-0000000000a1")
+        val f2 = RuntimeFence(epoch, 1, "00000000-0000-4000-8000-0000000000a2")
+        val f3 = RuntimeFence(epoch, 1, "00000000-0000-4000-8000-0000000000a3")
+        harness.port.verdict = { fence, _ -> if (fence == f3) RuntimeHealthClass.Healthy else RuntimeHealthClass.BridgeFault }
+        for (fence in listOf(f1, f2)) {
+            harness.session.set(active(fence))
+            expectRefused { harness.gate.admit(harness.session.get()) }
+        }
+        // A request admitted on f3 while it still probed healthy...
+        harness.session.set(active(f3))
+        val stale = harness.session.get()
+        harness.gate.admit(stale)
+        // ...then a concurrent failure proves f3 unhealthy and opens the breaker.
+        harness.port.verdict = { _, _ -> RuntimeHealthClass.BridgeFault }
+        harness.gate.settle(stale, RuntimeSettlement.Suspicious)
+        assertTrue(harness.gate.establishmentBlocked())
+        // The admitted request's late reply, whatever it is, changes nothing.
+        harness.gate.settle(stale, RuntimeSettlement.Served)
+        harness.gate.settle(stale, RuntimeSettlement.Inconclusive)
+        assertTrue(harness.gate.establishmentBlocked())
+        assertEquals(3L, harness.gate.snapshot()["consecutive_withdrawals"]!!.jsonPrimitive.long)
+    }
+
+    @Test
+    fun i16_aStatusReadNeverCountsAsProofOfExecution() {
+        val harness = Harness(active(first))
+        harness.port.verdict = { fence, _ ->
+            if (fence == first) RuntimeHealthClass.BridgeFault else RuntimeHealthClass.Healthy
+        }
+        expectRefused { harness.gate.admit(harness.session.get()) }
+        harness.session.set(active(second))
+        harness.gate.serveApk(harness.session.get(), provesExecution = false) { ok() }
+        assertEquals(1L, harness.gate.snapshot()["consecutive_withdrawals"]!!.jsonPrimitive.long)
+        harness.gate.serveApk(harness.session.get(), provesExecution = true) { ok() }
+        assertEquals(0L, harness.gate.snapshot()["consecutive_withdrawals"]!!.jsonPrimitive.long)
+    }
+
+    @Test
+    fun i16_aDispatchThatThrowsIsSettledAsSuspiciousAndNeverRetried() {
+        val harness = Harness(active(first))
+        harness.port.verdict = { _, depth ->
+            if (depth == RuntimeProbeDepth.Deep) RuntimeHealthClass.BridgeFault else RuntimeHealthClass.Healthy
+        }
+        val thrown = IllegalStateException("jni returned null")
+        try {
+            harness.gate.serveApk(harness.session.get(), true) {
+                harness.dispatches.incrementAndGet()
+                throw thrown
+            }
+            fail("the throw was swallowed")
+        } catch (caught: IllegalStateException) {
+            assertSame(thrown, caught)
+        }
+        assertEquals(1, harness.dispatches.get())
+        assertFalse(harness.session.get().started)
+        assertEquals(listOf(RuntimeHealthPhase.Settlement), harness.port.recordedPhases.toList())
+    }
+
+    @Test
+    fun i16_withdrawalHoldsTheEstablishmentMonitorSoStartCannotInterleave() {
+        val harness = Harness(active(first))
+        harness.port.verdict = { _, _ -> RuntimeHealthClass.LeaseStale }
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val holder = Thread {
+            synchronized(harness) {
+                entered.countDown()
+                release.await()
+            }
+        }
+        holder.start()
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        val admitter = Thread { runCatching { harness.gate.admit(harness.session.get()) } }
+        admitter.start()
+        // While another caller holds the controller monitor (as start() does), nothing is withdrawn.
+        Thread.sleep(200)
+        assertTrue(harness.session.get().started)
+        assertEquals(0, harness.port.records.get())
+        release.countDown()
+        admitter.join(5_000)
+        holder.join(5_000)
+        assertFalse(harness.session.get().started)
+        assertEquals(1, harness.port.records.get())
+        assertTrue(harness.gate.releasePending())
+        harness.gate.releaseObserved()
+        assertFalse(harness.gate.releasePending())
     }
 
     @Test
@@ -503,5 +649,67 @@ class I16_RuntimeHealthGateTest {
         for (healthClass in RuntimeHealthClass.entries - RuntimeHealthClass.Healthy) {
             assertNotNull(DaemonErrorToken.entries.firstOrNull { it.wire == healthClass.faultCode })
         }
+    }
+
+    @Test
+    fun i16_anExecutorsOwnExceptionIsItsTypedFailureNotABridgeFault() {
+        fun request() = AndroidExecutionRequest(
+            primitive = AndroidPrimitive.PackageInspect,
+            payload = byteArrayOf(),
+            executionId = "00000000-0000-4000-8000-0000000000f1",
+            runtimeEpoch = epoch,
+            hostGeneration = 1,
+            runtimeInstanceId = first.runtimeInstanceId,
+        )
+        // Before issue #2's fix this escaped to JNI and was answered as IO_ERROR on the shared bridge.
+        val thrown = NativeAndroidExecutionDispatcher.dispatch(
+            AndroidExecutionBridge { throw IllegalStateException("SecurityException from the platform") },
+            request(),
+        )
+        assertEquals("INTERNAL_ERROR", thrown.errorCode)
+        val typed = NativeAndroidExecutionDispatcher.dispatch(
+            AndroidExecutionBridge { throw AndroidExecutionException("PERMISSION_DENIED") },
+            request(),
+        )
+        assertEquals("PERMISSION_DENIED", typed.errorCode)
+        val served = NativeAndroidExecutionDispatcher.dispatch(
+            AndroidExecutionBridge { AndroidExecutionResult("ok".encodeToByteArray()) },
+            request(),
+        )
+        assertNull(served.errorCode)
+    }
+
+    @Test
+    fun i16_aWithdrawnInstancesTaskCountStopsHoldingTheForegroundService() {
+        val seen = mutableListOf<Long>()
+        NativeAndroidExecutionDispatcher.installTaskActivitySink(seen::add)
+        seen.clear()
+        NativeAndroidExecutionDispatcher.taskActivityChanged("epoch-i16", 2, 5)
+        NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity()
+        // The next instance republishes from a clean slate, even at the same store revision.
+        NativeAndroidExecutionDispatcher.taskActivityChanged("epoch-i16", 2, 5)
+        // A daemon-published count is the daemon's to forget, never the App Runtime's.
+        NativeAndroidExecutionDispatcher.daemonTaskActivityChanged("epoch-i16-daemon", 1, 1)
+        NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity()
+        NativeAndroidExecutionDispatcher.forgetDaemonTaskActivity()
+        NativeAndroidExecutionDispatcher.installTaskActivitySink(null)
+        assertEquals(listOf(2L, 0L, 2L, 1L, 0L), seen)
+    }
+
+    @Test
+    fun i16_kotlinHealthClassesMatchTheSharedNativeContract() {
+        val text = checkNotNull(
+            javaClass.classLoader?.getResourceAsStream("contract/runtime-health-classes.v1.json"),
+        ).bufferedReader(Charsets.UTF_8).use { it.readText() }
+        val fixture = Json.parseToJsonElement(text).jsonObject
+        assertEquals(1L, fixture["schema_version"]!!.jsonPrimitive.long)
+        val native = fixture["classes"]!!.jsonArray.map { it.jsonPrimitive.content }
+        // Every class the native probe reports decodes to itself; only the Kotlin-side probe
+        // failure is not a native class, so a rename can never silently become probe_failed.
+        assertEquals(
+            native,
+            (RuntimeHealthClass.entries - RuntimeHealthClass.ProbeFailed).map { it.wire },
+        )
+        native.forEach { wire -> assertEquals(wire, RuntimeHealthClass.decode(wire).wire) }
     }
 }

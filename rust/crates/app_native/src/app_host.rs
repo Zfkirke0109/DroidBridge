@@ -92,6 +92,16 @@ pub(super) fn start_host(
     base: PathBuf,
     environment_json: &str,
 ) -> Result<StartResult, DomainError> {
+    {
+        let slot = host_slot()
+            .lock()
+            .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?;
+        if let Some(host) = slot.as_ref() {
+            return existing_host_result(host);
+        }
+    }
+    // Waited for without the slot, so a draining instance's own requests can still reach it.
+    await_released_lifetime(&base, RELEASED_LIFETIME_WAIT)?;
     let mut slot = host_slot()
         .lock()
         .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?;
@@ -131,7 +141,6 @@ pub(super) fn start_host(
         pid: std::process::id(),
         start_ticks: read_start_ticks(Path::new("/proc/self/stat"))?,
     };
-    await_released_lifetime(&base)?;
     let lease = Arc::new(store.acquire_lifetime(live)?);
     activate_app_host(
         &mut slot,
@@ -146,11 +155,13 @@ pub(super) fn start_host(
     )
 }
 
+const RELEASED_LIFETIME_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A quarantined instance (issue #2) keeps its lifetime lock until the last request it already
 /// admitted ends. The next instance waits a bounded time for that release, then fails this start as
 /// unavailable instead of blocking every caller of the start behind it; a later request starts it.
-fn await_released_lifetime(base: &Path) -> Result<(), DomainError> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+fn await_released_lifetime(base: &Path, wait: std::time::Duration) -> Result<(), DomainError> {
+    let deadline = std::time::Instant::now() + wait;
     loop {
         if persistence::FileLock::try_acquire(&base.join("runtime-live.lock"))?.is_some() {
             return Ok(());
@@ -422,7 +433,7 @@ fn publish_ready_host(
         AndroidFrameworkFilesystemDispatcher,
         runtime.capability_port(runtime_instance_id.clone()),
     ));
-    spawn_automation_scheduler(
+    let automation_scheduler = spawn_automation_scheduler(
         &async_runtime,
         core.clone(),
         Arc::clone(&automation_wake),
@@ -448,6 +459,7 @@ fn publish_ready_host(
         product_version,
         admission_open: AtomicBool::new(admission_open),
         automation_wake,
+        automation_scheduler,
     }));
     Ok(StartResult {
         ready: true,
@@ -501,7 +513,7 @@ fn spawn_automation_scheduler(
     core: ApkCore,
     wake: Arc<crate::ApkAutomationWake>,
     fault: AutomationFaultContext,
-) {
+) -> tokio::task::AbortHandle {
     let fault = Arc::new(fault);
     let pass_fault = Arc::clone(&fault);
     // A failed pass is retried by the loop itself; the fault file keeps the record of it.
@@ -510,18 +522,20 @@ fn spawn_automation_scheduler(
             let _recorded = record_scheduler_fault(&pass_fault, error, "automation_scheduler_pass");
         }),
     );
-    async_runtime.spawn(async move {
-        let ended = async {
-            scheduler.publish_runtime_ready().await?;
-            scheduler.run(wake.as_ref()).await
-        }
-        .await;
-        if let Err(error) = ended {
-            // The fault file is the last channel a detached scheduler has; if it cannot be
-            // written either, the stopped scheduler still leaves persisted dues unchanged.
-            let _recorded = record_scheduler_fault(&fault, &error, "automation_scheduler_run");
-        }
-    });
+    async_runtime
+        .spawn(async move {
+            let ended = async {
+                scheduler.publish_runtime_ready().await?;
+                scheduler.run(wake.as_ref()).await
+            }
+            .await;
+            if let Err(error) = ended {
+                // The fault file is the last channel a detached scheduler has; if it cannot be
+                // written either, the stopped scheduler still leaves persisted dues unchanged.
+                let _recorded = record_scheduler_fault(&fault, &error, "automation_scheduler_run");
+            }
+        })
+        .abort_handle()
 }
 
 fn record_scheduler_fault(
@@ -560,5 +574,43 @@ fn read_previous_live(base: &Path) -> Result<Option<RuntimeLive>, DomainError> {
             .map_err(|_| DomainError::new(ErrorCode::IoError, "runtime live record is invalid")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(io_error(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p0_a_successor_start_waits_a_bounded_time_for_the_released_lifetime() {
+        let base = std::env::temp_dir().join(format!(
+            "droidbridge-lifetime-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        // Free: no wait at all.
+        let started = std::time::Instant::now();
+        await_released_lifetime(&base, std::time::Duration::from_secs(2)).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        // Held by a draining instance: refused as unavailable once the bound passes.
+        let held = persistence::FileLock::try_acquire(&base.join("runtime-live.lock"))
+            .unwrap()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let refused =
+            await_released_lifetime(&base, std::time::Duration::from_millis(200)).unwrap_err();
+        assert_eq!(refused.code, ErrorCode::CapabilityUnavailable);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // Released while waiting: the successor proceeds.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        await_released_lifetime(&base, std::time::Duration::from_secs(2)).unwrap();
+        releaser.join().unwrap();
+        fs::remove_dir_all(base).unwrap();
     }
 }

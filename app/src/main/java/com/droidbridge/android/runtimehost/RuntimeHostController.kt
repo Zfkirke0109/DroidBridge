@@ -42,6 +42,8 @@ private const val DEAD_HOST_RECOVERY_DELAY_MILLIS = 31_000L
 private const val DIAGNOSTICS_DEADLINE_MILLIS = 2_000L
 private const val MAINTENANCE_RESET = """{"schema_version":1,"reset":true}"""
 private const val PRIVILEGED_INSTALL_TIMEOUT_MILLIS = 330_000L
+private const val RELEASE_WAIT_MILLIS = 5_000L
+private const val RELEASE_POLL_MILLIS = 50L
 
 internal enum class MagiskHostStatusAction {
     Wait,
@@ -115,6 +117,7 @@ internal class RuntimeHostController(
     private val promotionState = HostPromotionState()
     private val promotionConnection = AtomicReference<DaemonConnection?>(null)
     private val hintSink = AtomicReference<((String) -> Unit)?>(null)
+    private val automationRetrySink = AtomicReference<((Long) -> Unit)?>(null)
     private val frameworkReadySink = AtomicReference<((Long) -> Unit)?>(null)
     private val companionDisconnectedSink = AtomicReference<(() -> Boolean)?>(null)
     private val networkAttachmentSource = AtomicReference<(() -> String?)?>(null)
@@ -159,8 +162,8 @@ internal class RuntimeHostController(
                 healthClass: RuntimeHealthClass,
                 phase: RuntimeHealthPhase,
             ): Boolean = NativeRuntime.nativeRecordRuntimeHealthFault(
-                fence.runtimeEpoch,
-                fence.hostGeneration,
+                canonicalBase.absolutePath,
+                BuildConfig.VERSION_NAME,
                 fence.runtimeInstanceId,
                 healthClass.faultCode,
                 runtimeHealthFaultPhase(phase, healthClass, fence.hostGeneration),
@@ -173,7 +176,7 @@ internal class RuntimeHostController(
             )
         },
         nowMillis = SystemClock::elapsedRealtime,
-        onWithdrawn = { hintSink.get()?.invoke("context.status") },
+        onWithdrawn = ::onApkInstanceWithdrawn,
     )
 
     /** One bounded worker for S-UI-017 status reads; a timed-out read never blocks the next caller. */
@@ -257,6 +260,18 @@ internal class RuntimeHostController(
                 inactiveSession(observedSession.host, DaemonErrorToken.CapabilityUnavailable.wire),
             )
             return false
+        }
+        if (health.releasePending()) {
+            // A withdrawn instance keeps its lifetime lease until the requests it admitted end; the
+            // next one is refused at once instead of every caller waiting behind this monitor.
+            if (!NativeRuntime.nativeLifetimeReleased(canonicalBase.absolutePath)) {
+                runtimeSession.compareAndSet(
+                    observedSession,
+                    inactiveSession(observedSession.host, DaemonErrorToken.CapabilityUnavailable.wire),
+                )
+                return false
+            }
+            health.releaseObserved()
         }
         val packageInfo = application.packageManager.getPackageInfo(application.packageName, 0)
         val environment = JSONObject()
@@ -373,6 +388,8 @@ internal class RuntimeHostController(
             startCompanion()
             return false
         }
+        // Marked before the session publishes it, so no request can reach it unprobed.
+        health.onEstablished(activatedFence)
         if (!runtimeSession.compareAndSet(observedSession, activated)) {
             NativeRuntime.nativeRecordHostFault(
                 DaemonErrorToken.StaleAuthority.wire,
@@ -381,7 +398,6 @@ internal class RuntimeHostController(
             startCompanion()
             return runtimeSession.get().started
         }
-        health.onEstablished(activatedFence)
         startCompanion()
         replayCompanionFacts()
         registerPlatformFacts()
@@ -469,15 +485,29 @@ internal class RuntimeHostController(
         return accepted
     }
 
-    fun submit(envelope: ByteArray): ByteArray {
-        if (!start()) throw RuntimeStartException(runtimeSession.get().startFailure)
+    fun submit(envelope: ByteArray): ByteArray = submit(envelope, establish = true)
+
+    /**
+     * One submission. [establish] false serves only an instance that is already started, for the
+     * S-UI-017 diagnostics read that must report a stopped session rather than start one.
+     */
+    private fun submit(envelope: ByteArray, establish: Boolean): ByteArray {
+        if (establish && !start()) throw RuntimeStartException(runtimeSession.get().startFailure)
         val session = runtimeSession.get()
         val fence = session.activeFence ?: throw RuntimeStartException(session.startFailure)
         frameworkReadySink.get()?.invoke(fence.hostGeneration)
         registerPlatformFacts()
         if (session.host == DaemonHostToken.ApkRuntime) {
-            // Admitted only after the health probe; dispatched exactly once; never replayed (issue #2).
-            return health.serveApk(session) { NativeRuntime.nativeSubmit(envelope) }
+            // Admitted only after the health probe; dispatched exactly once, and only to the
+            // instance that was probed; never replayed (issue #2).
+            return health.serveApk(session, submissionProvesExecution(envelope)) {
+                NativeRuntime.nativeSubmitAdmitted(
+                    envelope,
+                    fence.runtimeEpoch,
+                    fence.hostGeneration,
+                    fence.runtimeInstanceId,
+                )
+            }
         }
         val connection = companion.connection()
             ?: throw RuntimeStartException(DaemonErrorToken.CapabilityUnavailable.wire)
@@ -529,8 +559,11 @@ internal class RuntimeHostController(
     fun queryArtifacts(query: ByteArray): McpArtifactQueryReply {
         if (!start()) throw RuntimeStartException(runtimeSession.get().startFailure)
         val session = runtimeSession.get()
-        session.activeFence ?: throw RuntimeStartException(session.startFailure)
+        val fence = session.activeFence ?: throw RuntimeStartException(session.startFailure)
         if (session.host == DaemonHostToken.ApkRuntime) {
+            // The probe checks the framework executor at the live generation, so publish it first
+            // exactly as [submit] does.
+            frameworkReadySink.get()?.invoke(fence.hostGeneration)
             health.admit(session)
             val slot = intArrayOf(-1)
             val payload = NativeRuntime.nativeQueryArtifacts(query, slot)
@@ -744,7 +777,7 @@ internal class RuntimeHostController(
                     put("input", buildJsonObject { put("detail", "full") })
                 })
             }.toString().encodeToByteArray()
-            val read = diagnosticsReads.submit<ByteArray> { submit(envelope) }
+            val read = diagnosticsReads.submit<ByteArray> { submit(envelope, establish = false) }
             runCatching { read.get(DIAGNOSTICS_DEADLINE_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS) }
                 .onFailure { read.cancel(true) }
                 .getOrNull()
@@ -798,8 +831,10 @@ internal class RuntimeHostController(
         val idle = runtimeSession.get()
         if (!idle.started && idle.host == DaemonHostToken.ApkRuntime) {
             // An instance withdrawn as unhealthy (issue #2) leaves none to record the reset under.
-            // Reset is the user's explicit recovery, so it establishes one first, past the breaker.
+            // Reset is the user's explicit recovery, so it establishes one first, past the breaker,
+            // once the withdrawn instance has released its lease (bounded like the native reset).
             health.clearBreaker()
+            awaitWithdrawnInstanceRelease()
             start()
         }
         val source = runtimeSession.get()
@@ -841,6 +876,16 @@ internal class RuntimeHostController(
         activateAfterMaintenance()
     }
 
+    private fun awaitWithdrawnInstanceRelease() {
+        if (!health.releasePending()) return
+        val deadline = SystemClock.elapsedRealtime() + RELEASE_WAIT_MILLIS
+        while (!NativeRuntime.nativeLifetimeReleased(canonicalBase.absolutePath)) {
+            if (SystemClock.elapsedRealtime() >= deadline) return
+            Thread.sleep(RELEASE_POLL_MILLIS)
+        }
+        health.releaseObserved()
+    }
+
     private fun activateAfterMaintenance(): String {
         health.clearBreaker()
         runtimeSession.updateAndGet { current ->
@@ -877,7 +922,17 @@ internal class RuntimeHostController(
      */
     fun wakeAutomation(): Boolean {
         registerPlatformFacts()
-        if (!start()) return false
+        val admitted = start() && runtimeSession.get().let { session ->
+            // Automations execute through the same instance, so they are admitted like a request.
+            session.host != DaemonHostToken.ApkRuntime || runCatching { health.admit(session) }.isSuccess
+        }
+        if (!admitted) {
+            // The single exact alarm that fired is spent. While establishment is held off (the
+            // breaker, or a withdrawn instance still draining), one wake when it may be tried
+            // again lets the next instance re-project the canonical dues.
+            health.establishmentRetryMillis()?.let { delay -> automationRetrySink.get()?.invoke(delay) }
+            return false
+        }
         if (runtimeSession.get().host != DaemonHostToken.ApkRuntime) return true
         return NativeRuntime.nativeAutomationWake()
     }
@@ -999,6 +1054,23 @@ internal class RuntimeHostController(
 
     fun setHintSink(sink: ((String) -> Unit)?) {
         hintSink.set(sink)
+    }
+
+    /** Arms one Automation wake after the given delay in milliseconds. */
+    fun setAutomationRetrySink(sink: ((Long) -> Unit)?) {
+        automationRetrySink.set(sink)
+    }
+
+    /**
+     * Issue #2: releases what the withdrawn instance projected into this process, so the next
+     * instance does not inherit it: its default-network subscription and the Task count that
+     * holds the foreground service. Its exact alarm is kept, because that wake is what
+     * establishes the next instance when no request does.
+     */
+    private fun onApkInstanceWithdrawn() {
+        runCatching { companionDisconnectedSink.get()?.invoke() }
+        runCatching { NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity() }
+        hintSink.get()?.invoke("context.status")
     }
 
     fun setFrameworkReadySink(sink: ((Long) -> Unit)?) {
@@ -1333,10 +1405,11 @@ internal class RuntimeHostController(
                     result.getLong("host_generation"),
                     result.getString("runtime_instance_id"),
                 )
-                if (!runtimeSession.compareAndSet(observedSession, activated)) return@execute
                 activated.activeFence?.let(health::onEstablished)
+                if (!runtimeSession.compareAndSet(observedSession, activated)) return@execute
                 replayCompanionFacts()
                 registerPlatformFacts()
+                publishFrameworkPrimitives(result.getLong("host_generation"))
                 val guard = File(
                     application.applicationInfo.nativeLibraryDir,
                     "libdroidbridge_exec_guard.so",
@@ -1645,8 +1718,8 @@ internal class RuntimeHostController(
             activated.getLong("host_generation"),
             instance,
         )
-        if (!runtimeSession.compareAndSet(observedSession, targetSession)) return
         targetSession.activeFence?.let(health::onEstablished)
+        if (!runtimeSession.compareAndSet(observedSession, targetSession)) return
         replayCompanionFacts()
         registerPlatformFacts()
         publishFrameworkPrimitives(activated.getLong("host_generation"))

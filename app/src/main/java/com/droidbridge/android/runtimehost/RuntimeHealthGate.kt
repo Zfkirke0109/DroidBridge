@@ -41,6 +41,18 @@ internal enum class RuntimeHealthPhase(val wire: String) {
     Settlement("settlement"),
 }
 
+/** What one dispatched request's reply proves about the instance that served it. */
+internal enum class RuntimeSettlement {
+    /** A business request completed: the instance demonstrably executes. */
+    Served,
+
+    /** Proves nothing either way: an ordinary refusal, or a status read served from projection. */
+    Inconclusive,
+
+    /** What an unusable instance produces: IO_ERROR, INTERNAL_ERROR, an unreadable reply, a throw. */
+    Suspicious,
+}
+
 internal interface RuntimeHealthPort {
     fun probe(fence: RuntimeFence, depth: RuntimeProbeDepth): RuntimeHealthClass
 
@@ -87,6 +99,7 @@ internal class RuntimeHealthGate(
     /** The last settlement deep probe that proved an instance healthy; it bounds how often one runs. */
     private var lastDeepProbe: Pair<RuntimeFence, Long>? = null
     private val quarantined = LinkedHashSet<String>()
+    private var releasePending = false
     private var consecutiveWithdrawals = 0
     private var breakerUntilMillis = 0L
     private var last: Withdrawal? = null
@@ -117,17 +130,25 @@ internal class RuntimeHealthGate(
     }
 
     /**
-     * Runs after one dispatched request. An infrastructure failure deep-probes the instance and, if
-     * it is unhealthy, withdraws it; the response itself is the caller's to return unchanged.
+     * Runs after one dispatched request. Only a business request the still-authoritative instance
+     * served counts as proof it executes; an infrastructure failure deep-probes the instance and,
+     * if it is unhealthy, withdraws it. The response itself is the caller's to return unchanged,
+     * and an open breaker only expires or is cleared by an explicit recovery, never by a reply.
      */
-    fun settle(observed: RuntimeSessionState, suspicious: Boolean) {
+    fun settle(observed: RuntimeSessionState, settlement: RuntimeSettlement) {
         val fence = observed.activeFence ?: return
-        if (!suspicious) {
-            synchronized(state) {
-                consecutiveWithdrawals = 0
-                breakerUntilMillis = 0L
+        when (settlement) {
+            RuntimeSettlement.Inconclusive -> return
+            RuntimeSettlement.Served -> {
+                synchronized(state) {
+                    // A reply from an instance already withdrawn says nothing about the next one.
+                    if (session.get() === observed && fence.runtimeInstanceId !in quarantined) {
+                        consecutiveWithdrawals = 0
+                    }
+                }
+                return
             }
-            return
+            RuntimeSettlement.Suspicious -> Unit
         }
         val now = nowMillis()
         val recentlyProven = synchronized(state) {
@@ -145,6 +166,29 @@ internal class RuntimeHealthGate(
     /** True while repeated unhealthy instances hold off establishing another one. */
     fun establishmentBlocked(): Boolean = synchronized(state) { nowMillis() < breakerUntilMillis }
 
+    /**
+     * True from a withdrawal until [releaseObserved]: the withdrawn instance may still hold its
+     * lifetime lease while requests it admitted finish.
+     */
+    fun releasePending(): Boolean = synchronized(state) { releasePending }
+
+    fun releaseObserved() {
+        synchronized(state) { releasePending = false }
+    }
+
+    /**
+     * When establishment is being held off, how long until it may be tried again: the breaker's
+     * remaining time, or a short wait while a withdrawn instance still drains. Null otherwise.
+     */
+    fun establishmentRetryMillis(): Long? = synchronized(state) {
+        val remaining = breakerUntilMillis - nowMillis()
+        when {
+            remaining > 0 -> remaining
+            releasePending -> RELEASE_RETRY_MILLIS
+            else -> null
+        }
+    }
+
     /** True for an instance this gate already withdrew: it can never become authoritative again. */
     fun rejectsEstablishment(fence: RuntimeFence): Boolean =
         synchronized(state) { fence.runtimeInstanceId in quarantined }
@@ -161,6 +205,7 @@ internal class RuntimeHealthGate(
         val now = nowMillis()
         buildJsonObject {
             put("consecutive_withdrawals", consecutiveWithdrawals)
+            put("release_pending", releasePending)
             put("breaker_open", now < breakerUntilMillis)
             if (now < breakerUntilMillis) put("breaker_remaining_ms", breakerUntilMillis - now)
             last?.let { withdrawal ->
@@ -198,6 +243,7 @@ internal class RuntimeHealthGate(
                 quarantined += fence.runtimeInstanceId
                 while (quarantined.size > MAX_REMEMBERED_INSTANCES) quarantined.remove(quarantined.first())
                 if (deepProbePending == fence) deepProbePending = null
+                releasePending = true
             }
             val recorded = runCatching { port.recordFault(fence, verdict, phase) }.getOrDefault(false)
             val released = runCatching { port.quarantine(fence) }.getOrDefault(false)
@@ -221,29 +267,61 @@ internal class RuntimeHealthGate(
         const val MAX_BREAKER_DOUBLINGS = 5
         const val DEEP_PROBE_INTERVAL_MILLIS = 5_000L
         const val MAX_REMEMBERED_INSTANCES = 16
+        const val RELEASE_RETRY_MILLIS = 15_000L
     }
 }
 
 /**
  * One APK request through the gate: probe, dispatch exactly once, settle. The response is returned
- * unchanged whatever the settlement finds, so nothing here can run the request a second time.
+ * unchanged whatever the settlement finds, and a dispatch that throws is settled as suspicious and
+ * rethrown, so nothing here can run the request a second time.
  */
-internal fun RuntimeHealthGate.serveApk(observed: RuntimeSessionState, dispatch: () -> ByteArray): ByteArray {
+internal fun RuntimeHealthGate.serveApk(
+    observed: RuntimeSessionState,
+    provesExecution: Boolean,
+    dispatch: () -> ByteArray,
+): ByteArray {
     admit(observed)
-    val response = dispatch()
-    settle(observed, responseIndicatesInfrastructureFailure(response))
+    val response = try {
+        dispatch()
+    } catch (failure: Throwable) {
+        settle(observed, RuntimeSettlement.Suspicious)
+        throw failure
+    }
+    settle(observed, runtimeSettlement(response, provesExecution))
     return response
 }
 
 /**
- * Whether one Runtime response failed with a code that can mean the instance itself is broken
- * rather than the operation: the codes a lost bridge, store or descriptor table collapse into.
+ * What one Runtime reply proves. IO_ERROR and INTERNAL_ERROR are the codes a lost bridge, store or
+ * descriptor table collapse into, and a reply that cannot be read proves nothing was answered.
+ * Only a successful business request ([provesExecution]) shows the instance executes.
  */
-internal fun responseIndicatesInfrastructureFailure(response: ByteArray): Boolean = runCatching {
-    val envelope = Json.parseToJsonElement(response.decodeToString()).jsonObject
-    if ((envelope["outcome"] as? JsonPrimitive)?.content != "error") return@runCatching false
-    val code = ((envelope["error"] as? JsonObject)?.get("code") as? JsonPrimitive)?.content
-    code == DaemonErrorToken.IoError.wire || code == DaemonErrorToken.InternalError.wire
+internal fun runtimeSettlement(response: ByteArray, provesExecution: Boolean): RuntimeSettlement {
+    val envelope = runCatching { Json.parseToJsonElement(response.decodeToString()).jsonObject }.getOrNull()
+        ?: return RuntimeSettlement.Suspicious
+    return when ((envelope["outcome"] as? JsonPrimitive)?.content) {
+        "success" -> if (provesExecution) RuntimeSettlement.Served else RuntimeSettlement.Inconclusive
+        "error" -> {
+            val code = ((envelope["error"] as? JsonObject)?.get("code") as? JsonPrimitive)?.content
+            if (code == DaemonErrorToken.IoError.wire || code == DaemonErrorToken.InternalError.wire) {
+                RuntimeSettlement.Suspicious
+            } else {
+                RuntimeSettlement.Inconclusive
+            }
+        }
+        else -> RuntimeSettlement.Suspicious
+    }
+}
+
+/**
+ * Whether one submission exercises execution. `context` reads are projections and `task_control`
+ * reads the store, so neither proves an executor works.
+ */
+internal fun submissionProvesExecution(envelope: ByteArray): Boolean = runCatching {
+    val tool = (Json.parseToJsonElement(envelope.decodeToString()).jsonObject["payload"] as? JsonObject)
+        ?.get("tool") as? JsonPrimitive
+    tool?.content !in setOf("context", "task_control")
 }.getOrDefault(false)
 
 /** The fault record phase: bounded ASCII naming where, why and at which host generation. */

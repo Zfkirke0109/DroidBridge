@@ -196,6 +196,8 @@ struct NativeHost {
     product_version: String,
     admission_open: AtomicBool,
     automation_wake: Arc<ApkAutomationWake>,
+    /// Stops this instance's Automation scheduler when the instance is quarantined (issue #2).
+    automation_scheduler: tokio::task::AbortHandle,
 }
 
 type ApkAutomationWake =
@@ -1076,13 +1078,11 @@ fn dispatch_android_execution_for_with_descriptor(
                 env, dispatcher, key, primitive, payload, execution, descriptor,
             )
         })
-        .map_err(|error| {
-            // An executor's own exception fails that operation; any other JNI failure means the
-            // path every Android primitive shares is broken, which the next health probe reports.
-            let caught = matches!(error, jni::errors::Error::CaughtJavaException { .. });
-            if runtime_health::bridge_failure_latches(caught) {
-                runtime_health::latch_bridge_fault(instance);
-            }
+        .map_err(|_| {
+            // The dispatcher answers an executor's own exception as that operation's typed
+            // failure, so a JNI failure here is on the path every Android primitive shares; the
+            // next health probe reports it.
+            runtime_health::latch_bridge_fault(instance);
             DomainError::new(ErrorCode::IoError, "Android execution bridge failed")
         })?;
     if let Some(error_code) = error_code {
@@ -2410,14 +2410,40 @@ fn probe_runtime_health(
             Ok(()) => HealthClass::Healthy,
             Err(_) => HealthClass::StoreUnwritable,
         },
-        probe_execution_bridge(fence.host_generation),
+        probe_execution_bridge(&host, fence.host_generation),
     ])
+}
+
+/// Bounds the deep probe's registry round trip; a bridge that cannot answer in this time is not
+/// one an execution can use.
+#[cfg(target_os = "android")]
+const BRIDGE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Runs the registry round trip on the instance's own blocking pool, where command and network
+/// executions attach to the VM, so the probe crosses the bridge the way those executions do.
+#[cfg(target_os = "android")]
+fn probe_execution_bridge(host: &NativeHost, host_generation: u64) -> runtime_health::HealthClass {
+    use runtime_health::HealthClass;
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Never block a reactor thread on its own pool.
+        return probe_execution_bridge_here(host_generation);
+    }
+    let probe = host
+        .async_runtime
+        .spawn_blocking(move || probe_execution_bridge_here(host_generation));
+    match host
+        .async_runtime
+        .block_on(async { tokio::time::timeout(BRIDGE_PROBE_TIMEOUT, probe).await })
+    {
+        Ok(Ok(class)) => class,
+        Ok(Err(_)) | Err(_) => HealthClass::BridgeFault,
+    }
 }
 
 /// One registry read through the cached dispatcher class and the same JNI attach real dispatch
 /// uses, so a bridge that would fail an execution fails this read instead.
 #[cfg(target_os = "android")]
-fn probe_execution_bridge(host_generation: u64) -> runtime_health::HealthClass {
+fn probe_execution_bridge_here(host_generation: u64) -> runtime_health::HealthClass {
     use runtime_health::HealthClass;
     let Some(dispatcher) = ANDROID_EXECUTION_DISPATCHER.get() else {
         return HealthClass::BridgeFault;
@@ -2445,13 +2471,16 @@ fn probe_execution_bridge(host_generation: u64) -> runtime_health::HealthClass {
 }
 
 #[cfg(not(target_os = "android"))]
-fn probe_execution_bridge(_host_generation: u64) -> runtime_health::HealthClass {
+fn probe_execution_bridge(
+    _host: &NativeHost,
+    _host_generation: u64,
+) -> runtime_health::HealthClass {
     runtime_health::HealthClass::Healthy
 }
 
-/// Closes admission on the instance the fence names and releases it from the slot. Requests that
-/// already hold it finish on it; its lifetime lease is released with its last reference, off the
-/// caller's thread, because stopping its reactor waits for its blocking executions.
+/// Closes admission on the instance the fence names, stops its Automation scheduler and takes it
+/// out of the slot, so no new request or scheduled pass reaches it. Requests that already hold it
+/// finish on it; the instance is released off the caller's thread once they have.
 fn quarantine_host(fence: &runtime_health::ExpectedFence<'_>) -> Result<bool, DomainError> {
     let mut slot = host_slot()
         .lock()
@@ -2467,11 +2496,35 @@ fn quarantine_host(fence: &runtime_health::ExpectedFence<'_>) -> Result<bool, Do
     };
     drop(slot);
     host.admission_open.store(false, Ordering::SeqCst);
-    // If the thread cannot start, the closure and the instance it holds are dropped right here.
+    host.automation_scheduler.abort();
+    // If the thread cannot start, the closure and the instance it holds are released right here.
     let _ = std::thread::Builder::new()
         .name("droidbridge-host-release".to_owned())
-        .spawn(move || drop(host));
+        .spawn(move || release_quarantined_host(host));
     Ok(true)
+}
+
+/// How often the release thread looks for the last in-flight request to have let go.
+const QUARANTINE_RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Waits until this thread holds the only reference, then stops the instance's reactor (which
+/// waits for its blocking executions) while still holding its lifetime lease, and releases the
+/// lease last. A successor can therefore never start while this instance's work still runs.
+fn release_quarantined_host(mut host: Arc<NativeHost>) {
+    loop {
+        match Arc::try_unwrap(host) {
+            Ok(owned) => {
+                let lease = Arc::clone(&owned._lease);
+                drop(owned);
+                drop(lease);
+                return;
+            }
+            Err(shared) => {
+                host = shared;
+                std::thread::sleep(QUARANTINE_RELEASE_POLL);
+            }
+        }
+    }
 }
 
 fn expected_fence_strings(
@@ -2518,36 +2571,68 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
     }
 }
 
-/// Records one health fault under exactly the instance the fence names, while it still holds the
-/// slot; a different or released instance records nothing and answers false.
+/// Records one health fault in the canonical host fault file under the instance the fence names.
+/// It needs no live slot, so a missing or replaced instance (`host_missing`, `fence_mismatch`) is
+/// recorded as well; the instance identifier is recorded only when it is a canonical UUID.
+fn record_runtime_health_fault(
+    base: &Path,
+    product_version: String,
+    runtime_instance_id: &str,
+    code: String,
+    phase: String,
+) -> Result<(), DomainError> {
+    let now = Utc::now();
+    let now_ms = u64::try_from(now.timestamp_millis())
+        .map_err(|_| DomainError::new(ErrorCode::InternalError, "clock is before epoch"))?;
+    FaultFileStore::new(base, FaultRole::Host).append(
+        FaultRecord {
+            record_id: new_uuid()?,
+            at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            component: "apk_runtime_health".to_owned(),
+            code,
+            phase,
+            product_version,
+            boot_id: read_boot_id()?,
+            runtime_instance_id: UuidV4::parse(runtime_instance_id.to_owned())
+                .ok()
+                .filter(|parsed| parsed.as_str() == runtime_instance_id),
+            execution_id: None,
+            exit_code: None,
+            signal: None,
+            repeat_count: 1,
+        },
+        now_ms,
+    )
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeRecordRuntimeHealthFault(
     mut env: EnvUnowned,
     _class: JClass,
-    runtime_epoch: JString,
-    host_generation: jlong,
+    canonical_base: JString,
+    product_version: JString,
     runtime_instance_id: JString,
     code: JString,
     phase: JString,
 ) -> jboolean {
     match env
         .with_env(|owned| -> jni::errors::Result<jboolean> {
-            let (epoch, instance) =
-                expected_fence_strings(owned, &runtime_epoch, &runtime_instance_id)?;
+            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
+            let product_version = product_version.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
             let code = code.mutf8_chars(owned)?.to_str().into_owned();
             let phase = phase.mutf8_chars(owned)?.to_str().into_owned();
-            let recorded = u64::try_from(host_generation)
-                .ok()
-                .and_then(|host_generation| {
-                    fenced_host(&runtime_health::ExpectedFence {
-                        runtime_epoch: &epoch,
-                        host_generation,
-                        runtime_instance_id: &instance,
-                    })
-                });
-            let recorded = recorded.is_some_and(|host| {
-                append_host_fault(&host, "apk_runtime_health", code, phase).is_ok()
-            });
+            let recorded = record_runtime_health_fault(
+                Path::new(&base),
+                product_version,
+                &instance,
+                code,
+                phase,
+            )
+            .is_ok();
             Ok(if recorded { JNI_TRUE } else { JNI_FALSE })
         })
         .into_outcome()
@@ -2583,6 +2668,67 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
     {
         Outcome::Ok(value) => value,
         Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
+    }
+}
+
+/// Whether no APK instance in any process holds the canonical lifetime lease right now.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeLifetimeReleased(
+    mut env: EnvUnowned,
+    _class: JClass,
+    canonical_base: JString,
+) -> jboolean {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jboolean> {
+            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
+            let released =
+                persistence::FileLock::try_acquire(&Path::new(&base).join("runtime-live.lock"))
+                    .is_ok_and(|lock| lock.is_some());
+            Ok(if released { JNI_TRUE } else { JNI_FALSE })
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
+    }
+}
+
+/// [nativeSubmit] bound to the instance the health probe admitted: an envelope only ever reaches
+/// the instance its fence names, and any other answers CAPABILITY_UNAVAILABLE without running it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeSubmitAdmitted(
+    mut env: EnvUnowned,
+    _class: JClass,
+    envelope: JByteArray,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+) -> jbyteArray {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jbyteArray> {
+            let bytes = owned.convert_byte_array(&envelope)?;
+            let (epoch, instance) =
+                expected_fence_strings(owned, &runtime_epoch, &runtime_instance_id)?;
+            let admitted = u64::try_from(host_generation)
+                .ok()
+                .and_then(|host_generation| {
+                    fenced_host(&runtime_health::ExpectedFence {
+                        runtime_epoch: &epoch,
+                        host_generation,
+                        runtime_instance_id: &instance,
+                    })
+                });
+            let response = match admitted {
+                Some(host) => submit_apk_public(&host, &bytes)
+                    .unwrap_or_else(|error| native_error_envelope(error.code, &bytes)),
+                None => native_error_envelope(ErrorCode::CapabilityUnavailable, &bytes),
+            };
+            Ok(owned.byte_array_from_slice(&response)?.into_raw())
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
     }
 }
 

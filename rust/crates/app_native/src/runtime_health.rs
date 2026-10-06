@@ -39,6 +39,20 @@ pub(crate) enum HealthClass {
 }
 
 impl HealthClass {
+    /// Every class the native probe can report, in the order of the shared contract fixture.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Healthy,
+        Self::HostMissing,
+        Self::FenceMismatch,
+        Self::LeaseStale,
+        Self::StoreUnreadable,
+        Self::StoreUnwritable,
+        Self::ResourceExhausted,
+        Self::BridgeFault,
+        Self::ExecutorMissing,
+    ];
+
     pub(crate) fn token(self) -> &'static str {
         match self {
             Self::Healthy => "healthy",
@@ -135,11 +149,10 @@ pub(crate) fn probe_store_writable(base: &Path, instance: &UuidV4) -> std::io::R
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let written = (|| {
-        let mut file = options.open(&path)?;
-        file.write_all(&[0])?;
-        file.sync_all()
-    })();
+    // Only a file this call created is ever removed.
+    let mut file = options.open(&path)?;
+    let written = file.write_all(&[0]).and_then(|()| file.sync_all());
+    drop(file);
     let removed = fs::remove_file(&path);
     written?;
     match removed {
@@ -149,28 +162,31 @@ pub(crate) fn probe_store_writable(base: &Path, instance: &UuidV4) -> std::io::R
     }
 }
 
-/// The instance whose JNI bridge failed outside an executor's own exception. Only the instance
-/// named here is affected; a new instance starts clean.
-static BRIDGE_FAULT: Mutex<Option<UuidV4>> = Mutex::new(None);
+/// How many instances' bridge faults are remembered; a process only ever has a handful.
+const MAX_LATCHED_INSTANCES: usize = 8;
 
-/// A Java exception an executor threw is that operation's failure, not the bridge's; every other
-/// JNI failure means the path all Android primitives share is broken.
-#[cfg_attr(not(target_os = "android"), allow(dead_code))]
-pub(crate) fn bridge_failure_latches(caught_java_exception: bool) -> bool {
-    !caught_java_exception
-}
+/// Instances whose JNI dispatch bridge failed. The Kotlin dispatcher answers every exception an
+/// executor throws as that operation's typed failure, so any JNI failure that still reaches here
+/// comes from the path all Android primitives share. Each instance is latched on its own, so a
+/// straggler from a released instance cannot clear or hide the live one's fault.
+static BRIDGE_FAULT: Mutex<Vec<UuidV4>> = Mutex::new(Vec::new());
 
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub(crate) fn latch_bridge_fault(instance: &UuidV4) {
-    if let Ok(mut latched) = BRIDGE_FAULT.lock() {
-        *latched = Some(instance.clone());
+    if let Ok(mut latched) = BRIDGE_FAULT.lock()
+        && !latched.contains(instance)
+    {
+        if latched.len() == MAX_LATCHED_INSTANCES {
+            latched.remove(0);
+        }
+        latched.push(instance.clone());
     }
 }
 
 pub(crate) fn bridge_fault_latched(instance: &UuidV4) -> bool {
     BRIDGE_FAULT
         .lock()
-        .map(|latched| latched.as_ref() == Some(instance))
+        .map(|latched| latched.contains(instance))
         // A poisoned latch cannot prove the bridge is intact.
         .unwrap_or(true)
 }
@@ -302,17 +318,40 @@ mod tests {
     }
 
     #[test]
-    fn p0_only_non_executor_bridge_failures_latch_and_only_for_their_instance() {
-        assert!(!bridge_failure_latches(true));
-        assert!(bridge_failure_latches(false));
+    fn p0_rust_health_classes_match_the_shared_contract_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../app/src/test/resources/contract/runtime-health-classes.v1.json"
+        )))
+        .unwrap();
+        assert_eq!(fixture["schema_version"], 1);
+        let classes: Vec<&str> = fixture["classes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        let emitted: Vec<&str> = HealthClass::ALL.iter().map(|class| class.token()).collect();
+        assert_eq!(emitted, classes);
+    }
+
+    #[test]
+    fn p0_bridge_faults_latch_per_instance_and_a_straggler_never_hides_the_live_one() {
         let first = id(0x51);
         let second = id(0x52);
+        let fresh = id(0x53);
+        latch_bridge_fault(&second);
+        assert!(bridge_fault_latched(&second));
+        assert!(!bridge_fault_latched(&fresh));
+        // A late failure on the released instance does not displace the live instance's latch.
         latch_bridge_fault(&first);
         assert!(bridge_fault_latched(&first));
-        assert!(!bridge_fault_latched(&second));
-        latch_bridge_fault(&second);
-        assert!(!bridge_fault_latched(&first));
         assert!(bridge_fault_latched(&second));
+        assert!(!bridge_fault_latched(&fresh));
+        latch_bridge_fault(&second);
+        let latched = BRIDGE_FAULT.lock().unwrap();
+        assert_eq!(latched.iter().filter(|value| **value == second).count(), 1);
+        assert!(latched.len() <= MAX_LATCHED_INSTANCES);
     }
 
     #[test]

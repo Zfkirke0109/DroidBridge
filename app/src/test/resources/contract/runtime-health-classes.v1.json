@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "classes": [
+    "healthy",
+    "host_missing",
+    "fence_mismatch",
+    "lease_stale",
+    "store_unreadable",
+    "store_unwritable",
+    "resource_exhausted",
+    "bridge_fault",
+    "executor_missing"
+  ]
+}

@@ -34,6 +34,20 @@ internal object NativeRuntime {
         targetInstanceId: String,
     ): Boolean
     external fun nativeSubmit(envelope: ByteArray): ByteArray
+
+    /**
+     * Dispatches one envelope only to the APK instance the fence names, the one the health probe
+     * admitted; any other instance answers CAPABILITY_UNAVAILABLE without executing it.
+     */
+    external fun nativeSubmitAdmitted(
+        envelope: ByteArray,
+        runtimeEpoch: String,
+        hostGeneration: Long,
+        runtimeInstanceId: String,
+    ): ByteArray
+
+    /** Whether no APK instance holds the lifetime lease; a read of the lock only. */
+    external fun nativeLifetimeReleased(canonicalBase: String): Boolean
     external fun nativeQueryArtifacts(query: ByteArray, descriptor: IntArray): ByteArray?
     external fun nativeMcpStart(port: Int, token: String, productVersion: String): Boolean
     external fun nativeMcpSetToken(token: String): Boolean
@@ -90,10 +104,10 @@ internal object NativeRuntime {
         deep: Boolean,
     ): String?
 
-    /** Records one health fault only while the fenced instance still holds the slot. */
+    /** Records one health fault in the host fault file; it needs no live instance in the slot. */
     external fun nativeRecordRuntimeHealthFault(
-        runtimeEpoch: String,
-        hostGeneration: Long,
+        canonicalBase: String,
+        productVersion: String,
         runtimeInstanceId: String,
         code: String,
         phase: String,

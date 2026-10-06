@@ -57,6 +57,20 @@ internal object NativeAndroidExecutionDispatcher {
         taskActivitySink?.invoke(0L)
     }
 
+    /**
+     * The APK Runtime instance that published the current count was withdrawn as unhealthy, so its
+     * Tasks no longer run here; the next instance publishes its own count from a clean slate.
+     */
+    @Synchronized
+    fun forgetRuntimeTaskActivity() {
+        if (taskActivityFromDaemon) return
+        taskActivityEpoch = null
+        taskActivityRevision = -1L
+        if (activeTaskCount == 0L) return
+        activeTaskCount = 0L
+        taskActivitySink?.invoke(0L)
+    }
+
     private fun taskActivityChanged(
         runtimeEpoch: String,
         activeTasks: Long,
@@ -197,7 +211,12 @@ internal object NativeAndroidExecutionDispatcher {
     fun probeExecutor(key: String, generation: Long): Boolean =
         key == ANDROID_FRAMEWORK_EXECUTOR_KEY && frameworkExecutorPresent(registry.get(), generation)
 
-    private fun dispatch(
+    /**
+     * Runs one executor and answers its outcome. An exception the executor itself throws is that
+     * operation's typed internal failure, so a Java exception that still reaches the native bridge
+     * comes from the dispatch path every primitive shares (issue #2) rather than from one executor.
+     */
+    internal fun dispatch(
         executor: AndroidExecutionBridge,
         request: AndroidExecutionRequest,
     ): AndroidExecutionResult = try {
@@ -208,6 +227,8 @@ internal object NativeAndroidExecutionDispatcher {
         AndroidExecutionResult(byteArrayOf(), errorCode = "TIMEOUT")
     } catch (_: CancellationException) {
         AndroidExecutionResult(byteArrayOf(), errorCode = "CANCELLED")
+    } catch (_: Exception) {
+        AndroidExecutionResult(byteArrayOf(), errorCode = "INTERNAL_ERROR")
     }
 }
 
