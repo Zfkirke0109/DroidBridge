@@ -164,7 +164,7 @@ mod unix {
     use super::{GuardScope, GuardSettlement};
     use crate::{
         ProcFacts, block_guard_termination_signals, clear_cloexec, guard_proof_capacity_available,
-        io_error, sync_directory,
+        sync_directory,
     };
     use contract::{ErrorCode, UuidV4};
     use domain::DomainError;
@@ -246,7 +246,8 @@ mod unix {
                 ));
             }
             let directory = self.directory();
-            fs::create_dir_all(&directory).map_err(io_error)?;
+            fs::create_dir_all(&directory)
+                .map_err(os("cannot create execution guard directory"))?;
             sync_directory(&directory)?;
             let identity = self.identity(execution_id);
             let header = encode_guard_frame(&identity)?;
@@ -257,18 +258,15 @@ mod unix {
                 .create_new(true)
                 .mode(0o600)
                 .open(&proof_path)
-                .map_err(io_error)?;
-            if proof
-                .write_all(&header)
-                .and_then(|_| proof.sync_all())
-                .is_err()
-            {
+                .map_err(os("cannot create execution guard proof"))?;
+            if let Err(error) = proof.write_all(&header).and_then(|_| proof.sync_all()) {
                 drop(proof);
                 let _ = fs::remove_file(proof_path);
                 let _ = sync_directory(&directory);
-                return Err(DomainError::new(
+                return Err(DomainError::os(
                     ErrorCode::IoError,
                     "guard proof header write failed",
+                    &error,
                 ));
             }
             Ok(proof)
@@ -310,7 +308,7 @@ mod unix {
             if result.cleanup_verified {
                 let directory = self.directory();
                 fs::remove_file(directory.join(format!("{}.proof", execution_id.as_str())))
-                    .map_err(io_error)?;
+                    .map_err(os("cannot remove clean execution guard proof"))?;
                 sync_directory(&directory)?;
             } else {
                 self.quarantine();
@@ -324,11 +322,11 @@ mod unix {
             let identity = self.identity(execution_id);
             let directory = self.directory();
             let path = directory.join(format!("{}.proof", execution_id.as_str()));
-            let bytes = fs::read(&path).map_err(io_error)?;
+            let bytes = fs::read(&path).map_err(os("cannot read execution guard proof"))?;
             if bytes != encode_guard_frame(&identity)? {
                 return Ok(false);
             }
-            fs::remove_file(path).map_err(io_error)?;
+            fs::remove_file(path).map_err(os("cannot retire execution guard proof"))?;
             sync_directory(&directory)?;
             Ok(true)
         }
@@ -352,13 +350,13 @@ mod unix {
                 }
                 None => (
                     fs::File::open("/dev/null")
-                        .map_err(io_error)
-                        .map_err(pre_start)?,
+                        .map_err(os("cannot open command input"))
+                        .map_err(setup)?,
                     None,
                 ),
             };
             let (lifetime_read, lifetime_write) = pipe()?;
-            let proof = self.prepare(execution_id).map_err(pre_start)?;
+            let proof = self.prepare(execution_id).map_err(setup)?;
             let proof_raw = proof.as_raw_fd();
             let lifetime_raw = lifetime_read.as_raw_fd();
 
@@ -390,7 +388,14 @@ mod unix {
                     drop(proof);
                     drop(lifetime_read);
                     drop(lifetime_write);
-                    return Err(self.unstarted(execution_id, error));
+                    return Err(self.unstarted(
+                        execution_id,
+                        DomainError::os(
+                            ErrorCode::ExecutionFailed,
+                            "cannot launch the execution guard",
+                            &error,
+                        ),
+                    ));
                 }
             };
             // `Command` retains the configured `Stdio` handles so it can be spawned
@@ -407,7 +412,7 @@ mod unix {
                     drop(lifetime_write);
                     return Err(self.unstarted(
                         execution_id,
-                        std::io::Error::other("command guard PID is invalid"),
+                        DomainError::new(ErrorCode::InternalError, "command guard PID is invalid"),
                     ));
                 }
             };
@@ -496,7 +501,13 @@ mod unix {
                         });
                     }
                     Ok(None) => {}
-                    Err(error) => return Err(pre_start(io_error(error))),
+                    Err(error) => {
+                        return Err(pre_start(DomainError::os(
+                            ErrorCode::IoError,
+                            "cannot observe the execution guard",
+                            &error,
+                        )));
+                    }
                 }
                 let now = Instant::now();
                 if signalled.is_none() {
@@ -533,7 +544,7 @@ mod unix {
         /// Reports a pre-start failure. A proof that is still exactly its identity frame
         /// proves no process was started, so the failure is verified; anything else has
         /// to settle before it is trusted.
-        fn unstarted(&self, execution_id: &UuidV4, error: std::io::Error) -> ExecutionFailure {
+        fn unstarted(&self, execution_id: &UuidV4, error: DomainError) -> ExecutionFailure {
             let aborted = self.abort(execution_id).unwrap_or(false);
             let cleanup_verified = aborted
                 || self
@@ -541,7 +552,7 @@ mod unix {
                     .map(|settlement| settlement.cleanup_verified)
                     .unwrap_or(false);
             ExecutionFailure {
-                error: io_error(error),
+                error,
                 cleanup_verified,
             }
         }
@@ -563,10 +574,31 @@ mod unix {
         }
     }
 
+    /// A step that sets up a process which never starts. Its I/O failure means the request
+    /// could not be executed; a resource limit or a more exact cause keeps its own code.
+    fn setup(error: DomainError) -> ExecutionFailure {
+        pre_start(if error.code == ErrorCode::IoError {
+            DomainError {
+                code: ErrorCode::ExecutionFailed,
+                ..error
+            }
+        } else {
+            error
+        })
+    }
+
+    fn os(reason: &'static str) -> impl Fn(std::io::Error) -> DomainError {
+        move |error| DomainError::os(ErrorCode::IoError, reason, &error)
+    }
+
     fn pipe() -> Result<(fs::File, fs::File), ExecutionFailure> {
         let mut ends = [0_i32; 2];
         if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(pre_start(io_error(std::io::Error::last_os_error())));
+            return Err(setup(DomainError::os(
+                ErrorCode::IoError,
+                "cannot create command pipe",
+                &std::io::Error::last_os_error(),
+            )));
         }
         Ok(unsafe {
             (
@@ -617,7 +649,7 @@ mod unix {
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(io_error(error));
+                return Err(os("cannot poll a command stream")(error));
             }
             if ready == 0 {
                 if stopped {
@@ -632,7 +664,7 @@ mod unix {
                 if error.kind() == std::io::ErrorKind::Interrupted {
                     continue;
                 }
-                return Err(io_error(error));
+                return Err(os("cannot read a command stream")(error));
             }
             if count == 0 {
                 return Ok(BoundedStream { bytes, truncated });

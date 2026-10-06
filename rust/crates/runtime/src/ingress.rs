@@ -6,6 +6,20 @@ use contract::{ACTION_SPECS, ErrorCode, PublicError, PublicRequest, PublicRespon
 use domain::DomainError;
 use serde_json::Value;
 
+/// Why a public tool call has no result: a refusal before any execution settled, or the
+/// settled execution's own public error, which the reply carries unchanged.
+#[derive(Debug)]
+pub enum ToolFailure {
+    Refused(DomainError),
+    Settled(PublicError),
+}
+
+impl From<DomainError> for ToolFailure {
+    fn from(error: DomainError) -> Self {
+        Self::Refused(error)
+    }
+}
+
 pub async fn submit_public<P, A, E, C, H, F, Fut>(
     core: &RuntimeCore<P, A, E, C, H>,
     encoded: &[u8],
@@ -29,18 +43,21 @@ where
     };
     let request_id = request.request_id.clone();
     let payload_sha256 = contract::canonical_payload_sha256(&request.payload);
-    let result = match request.payload {
-        contract::PublicPayload::TaskControl { call } => {
-            core.handle_task_control(call, ended_at, now_ms).await
-        }
+    let result: Result<Value, ToolFailure> = match request.payload {
+        contract::PublicPayload::TaskControl { call } => core
+            .handle_task_control(call, ended_at, now_ms)
+            .await
+            .map_err(ToolFailure::from),
         // The static ToolCatalog is read-only and stays served behind the admission barrier.
         contract::PublicPayload::Context {
             call: contract::ContextCall::Catalog(input),
-        } => crate::context_catalog(&input).and_then(|result| {
-            serde_json::to_value(result).map_err(|_| {
-                DomainError::new(ErrorCode::InternalError, "catalog serialization failed")
+        } => crate::context_catalog(&input)
+            .and_then(|result| {
+                serde_json::to_value(result).map_err(|_| {
+                    DomainError::new(ErrorCode::InternalError, "catalog serialization failed")
+                })
             })
-        }),
+            .map_err(ToolFailure::from),
         contract::PublicPayload::Filesystem { call } if business_admission_open => {
             crate::handle_filesystem_public(
                 core,
@@ -55,7 +72,8 @@ where
         contract::PublicPayload::Filesystem { .. } => Err(DomainError::new(
             ErrorCode::HostTransitionPending,
             "Runtime host transition is pending",
-        )),
+        )
+        .into()),
         contract::PublicPayload::Command { call } if business_admission_open => {
             crate::handle_command_public(
                 core,
@@ -70,7 +88,8 @@ where
         contract::PublicPayload::Command { .. } => Err(DomainError::new(
             ErrorCode::HostTransitionPending,
             "Runtime host transition is pending",
-        )),
+        )
+        .into()),
         contract::PublicPayload::Network { call } if business_admission_open => {
             crate::handle_network_public(
                 core,
@@ -85,7 +104,8 @@ where
         contract::PublicPayload::Network { .. } => Err(DomainError::new(
             ErrorCode::HostTransitionPending,
             "Runtime host transition is pending",
-        )),
+        )
+        .into()),
         contract::PublicPayload::Visual { call } if business_admission_open => {
             crate::handle_visual_public(
                 core,
@@ -100,7 +120,8 @@ where
         contract::PublicPayload::Visual { .. } => Err(DomainError::new(
             ErrorCode::HostTransitionPending,
             "Runtime host transition is pending",
-        )),
+        )
+        .into()),
         contract::PublicPayload::Android { call } if business_admission_open => {
             crate::handle_android_public(
                 core,
@@ -115,26 +136,27 @@ where
         contract::PublicPayload::Android { .. } => Err(DomainError::new(
             ErrorCode::HostTransitionPending,
             "Runtime host transition is pending",
-        )),
+        )
+        .into()),
         // Read-only list/get stay available behind the business-admission barrier; the handler
         // refuses definition mutations while it is closed (S-AUTH-001).
-        contract::PublicPayload::Automation { call } => {
-            crate::handle_automation_public(
-                core,
-                request_id.clone(),
-                payload_sha256,
-                call,
-                ended_at,
-                now_ms,
-                business_admission_open,
-            )
-            .await
-        }
-        _ => dispatch_installed(request).await,
+        contract::PublicPayload::Automation { call } => crate::handle_automation_public(
+            core,
+            request_id.clone(),
+            payload_sha256,
+            call,
+            ended_at,
+            now_ms,
+            business_admission_open,
+        )
+        .await
+        .map_err(ToolFailure::from),
+        _ => dispatch_installed(request).await.map_err(ToolFailure::from),
     };
     encode_public(match result {
         Ok(result) => PublicResponse::success(request_id, result),
-        Err(error) => domain_failure(request_id, &error, &operation),
+        Err(ToolFailure::Refused(error)) => domain_failure(request_id, &error, &operation),
+        Err(ToolFailure::Settled(error)) => PublicResponse::error(Some(request_id), error),
     })
 }
 
@@ -199,10 +221,7 @@ fn domain_failure(
             retryable: error.code == ErrorCode::HostTransitionPending,
             message: None,
             capability: None,
-            details: Some(std::collections::BTreeMap::from([(
-                "reason".to_owned(),
-                contract::ErrorDetailValue::String(error.reason.to_owned()),
-            )])),
+            details: Some(crate::core::failure_details(error)),
         },
     )
 }

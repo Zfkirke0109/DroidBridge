@@ -6,6 +6,8 @@ import java.nio.charset.CharacterCodingException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -50,7 +52,11 @@ internal class AppProcessExecutor(
         val error = value["error"]?.jsonObject
             ?: return AndroidExecutionResult(encoded.encodeToByteArray())
         val code = error["code"]?.jsonPrimitive?.content
-        throw AndroidExecutionException(code ?: INTERNAL_ERROR)
+        throw AndroidExecutionException(
+            code ?: INTERNAL_ERROR,
+            reason = error["reason"]?.jsonPrimitive?.contentOrNull,
+            osError = error["os_error"]?.jsonPrimitive?.intOrNull,
+        )
     }
 
     private fun cancel(request: AndroidExecutionRequest): AndroidExecutionResult {

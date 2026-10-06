@@ -221,7 +221,6 @@
     <string name="theme_dark">Dark</string>
     <string name="action_check_for_updates">Check for updates</string>
     <string name="updates_install_apk">Install update</string>
-    <string name="updates_export_module">Export module</string>
     <string name="data_reset_mcp_credentials">Reset Local MCP credentials</string>
     <string name="data_clear_chatgpt_credentials">Clear ChatGPT credentials</string>
     <string name="data_reset_runtime_data">Reset Runtime data</string>
@@ -280,13 +279,10 @@
     <string name="licenses_empty">No third-party licenses</string>
     <string name="updates_title">Updates</string>
     <string name="updates_current_version">Current version</string>
-    <string name="updates_component_status">Component compatibility</string>
     <string name="updates_up_to_date">Up to date</string>
     <string name="updates_available">Update available</string>
-    <string name="updates_module_repair_required">Module repair required</string>
     <string name="updates_configuration_unavailable">Release configuration unavailable</string>
     <string name="action_download_update">Download update</string>
-    <string name="action_download_module">Download module</string>
     <string name="dialog_reset_mcp_title">Reset Local MCP credentials?</string>
     <string name="dialog_reset_mcp_body">The current Local MCP token will stop working immediately. Runtime data is not changed.</string>
     <string name="dialog_clear_chatgpt_title">Clear ChatGPT credentials?</string>
@@ -301,11 +297,8 @@
     <string name="dialog_delete_all_automations_body">All automations and their run history will be deleted. This cannot be undone.</string>
     <string name="snackbar_bulk_delete_result">Deleted %1$d, %2$d failed</string>
     <string name="diagnostics_no_failures">No recent failures</string>
-    <string name="updates_continue_apk_only">Continue without module</string>
-    <string name="dialog_apk_only_title">Continue with APK capabilities?</string>
-    <string name="dialog_apk_only_body">The module will be excluded from execution. Current data is preserved. A verified module update is required to restore Root execution.</string>
-    <string name="updates_module_excluded">Module excluded; APK capabilities available</string>
     <string name="reason_cleanup_unverified">Execution cleanup could not be verified. Restart the device before continuing.</string>
+    <string name="reason_executor_recovering">The execution environment is recovering automatically. Please wait.</string>
     <string name="reason_user_consent_required">Start screen capture to allow this request.</string>
     <string name="dialog_reset_host_title">Reset Runtime host to APK?</string>
     <string name="dialog_reset_host_body">Runtime host fencing will be re-created for APK Runtime. Runtime data is preserved. Unverified execution cleanup cannot be bypassed.</string>
@@ -320,7 +313,6 @@
     <string name="settings_group_app">App</string>
     <string name="settings_language">Language</string>
     <string name="language_system">System default</string>
-    <string name="updates_reboot_required">Restart the device to finish the module update</string>
     <string name="settings_open_welcome">Open welcome page</string>
     <string name="agent_connection_title">Agent connection</string>
     <string name="agent_connection_idle">Not connected</string>
@@ -476,4 +468,5 @@
     <string name="module_unsupported_body">The root manager to install with could not be told apart (none or more than one was found). Export the module ZIP and install it in the manager yourself.</string>
     <string name="module_exported">Module ZIP exported</string>
     <string name="module_export_failed">Could not export the module ZIP</string>
+    <string name="module_update_mismatch">The installed root module does not match this version of the App. Install the module the App carries.</string>
 </resources>

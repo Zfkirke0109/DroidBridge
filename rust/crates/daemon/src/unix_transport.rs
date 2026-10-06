@@ -266,6 +266,6 @@ fn protocol_error(reason: &'static str) -> DomainError {
     DomainError::new(ErrorCode::ProtocolIncompatible, reason)
 }
 
-fn io_error(_: std::io::Error) -> DomainError {
-    DomainError::new(ErrorCode::IoError, "daemon IPC I/O failed")
+fn io_error(error: std::io::Error) -> DomainError {
+    DomainError::os(ErrorCode::IoError, "daemon IPC I/O failed", &error)
 }

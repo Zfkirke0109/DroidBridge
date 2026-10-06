@@ -103,6 +103,7 @@ object ReasonText {
         "MODULE_CONFLICT" -> R.string.reason_module_conflict
         "USER_CONSENT_REQUIRED" -> R.string.reason_user_consent_required
         "CLEANUP_UNVERIFIED" -> R.string.reason_cleanup_unverified
+        "EXECUTOR_RECOVERING" -> R.string.reason_executor_recovering
         else -> R.string.state_error
     }
 }

@@ -145,18 +145,8 @@ internal data class UpdateMaintenanceRecord(
     }
 }
 
-/** The S-UPD-004 `module-exclusion.json` quarantine record. */
-internal data class ModuleExclusion(val moduleId: String, val updateId: String, val createdAt: String) {
-    fun encode(): String = buildJsonObject {
-        put("schema_version", 1)
-        put("module_id", moduleId)
-        put("update_id", updateId)
-        put("created_at", createdAt)
-    }.toString()
-}
-
 /**
- * HostController's single writer for the maintenance and exclusion records. Every mutation takes
+ * HostController's single writer for the maintenance record. Every mutation takes
  * the stable `update-maintenance.lock`, re-reads the current record, writes a same-directory
  * owner-only temp, fsyncs it, atomically renames it and fsyncs the directory.
  */
@@ -169,8 +159,6 @@ internal class UpdateMaintenanceStore(
     private val exclusion = File(base, EXCLUSION)
 
     fun read(): UpdateMaintenanceRecord? = locked { current() }
-
-    fun exclusionPresent(): Boolean = exclusion.isFile
 
     /** Creates the record only when none exists. */
     fun create(next: UpdateMaintenanceRecord) = locked {
@@ -191,14 +179,7 @@ internal class UpdateMaintenanceStore(
         syncDirectory(base)
     }
 
-    /** Commits the exclusion first, then removes the matching record, both durably. */
-    fun excludeModuleAndFinish(expected: UpdateMaintenanceRecord, exclusionRecord: ModuleExclusion) = locked {
-        check(current() == expected) { "update maintenance record changed" }
-        write(exclusion, exclusionRecord.encode())
-        Files.delete(record.toPath())
-        syncDirectory(base)
-    }
-
+    /** Removes the APK-only exclusion earlier releases wrote; nothing writes it anymore. */
     fun removeExclusion() = locked {
         if (exclusion.exists()) {
             Files.delete(exclusion.toPath())

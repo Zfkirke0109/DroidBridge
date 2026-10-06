@@ -24,14 +24,12 @@ interface IDroidBridgeRuntime {
     String resetRuntimeHostToApk();
     String getUpdateMaintenance();
     String beginProductUpdate(in byte[] manifest, in byte[] signature);
-    String beginModuleRepair(in byte[] manifest, in byte[] signature);
     String installUpdateApk(String updateId);
-    String installUpdateModule(String updateId);
     String cancelUpdate(String updateId);
-    String continueWithoutModule(String updateId);
     int getStrandedExecutions();
     String clearStrandedExecutions();
     String installEmbeddedModule();
     boolean isModuleRebootPending();
     boolean rebootForModule();
+    long getModuleVersionCode();
 }

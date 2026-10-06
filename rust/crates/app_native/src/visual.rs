@@ -961,6 +961,6 @@ fn stale(message: &'static str) -> ExecutionFailure {
     clean_failure(DomainError::new(ErrorCode::StaleAuthority, message))
 }
 
-fn io_error(_error: std::io::Error) -> DomainError {
-    DomainError::new(ErrorCode::IoError, "visual file operation failed")
+fn io_error(error: std::io::Error) -> DomainError {
+    DomainError::os(ErrorCode::IoError, "visual file operation failed", &error)
 }

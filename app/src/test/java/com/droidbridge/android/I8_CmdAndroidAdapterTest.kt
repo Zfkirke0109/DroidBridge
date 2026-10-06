@@ -41,6 +41,19 @@ class I8_CmdAndroidAdapterTest {
             rejected.execute(request(AndroidPrimitive.AppProcessStart))
         }.exceptionOrNull()
         assertEquals("NOT_FOUND", (failure as AndroidExecutionException).code)
+
+        val explained = AppProcessExecutor(
+            validatesFence = { _, _, _ -> true },
+            runCommand = { _, _ ->
+                """{"error":{"code":"EXECUTION_FAILED","retryable":false,"reason":"cannot create command pipe","os_error":24}}"""
+            },
+        )
+        val cause = runCatching {
+            explained.execute(request(AndroidPrimitive.AppProcessStart))
+        }.exceptionOrNull() as AndroidExecutionException
+        assertEquals("EXECUTION_FAILED", cause.code)
+        assertEquals("cannot create command pipe", cause.reason)
+        assertEquals(24, cause.osError)
     }
 
     @Test

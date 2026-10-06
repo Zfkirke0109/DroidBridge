@@ -439,7 +439,7 @@ pub async fn handle_android_public<P, A, E, C, H>(
     call: AndroidCall,
     timestamp: String,
     now_ms: u64,
-) -> Result<serde_json::Value, DomainError>
+) -> Result<serde_json::Value, crate::ToolFailure>
 where
     P: PersistencePort + 'static,
     A: ArtifactPort + Clone + 'static,
@@ -481,7 +481,7 @@ where
         now_ms,
     )
     .await
-    .map_err(|error| DomainError::new(error.code, "Android execution failed"))
+    .map_err(crate::ToolFailure::Settled)
 }
 
 /// Revalidates R-ANDROID-002/006/007/008/009 bounds before any executor is resolved.

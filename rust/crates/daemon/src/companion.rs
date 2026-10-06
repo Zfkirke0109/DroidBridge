@@ -86,6 +86,13 @@ impl CompanionPort {
         }
     }
 
+    /// Ends the live connection, if there is one, so the loop that owns it returns.
+    pub(crate) fn close_live(&self) {
+        if let Ok(Some(channel)) = self.live() {
+            channel.close();
+        }
+    }
+
     fn live(&self) -> Result<Option<Arc<CompanionChannel>>, DomainError> {
         Ok(self
             .channel
@@ -586,6 +593,9 @@ impl Shared {
     }
 }
 
+/// The bound on a peer's reason, which is public error detail (R-CONTRACT-002).
+const MAX_PEER_REASON_BYTES: usize = 1_024;
+
 fn result_for(
     payload: Value,
     roles: &[String],
@@ -602,10 +612,17 @@ fn result_for(
                 "companion failure result carries descriptors",
             ));
         }
-        return Err(DomainError::new(
-            code,
-            "companion execution reported a typed failure",
-        ));
+        let mut failure = DomainError::new(code, "companion execution reported a typed failure");
+        failure.peer_reason = error
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| reason.len() <= MAX_PEER_REASON_BYTES)
+            .map(str::to_owned);
+        failure.os_error = error
+            .get("os_error")
+            .and_then(Value::as_i64)
+            .and_then(|errno| i32::try_from(errno).ok());
+        return Err(failure);
     }
     let payload = payload
         .get("payload")
@@ -640,4 +657,43 @@ fn io_error(reason: &'static str) -> DomainError {
 
 fn lost(code: ErrorCode) -> DomainError {
     DomainError::new(code, "companion execution channel is closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::result_for;
+    use contract::ErrorCode;
+    use serde_json::json;
+
+    #[test]
+    fn a_typed_failure_keeps_the_peer_step_and_system_error() {
+        let failure = result_for(
+            json!({"error": {"code": "EXECUTION_FAILED", "retryable": false,
+                "reason": "cannot launch the execution guard", "os_error": 2}}),
+            &[],
+            Vec::new(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(failure.code, ErrorCode::ExecutionFailed);
+        assert_eq!(
+            failure.reason,
+            "companion execution reported a typed failure"
+        );
+        assert_eq!(
+            failure.peer_reason.as_deref(),
+            Some("cannot launch the execution guard")
+        );
+        assert_eq!(failure.os_error, Some(2));
+
+        let unbounded = result_for(
+            json!({"error": {"code": "IO_ERROR", "reason": "x".repeat(1_025)}}),
+            &[],
+            Vec::new(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(unbounded.peer_reason, None);
+        assert_eq!(unbounded.os_error, None);
+    }
 }

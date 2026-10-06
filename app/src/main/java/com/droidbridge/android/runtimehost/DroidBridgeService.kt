@@ -202,20 +202,9 @@ class DroidBridgeService : Service() {
                 .also { publishHint(PROJECTION_CONTEXT) }
         }
 
-        override fun beginModuleRepair(manifest: ByteArray?, signature: ByteArray?): String {
-            verifyCaller()
-            return hostController.beginModuleRepair(requireNotNull(manifest), requireNotNull(signature))
-                .also { publishHint(PROJECTION_CONTEXT) }
-        }
-
         override fun installUpdateApk(updateId: String?): String {
             verifyCaller()
             return hostController.installUpdateApk(requireNotNull(updateId))
-        }
-
-        override fun installUpdateModule(updateId: String?): String {
-            verifyCaller()
-            return hostController.installUpdateModule(requireNotNull(updateId)).also { publishHint(PROJECTION_CONTEXT) }
         }
 
         override fun cancelUpdate(updateId: String?): String {
@@ -238,9 +227,9 @@ class DroidBridgeService : Service() {
             return moduleInstaller.reboot()
         }
 
-        override fun continueWithoutModule(updateId: String?): String {
+        override fun getModuleVersionCode(): Long {
             verifyCaller()
-            return hostController.continueWithoutModule(requireNotNull(updateId)).also { publishHint(PROJECTION_CONTEXT) }
+            return hostController.moduleVersionCode()
         }
     }
 

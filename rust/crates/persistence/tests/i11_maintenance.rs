@@ -273,3 +273,31 @@ fn i11_guard_cleanup_evidence_ignores_business_json() {
     write_proof(directory.path(), &current_boot, &id(62), false);
     assert!(!guard_cleanup_verified(directory.path(), &current_boot, &NoLiveProcess).unwrap());
 }
+
+struct LiveGuard;
+
+impl ProcessFacts for LiveGuard {
+    fn is_same_process(&self, _pid: u32, _start_ticks: u64) -> Result<bool, DomainError> {
+        Ok(true)
+    }
+}
+
+#[test]
+fn i11_an_unsettled_guard_may_settle_only_while_it_is_alive() {
+    let directory = TestDirectory::new("settle");
+    let current_boot = id(3);
+    write_proof(directory.path(), &current_boot, &id(70), true);
+    write_proof(directory.path(), &current_boot, &id(71), false);
+    let proofs = GuardProofDirectory::new(directory.path());
+    let state = CanonicalState::default();
+
+    let alive =
+        build_guard_recovery_plan(&state, &id(99), &current_boot, &proofs, &LiveGuard).unwrap();
+    assert!(!alive.guards_are_clean());
+    assert!(alive.may_settle());
+
+    let dead =
+        build_guard_recovery_plan(&state, &id(99), &current_boot, &proofs, &NoLiveProcess).unwrap();
+    assert!(!dead.guards_are_clean());
+    assert!(!dead.may_settle());
+}

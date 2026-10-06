@@ -93,7 +93,18 @@ impl MagiskGuardRecoveryMechanics for FilesystemMagiskGuardRecovery<'_> {
         let root = self.base.join("execution-guards");
         let directory = root.join(boot_id.as_str());
         let proof = directory.join(format!("{}.proof", record.execution_id.as_str()));
-        fs::remove_file(proof).map_err(|_| io_error("cannot remove clean root guard proof"))?;
+        match fs::remove_file(proof) {
+            Ok(()) => {}
+            // The proof was read clean; its owning Runtime may already have retired it.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DomainError::os(
+                    ErrorCode::IoError,
+                    "cannot remove clean root guard proof",
+                    &error,
+                ));
+            }
+        }
         sync_directory(&directory)?;
         if !self.touched_directories.contains(&directory) {
             self.touched_directories.push(directory);
@@ -166,9 +177,9 @@ fn run_guard_probe(
         .write(true)
         .create_new(true)
         .mode(0o600);
-    let mut proof = proof_options
-        .open(&proof_path)
-        .map_err(|_| io_error("cannot create root guard proof"))?;
+    let mut proof = proof_options.open(&proof_path).map_err(|error| {
+        DomainError::os(ErrorCode::IoError, "cannot create root guard proof", &error)
+    })?;
     copy_canonical_metadata(&canonical_base.join("runtime-state.json"), &proof, 0o600)?;
     let identity = GuardIdentity {
         runtime_epoch: live.runtime_epoch.clone(),
@@ -178,10 +189,12 @@ fn run_guard_probe(
     };
     proof
         .write_all(&encode_guard_frame(&identity)?)
-        .map_err(|_| io_error("cannot write root guard proof"))?;
-    proof
-        .sync_all()
-        .map_err(|_| io_error("cannot sync root guard proof"))?;
+        .map_err(|error| {
+            DomainError::os(ErrorCode::IoError, "cannot write root guard proof", &error)
+        })?;
+    proof.sync_all().map_err(|error| {
+        DomainError::os(ErrorCode::IoError, "cannot sync root guard proof", &error)
+    })?;
 
     let mut pipe = [0_i32; 2];
     if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -210,9 +223,9 @@ fn run_guard_probe(
             command.arg("--probe-owner-death-child").arg(&marker_path);
         }
     }
-    let mut child = command
-        .spawn()
-        .map_err(|_| io_error("cannot launch root guard probe"))?;
+    let mut child = command.spawn().map_err(|error| {
+        DomainError::os(ErrorCode::IoError, "cannot launch root guard probe", &error)
+    })?;
     drop(proof);
     drop(lifetime_read);
     let mut lifetime_write = Some(lifetime_write);
@@ -229,10 +242,13 @@ fn run_guard_probe(
     }
     let deadline = Instant::now() + Duration::from_secs(8);
     let exited = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|_| io_error("cannot observe root guard probe"))?
-        {
+        if let Some(status) = child.try_wait().map_err(|error| {
+            DomainError::os(
+                ErrorCode::IoError,
+                "cannot observe root guard probe",
+                &error,
+            )
+        })? {
             break status.success();
         }
         if Instant::now() >= deadline {
@@ -261,11 +277,21 @@ fn run_guard_probe(
         GuardRecovery::Clean { clean: Some(ref value) } if value.cause == expected
     ) && exited;
     if clean {
-        fs::remove_file(&proof_path)
-            .map_err(|_| io_error("cannot remove clean root guard proof"))?;
+        fs::remove_file(&proof_path).map_err(|error| {
+            DomainError::os(
+                ErrorCode::IoError,
+                "cannot remove clean root guard proof",
+                &error,
+            )
+        })?;
         if marker_path.exists() {
-            fs::remove_file(&marker_path)
-                .map_err(|_| io_error("cannot remove root guard marker"))?;
+            fs::remove_file(&marker_path).map_err(|error| {
+                DomainError::os(
+                    ErrorCode::IoError,
+                    "cannot remove root guard marker",
+                    &error,
+                )
+            })?;
         }
         sync_directory(&directory)?;
     }
@@ -327,15 +353,30 @@ pub(crate) fn guard_proof_capacity_available(base: &Path) -> bool {
 pub(crate) fn create_guard_directory(base: &Path, directory: &Path) -> Result<(), DomainError> {
     let root = base.join("execution-guards");
     if !root.exists() {
-        fs::create_dir(&root).map_err(|_| io_error("cannot create guard proof root"))?;
-        let file = fs::File::open(&root).map_err(|_| io_error("cannot open guard proof root"))?;
+        fs::create_dir(&root).map_err(|error| {
+            DomainError::os(ErrorCode::IoError, "cannot create guard proof root", &error)
+        })?;
+        let file = fs::File::open(&root).map_err(|error| {
+            DomainError::os(ErrorCode::IoError, "cannot open guard proof root", &error)
+        })?;
         copy_canonical_metadata(base, &file, 0o700)?;
         sync_directory(base)?;
     }
     if !directory.exists() {
-        fs::create_dir(directory).map_err(|_| io_error("cannot create guard boot directory"))?;
-        let file =
-            fs::File::open(directory).map_err(|_| io_error("cannot open guard boot directory"))?;
+        fs::create_dir(directory).map_err(|error| {
+            DomainError::os(
+                ErrorCode::IoError,
+                "cannot create guard boot directory",
+                &error,
+            )
+        })?;
+        let file = fs::File::open(directory).map_err(|error| {
+            DomainError::os(
+                ErrorCode::IoError,
+                "cannot open guard boot directory",
+                &error,
+            )
+        })?;
         copy_canonical_metadata(&root, &file, 0o700)?;
         sync_directory(&root)?;
     }
@@ -347,18 +388,31 @@ pub(crate) fn copy_canonical_metadata(
     target: &fs::File,
     mode: u32,
 ) -> Result<(), DomainError> {
-    let metadata =
-        fs::metadata(source).map_err(|_| io_error("cannot inspect canonical metadata"))?;
+    let metadata = fs::metadata(source).map_err(|error| {
+        DomainError::os(
+            ErrorCode::IoError,
+            "cannot inspect canonical metadata",
+            &error,
+        )
+    })?;
     if unsafe { libc::fchown(target.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0
         || unsafe { libc::fchmod(target.as_raw_fd(), mode) } != 0
     {
-        return Err(io_error("cannot apply canonical owner or mode"));
+        return Err(DomainError::os(
+            ErrorCode::IoError,
+            "cannot apply canonical owner or mode",
+            &io::Error::last_os_error(),
+        ));
     }
     #[cfg(target_os = "android")]
     copy_selinux_label(source, target)?;
-    let actual = target
-        .metadata()
-        .map_err(|_| io_error("cannot verify canonical metadata"))?;
+    let actual = target.metadata().map_err(|error| {
+        DomainError::os(
+            ErrorCode::IoError,
+            "cannot verify canonical metadata",
+            &error,
+        )
+    })?;
     if actual.uid() != metadata.uid()
         || actual.gid() != metadata.gid()
         || actual.mode() & 0o777 != mode
@@ -417,7 +471,13 @@ pub(crate) fn make_inheritable(fd: i32) -> Result<(), DomainError> {
 pub(crate) fn sync_directory(path: &Path) -> Result<(), DomainError> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
-        .map_err(|_| io_error("cannot sync guard proof directory"))
+        .map_err(|error| {
+            DomainError::os(
+                ErrorCode::IoError,
+                "cannot sync guard proof directory",
+                &error,
+            )
+        })
 }
 
 pub(crate) struct ProcFacts;
@@ -435,12 +495,14 @@ impl ProcessFacts for ProcFacts {
 
 pub(crate) fn read_boot_id() -> Result<UuidV4, DomainError> {
     let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map_err(|_| io_error("cannot read boot id"))?;
+        .map_err(|error| DomainError::os(ErrorCode::IoError, "cannot read boot id", &error))?;
     UuidV4::parse(value.trim().to_owned()).map_err(|_| io_error("boot id is invalid"))
 }
 
 pub(crate) fn read_start_ticks(path: &Path) -> Result<u64, DomainError> {
-    let stat = fs::read_to_string(path).map_err(|_| io_error("cannot read process identity"))?;
+    let stat = fs::read_to_string(path).map_err(|error| {
+        DomainError::os(ErrorCode::IoError, "cannot read process identity", &error)
+    })?;
     let close = stat
         .rfind(')')
         .ok_or_else(|| io_error("process identity is invalid"))?;

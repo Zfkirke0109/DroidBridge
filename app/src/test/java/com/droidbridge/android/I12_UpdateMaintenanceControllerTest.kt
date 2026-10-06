@@ -2,12 +2,12 @@ package com.droidbridge.android
 
 import com.droidbridge.android.product.release.ReleaseConfig
 import com.droidbridge.android.runtimehost.ApkSessionInstaller
+import com.droidbridge.android.runtimehost.ApkInstallProvider
 import com.droidbridge.android.runtimehost.ArchiveFacts
 import com.droidbridge.android.runtimehost.InstalledPackageFacts
 import com.droidbridge.android.runtimehost.MaintenanceHost
+import com.droidbridge.android.runtimehost.MaintenanceKind
 import com.droidbridge.android.runtimehost.MaintenancePhase
-import com.droidbridge.android.runtimehost.ModuleObservation
-import com.droidbridge.android.runtimehost.PrivilegedArtifact
 import com.droidbridge.android.runtimehost.PrivilegedOutcome
 import com.droidbridge.android.runtimehost.UpdateMaintenanceController
 import com.droidbridge.android.runtimehost.UpdateMaintenanceRecord
@@ -52,20 +52,17 @@ class I12_UpdateMaintenanceControllerTest {
     private inner class FakeHost : MaintenanceHost {
         var busy = false
         var admissionOpen = true
-        var module = ModuleObservation.Absent
         var privileged = false
         var outcome = PrivilegedOutcome(0, cleanupVerified = true)
         var daemonCleanup: String? = null
-        val dispatched = mutableListOf<Pair<PrivilegedArtifact, UpdateMaintenanceRecord>>()
+        val dispatched = mutableListOf<UpdateMaintenanceRecord>()
         var onDispatch: () -> Unit = {}
         override fun ensureApkHost(): String? = null
         override fun closeAdmission(): String? = if (busy) "HOST_TRANSITION_PENDING" else null.also { admissionOpen = false }
         override fun reopenAdmission(): Boolean = true.also { admissionOpen = true }
-        override fun moduleObservation() = module
-        override fun cleanupVerified() = true
         override fun privilegedInstallAvailable() = privileged
-        override fun privilegedInstall(kind: PrivilegedArtifact, record: UpdateMaintenanceRecord, artifact: File): PrivilegedOutcome {
-            dispatched += kind to record
+        override fun privilegedInstall(record: UpdateMaintenanceRecord, apk: File): PrivilegedOutcome {
+            dispatched += record
             assertEquals(record, store.read())
             onDispatch()
             return outcome
@@ -208,38 +205,58 @@ class I12_UpdateMaintenanceControllerTest {
     }
 
     @Test
-    fun I12_G02_moduleStepCompletesOnlyFromObservationOrTheConfirmedApkOnlyExit() {
+    fun I12_G02_productUpdatesAreApkOnly() {
         val (manifest, signature) = signedRelease()
-        host.module = ModuleObservation.Mismatched
-        val id = updateId(controller.beginProductUpdate(manifest, signature))
-        assertTrue(store.read()!!.requiresModule)
-        controller.installApk(id)
-        packages.versionCode = 1000
+        updateId(controller.beginProductUpdate(manifest, signature))
+        val record = store.read()!!
+        assertFalse(record.requiresModule)
+        assertNull(record.targetModuleSha256)
+        assertFalse("module" in Json.parseToJsonElement(controller.state()).jsonObject)
+    }
+
+    @Test
+    fun I12_G02_moduleStepsOfEarlierReleasesSettleOnceNoDaemonAttemptCanRun() {
+        val exclusion = File(base, UpdateMaintenanceStore.EXCLUSION).apply { writeText("{}") }
+        val installing = UpdateMaintenanceRecord(
+            updateId = UpdateMaintenanceRecord.newUpdateId(),
+            kind = MaintenanceKind.ProductUpdate,
+            targetVersion = "0.1.0",
+            targetVersionCode = 1000,
+            targetApkSha256 = sha256(apkBytes),
+            targetApkSize = apkBytes.size.toLong(),
+            targetApkSignerSha256 = signer,
+            targetModuleSha256 = sha256(moduleBytes),
+            targetModuleSize = moduleBytes.size.toLong(),
+            maintenanceExecutionId = UpdateMaintenanceRecord.newUpdateId(),
+            requiresModule = true,
+            apkInstallProvider = ApkInstallProvider.MagiskPrivileged,
+            phase = MaintenancePhase.ModuleInstalling,
+            apkSessionId = null,
+        )
+        store.create(installing)
+        host.admissionOpen = false
         controller.recover()
-        assertEquals(MaintenancePhase.ModulePending, store.read()!!.phase)
+        assertFalse(exclusion.exists())
+        assertEquals(installing, store.read())
         assertFalse(host.admissionOpen)
 
-        assertNull(error(controller.continueWithoutModule(id)))
+        host.daemonCleanup = "clean"
+        controller.recover()
         assertNull(store.read())
-        assertTrue(store.exclusionPresent())
         assertTrue(host.admissionOpen)
-        assertEquals("excluded", Json.parseToJsonElement(controller.state()).jsonObject.getValue("module").jsonPrimitive.content)
 
-        val repairId = updateId(controller.beginModuleRepair(manifest, signature))
-        assertEquals(MaintenancePhase.ModulePending, store.read()!!.phase)
-        controller.recover()
-        assertTrue(store.exclusionPresent())
-        host.module = ModuleObservation.Compatible
+        val pending = installing.copy(updateId = UpdateMaintenanceRecord.newUpdateId(), maintenanceExecutionId = null, phase = MaintenancePhase.ModulePending)
+        store.create(pending)
+        host.daemonCleanup = null
+        host.admissionOpen = false
         controller.recover()
         assertNull(store.read())
-        assertFalse(store.exclusionPresent())
-        assertTrue(repairId.isNotEmpty())
+        assertTrue(host.admissionOpen)
     }
 
     @Test
     fun I12_G04_privilegedApkAttemptIsRecordedBeforeDispatchAndRetriesOnlyAfterCleanProof() {
         val (manifest, signature) = signedRelease()
-        host.module = ModuleObservation.Compatible
         host.privileged = true
         val id = updateId(controller.beginProductUpdate(manifest, signature))
         assertEquals("magisk_privileged", Json.parseToJsonElement(controller.state()).jsonObject.getValue("record").jsonObject
@@ -247,7 +264,7 @@ class I12_UpdateMaintenanceControllerTest {
 
         host.outcome = PrivilegedOutcome(1, cleanupVerified = true)
         assertEquals("IO_ERROR", error(controller.installApk(id)))
-        val dispatched = host.dispatched.single().second
+        val dispatched = host.dispatched.single()
         assertEquals(MaintenancePhase.ApkInstalling, dispatched.phase)
         assertNotNull(dispatched.maintenanceExecutionId)
         assertEquals(MaintenancePhase.Prepared, store.read()!!.phase)
@@ -267,37 +284,9 @@ class I12_UpdateMaintenanceControllerTest {
         controller.recover()
         assertEquals(MaintenancePhase.Prepared, store.read()!!.phase)
 
-        host.onDispatch = {
-            packages.versionCode = 1000
-            // The replaced APK no longer matches the old module until the module is updated too.
-            host.module = ModuleObservation.Mismatched
-        }
+        host.onDispatch = { packages.versionCode = 1000 }
         host.outcome = PrivilegedOutcome(0, cleanupVerified = true)
         controller.installApk(id)
-        assertEquals(MaintenancePhase.ModulePending, store.read()!!.phase)
-        assertNull(store.read()!!.maintenanceExecutionId)
-    }
-
-    @Test
-    fun I12_G04_privilegedModuleInstallWaitsForTheReloadedModuleObservation() {
-        val (manifest, signature) = signedRelease()
-        packages.versionCode = 1000
-        host.module = ModuleObservation.Mismatched
-        host.privileged = true
-        val id = updateId(controller.beginModuleRepair(manifest, signature))
-
-        host.outcome = PrivilegedOutcome(0, cleanupVerified = true)
-        assertNull(error(controller.installModule(id)))
-        assertEquals(PrivilegedArtifact.Module, host.dispatched.single().first)
-        val settled = store.read()!!
-        assertEquals(MaintenancePhase.ModuleInstalling, settled.phase)
-        assertNull(settled.maintenanceExecutionId)
-        assertFalse(host.admissionOpen)
-
-        controller.recover()
-        assertEquals(settled, store.read())
-        host.module = ModuleObservation.Compatible
-        controller.recover()
         assertNull(store.read())
         assertTrue(host.admissionOpen)
     }

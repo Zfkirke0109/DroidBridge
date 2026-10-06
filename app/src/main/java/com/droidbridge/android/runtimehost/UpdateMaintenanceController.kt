@@ -12,8 +12,6 @@ import com.droidbridge.android.product.release.ReleaseManifests
 import com.droidbridge.android.product.release.ReleaseRejected
 import java.io.File
 import java.security.MessageDigest
-import java.time.Instant
-import java.time.temporal.ChronoUnit
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonObject
@@ -24,10 +22,7 @@ internal enum class ModuleObservation(val wire: String) {
     Compatible("compatible"),
     Absent("absent"),
     Mismatched("mismatched"),
-    Excluded("excluded"),
 }
-
-internal enum class PrivilegedArtifact { Apk, Module }
 
 /** One daemon-owned attempt: the installer exit code when it ran, and whether guard cleanup is proven. */
 internal data class PrivilegedOutcome(val exitCode: Int?, val cleanupVerified: Boolean)
@@ -42,15 +37,11 @@ internal interface MaintenanceHost {
 
     fun reopenAdmission(): Boolean
 
-    fun moduleObservation(): ModuleObservation
-
-    fun cleanupVerified(): Boolean
-
     /** The authenticated compatible daemon can run the fixed S-IPC-DAEMON-005 installers. */
     fun privilegedInstallAvailable(): Boolean
 
-    /** Dispatches exactly one daemon install of the recorded attempt with a read-only artifact descriptor. */
-    fun privilegedInstall(kind: PrivilegedArtifact, record: UpdateMaintenanceRecord, artifact: File): PrivilegedOutcome
+    /** Dispatches exactly one daemon install of the recorded APK attempt with a read-only descriptor. */
+    fun privilegedInstall(record: UpdateMaintenanceRecord, apk: File): PrivilegedOutcome
 
     /** The daemon's `MaintenanceStatus` cleanup token for [updateId], or null when no daemon answers. */
     fun privilegedCleanup(updateId: String): String?
@@ -94,16 +85,12 @@ internal class UpdateMaintenanceController(
     private val packages: InstalledPackageFacts,
     private val installer: ApkSessionInstaller,
     private val cacheRoot: File,
-    private val clock: () -> Instant = Instant::now,
 ) {
-    private val moduleId = if (packageName.endsWith(".debug")) "droidbridge_debug" else "droidbridge"
-
     fun state(): String = reply {
         val record = store.read()
         buildJsonObject {
             put("schema_version", 1)
             put("configured", config is ReleaseConfig.Configured)
-            put("module", moduleFact().wire)
             put("privileged_install", host.privilegedInstallAvailable())
             put("installed_version_code", packages.installedVersionCode())
             put("record", record?.let { Json.parseToJsonElement(it.encode()) } ?: JsonNull)
@@ -114,9 +101,7 @@ internal class UpdateMaintenanceController(
         val configured = configured()
         val manifest = verified { ReleaseManifests.verify(configured, manifestBytes, signature) }
         if (manifest.versionCode <= packages.installedVersionCode()) refuse(INVALID_ARGUMENT, "release is not newer")
-        val requiresModule = moduleFact() != ModuleObservation.Absent
         val apk = verifiedArtifact(manifest.version, manifest.apk)
-        if (requiresModule) verifiedArtifact(manifest.version, manifest.module)
         val archive = packages.archive(apk) ?: refuse(INVALID_ARGUMENT, "APK cannot be parsed")
         if (archive.packageName != packageName || archive.versionCode != manifest.versionCode ||
             archive.signerSha256 != configured.apkSignerSha256
@@ -131,45 +116,16 @@ internal class UpdateMaintenanceController(
             targetApkSha256 = manifest.apk.sha256,
             targetApkSize = manifest.apk.size,
             targetApkSignerSha256 = configured.apkSignerSha256,
-            targetModuleSha256 = manifest.module.sha256.takeIf { requiresModule },
-            targetModuleSize = manifest.module.size.takeIf { requiresModule },
+            // The APK carries its own module, which Home installs once the new APK runs.
+            targetModuleSha256 = null,
+            targetModuleSize = null,
             maintenanceExecutionId = null,
-            requiresModule = requiresModule,
+            requiresModule = false,
             apkInstallProvider = if (host.privilegedInstallAvailable()) ApkInstallProvider.MagiskPrivileged else ApkInstallProvider.PackageInstaller,
             phase = MaintenancePhase.Prepared,
             apkSessionId = null,
         )
         enterMaintenance(record)
-    }
-
-    fun beginModuleRepair(manifestBytes: ByteArray, signature: ByteArray): String = reply {
-        val configured = configured()
-        val manifest = verified { ReleaseManifests.verify(configured, manifestBytes, signature) }
-        if (manifest.versionCode != packages.installedVersionCode() ||
-            packages.installedSignerSha256() != configured.apkSignerSha256
-        ) {
-            refuse(INVALID_ARGUMENT, "module repair must match the installed APK release")
-        }
-        if (moduleFact() == ModuleObservation.Compatible) refuse(INVALID_ARGUMENT, "the module is already compatible")
-        verifiedArtifact(manifest.version, manifest.module)
-        enterMaintenance(
-            UpdateMaintenanceRecord(
-                updateId = UpdateMaintenanceRecord.newUpdateId(),
-                kind = MaintenanceKind.ModuleRepair,
-                targetVersion = manifest.version,
-                targetVersionCode = manifest.versionCode,
-                targetApkSha256 = null,
-                targetApkSize = null,
-                targetApkSignerSha256 = configured.apkSignerSha256,
-                targetModuleSha256 = manifest.module.sha256,
-                targetModuleSize = manifest.module.size,
-                maintenanceExecutionId = null,
-                requiresModule = true,
-                apkInstallProvider = null,
-                phase = MaintenancePhase.ModulePending,
-                apkSessionId = null,
-            ),
-        )
     }
 
     /** One explicit APK attempt from `prepared` through the recorded provider. */
@@ -184,31 +140,6 @@ internal class UpdateMaintenanceController(
             ApkInstallProvider.PackageInstaller -> installWithPackageInstaller(record, apk)
             ApkInstallProvider.MagiskPrivileged -> installPrivilegedApk(record, apk)
             null -> refuse(INVALID_ARGUMENT, "product update has no APK provider")
-        }
-    }
-
-    /** One explicit privileged module attempt from `module_pending`; success still waits for observation. */
-    fun installModule(updateId: String): String = reply {
-        val record = current(updateId)
-        if (record.phase != MaintenancePhase.ModulePending) refuse(INVALID_ARGUMENT, "module install is legal only from module_pending")
-        if (!host.privilegedInstallAvailable()) refuse(CAPABILITY_UNAVAILABLE, "privileged module install is unavailable")
-        val module = cachedFile(record.targetVersion, moduleName(record.targetVersion))
-        if (!matches(module, record.targetModuleSize!!, record.targetModuleSha256!!)) refuse(INVALID_ARGUMENT, "verified module is no longer cached")
-        val installing = record.copy(phase = MaintenancePhase.ModuleInstalling, maintenanceExecutionId = UpdateMaintenanceRecord.newUpdateId())
-        store.replace(record, installing)
-        val outcome = host.privilegedInstall(PrivilegedArtifact.Module, installing, module)
-        when {
-            outcome.cleanupVerified && outcome.exitCode == 0 -> {
-                // The module takes effect after Magisk reload; only a compatible observation completes it.
-                val settled = installing.copy(maintenanceExecutionId = null)
-                store.replace(installing, settled)
-                success(settled)
-            }
-            outcome.cleanupVerified -> {
-                store.replace(installing, record)
-                refuse(IO_ERROR, "privileged module install failed")
-            }
-            else -> refuse(IO_ERROR, "privileged module install cleanup is unverified")
         }
     }
 
@@ -230,26 +161,12 @@ internal class UpdateMaintenanceController(
         success(null)
     }
 
-    /** S-UPD-004 APK-only exit: exclusion commits before the record is removed. */
-    fun continueWithoutModule(updateId: String): String = reply {
-        val record = current(updateId)
-        val modulePhase = record.phase == MaintenancePhase.ModulePending || record.phase == MaintenancePhase.ModuleInstalling
-        if (!modulePhase || record.maintenanceExecutionId != null) refuse(INVALID_ARGUMENT, "APK-only exit needs a settled module step")
-        if (!targetApkInstalled(record)) refuse(INVALID_ARGUMENT, "the target APK is not installed")
-        if (!host.cleanupVerified()) refuse(IO_ERROR, "execution cleanup is unverified")
-        store.excludeModuleAndFinish(
-            record,
-            ModuleExclusion(moduleId, record.updateId, clock().truncatedTo(ChronoUnit.SECONDS).toString()),
-        )
-        reopen()
-        success(null)
-    }
-
     /**
      * Observation-driven reconciliation after restart, package replacement, a module fact change or
      * an Updates read. It never starts an install and never infers success from callbacks.
      */
     fun recover() {
+        store.removeExclusion()
         val record = store.read() ?: return
         when (record.phase) {
             MaintenancePhase.Prepared -> installer.abandonUnrecordedSessions(null)
@@ -266,18 +183,12 @@ internal class UpdateMaintenanceController(
                 else -> Unit
             }
             MaintenancePhase.ApkInstalled -> advanceAfterApk(record)
-            MaintenancePhase.ModulePending, MaintenancePhase.ModuleInstalling -> {
-                val apkReady = record.kind == MaintenanceKind.ModuleRepair || targetApkInstalled(record)
-                when {
-                    apkReady && record.maintenanceExecutionId == null && host.moduleObservation() == ModuleObservation.Compatible -> {
-                        store.removeExclusion()
-                        store.delete(record)
-                        reopen()
-                    }
-                    record.maintenanceExecutionId != null && host.privilegedCleanup(record.updateId) == CLEAN ->
-                        store.replace(record, record.copy(phase = MaintenancePhase.ModulePending, maintenanceExecutionId = null))
+            // Module steps of earlier releases end once no daemon attempt of theirs can still run.
+            MaintenancePhase.ModulePending, MaintenancePhase.ModuleInstalling ->
+                if (record.maintenanceExecutionId == null || host.privilegedCleanup(record.updateId) == CLEAN) {
+                    store.delete(record)
+                    reopen()
                 }
-            }
         }
     }
 
@@ -303,7 +214,7 @@ internal class UpdateMaintenanceController(
         if (!host.privilegedInstallAvailable()) refuse(CAPABILITY_UNAVAILABLE, "privileged install is unavailable")
         val installing = record.copy(phase = MaintenancePhase.ApkInstalling, maintenanceExecutionId = UpdateMaintenanceRecord.newUpdateId())
         store.replace(record, installing)
-        val outcome = host.privilegedInstall(PrivilegedArtifact.Apk, installing, apk)
+        val outcome = host.privilegedInstall(installing, apk)
         // Replacing the package normally ends this process first; restart recovery observes it.
         if (targetApkInstalled(installing)) {
             advanceAfterApk(installing)
@@ -315,13 +226,8 @@ internal class UpdateMaintenanceController(
     }
 
     private fun advanceAfterApk(record: UpdateMaintenanceRecord) {
-        if (record.requiresModule) {
-            store.replace(record, record.copy(phase = MaintenancePhase.ModulePending, apkSessionId = null, maintenanceExecutionId = null))
-            recover()
-        } else {
-            store.delete(record)
-            reopen()
-        }
+        store.delete(record)
+        reopen()
     }
 
     private fun enterMaintenance(record: UpdateMaintenanceRecord): String {
@@ -345,9 +251,6 @@ internal class UpdateMaintenanceController(
         packages.installedVersionCode() == record.targetVersionCode &&
             packages.installedSignerSha256() == record.targetApkSignerSha256
 
-    private fun moduleFact(): ModuleObservation =
-        if (store.exclusionPresent()) ModuleObservation.Excluded else host.moduleObservation()
-
     private fun configured(): ReleaseConfig.Configured =
         config as? ReleaseConfig.Configured ?: refuse(CAPABILITY_UNAVAILABLE, "release configuration is unavailable")
 
@@ -364,8 +267,6 @@ internal class UpdateMaintenanceController(
     }
 
     private fun apkName(version: String) = "droidbridge-$version-arm64-v8a.apk"
-
-    private fun moduleName(version: String) = "droidbridge-magisk-$version.zip"
 
     private fun cachedFile(version: String, name: String) = File(File(cacheRoot, version), name)
 

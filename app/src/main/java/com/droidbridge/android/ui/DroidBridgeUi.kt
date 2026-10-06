@@ -236,6 +236,7 @@ private data class DeviceSetupState(
     val moduleAbsent: Boolean,
     val shizukuInstalled: Boolean,
     val moduleRebootPending: Boolean,
+    val moduleOutdated: Boolean,
 )
 
 @Composable
@@ -249,7 +250,9 @@ private fun rememberDeviceSetup(state: AppUiState): DeviceSetupState {
     )
     var facts by remember(confirmations) { mutableStateOf(read()) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { facts = read() }
-    return DeviceSetupState(facts.first, facts.second, state.moduleAbsent, facts.third, state.moduleRebootPending)
+    return DeviceSetupState(
+        facts.first, facts.second, state.moduleAbsent, facts.third, state.moduleRebootPending, state.moduleOutdated,
+    )
 }
 
 @Composable
@@ -374,8 +377,19 @@ private fun NavigationRoot(state: AppUiState, viewModel: AppViewModel, graph: Ap
                 val connectionEnabled = homeState.tunnel?.enabled == true ||
                     homeState.projection?.mcp?.let { it != HomeMcpRow.Off } == true
                 val rows = snapshot?.let {
-                    CapabilityRows.project(it, setup.rootDetected, setup.moduleAbsent, setup.moduleRebootPending)
+                    CapabilityRows.project(
+                        it, setup.rootDetected, setup.moduleAbsent, setup.moduleRebootPending, setup.moduleOutdated,
+                    )
                 }.orEmpty()
+                // Entering Home with a module from another release offers the one this APK carries,
+                // once per App session.
+                LaunchedEffect(state.moduleOutdated, state.moduleRebootPending, selectedTab) {
+                    if (selectedTab == HOME_TAB && state.moduleOutdated && !state.moduleRebootPending &&
+                        viewModel.claimModuleUpdatePrompt()
+                    ) {
+                        capabilityAction(CapabilityRowKey.RootBackend, CapabilityAction.UpdateModule)
+                    }
+                }
                 val attention = rows.filter { it.action != null && it.state !in settledCapabilityStates } +
                     BackgroundRows.attention(setup.background, BackgroundRows.keeper(snapshot), connectionEnabled)
                 // Without a snapshot nothing has been checked yet, which is not the same as all set.
@@ -658,7 +672,9 @@ private fun CapabilitiesScreen(
     val unavailableReason = (state.clientState as? ClientState.Unavailable)?.reason
     val setup = rememberDeviceSetup(state)
     val rows = snapshot?.let {
-        CapabilityRows.project(it, setup.rootDetected, setup.moduleAbsent, setup.moduleRebootPending)
+        CapabilityRows.project(
+            it, setup.rootDetected, setup.moduleAbsent, setup.moduleRebootPending, setup.moduleOutdated,
+        )
     } ?: listOf(
         CapabilityRow(
             CapabilityRowKey.Runtime,

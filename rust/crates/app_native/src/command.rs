@@ -287,13 +287,15 @@ fn encode_command_failure(failure: &ExecutionFailure) -> String {
     } else {
         serde_json::Value::String("CLEANUP_UNVERIFIED".to_owned())
     };
-    serde_json::json!({
-        "error": {
-            "code": code,
-            "retryable": false,
-        },
-    })
-    .to_string()
+    let mut error = serde_json::json!({
+        "code": code,
+        "retryable": false,
+        "reason": failure.error.reason,
+    });
+    if let Some(errno) = failure.error.os_error {
+        error["os_error"] = serde_json::Value::from(errno);
+    }
+    serde_json::json!({ "error": error }).to_string()
 }
 
 #[cfg(not(target_os = "android"))]
@@ -306,4 +308,36 @@ fn shell_command(
         ErrorCode::CapabilityUnavailable,
         "Shizuku shell commands require Android",
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_command_failure;
+    use contract::ErrorCode;
+    use domain::DomainError;
+    use runtime::ExecutionFailure;
+
+    #[test]
+    fn a_failure_reports_its_step_and_system_error_to_the_host() {
+        let encoded = encode_command_failure(&ExecutionFailure {
+            error: DomainError::os(
+                ErrorCode::ExecutionFailed,
+                "cannot launch the execution guard",
+                &std::io::Error::from_raw_os_error(2),
+            ),
+            cleanup_verified: true,
+        });
+        let error = &serde_json::from_str::<serde_json::Value>(&encoded).unwrap()["error"];
+        assert_eq!(error["code"], "EXECUTION_FAILED");
+        assert_eq!(error["reason"], "cannot launch the execution guard");
+        assert_eq!(error["os_error"], 2);
+
+        let unverified = encode_command_failure(&ExecutionFailure {
+            error: DomainError::new(ErrorCode::IoError, "guard lost"),
+            cleanup_verified: false,
+        });
+        let error = &serde_json::from_str::<serde_json::Value>(&unverified).unwrap()["error"];
+        assert_eq!(error["code"], "CLEANUP_UNVERIFIED");
+        assert!(error.get("os_error").is_none());
+    }
 }

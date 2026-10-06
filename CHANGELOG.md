@@ -1,5 +1,38 @@
 # Changelog / 更新日志
 
+## 0.4.3
+
+### English
+
+**New**
+- Opening the app checks that the installed root module matches the app. When it does not, the app
+  offers to install the module it carries. Updates now installs the app only; the module comes
+  inside it.
+- Errors say what failed. A failed call names the step that failed and, when the system refused
+  it, the system's own error; a command run as the App also reports the App's step. A command that
+  could not be started reports `EXECUTION_FAILED` and running out of files, memory or storage
+  reports `RESOURCE_LIMIT`, instead of `IO_ERROR` for everything.
+
+**Fixed**
+- When a command's cleanup could not be confirmed, the root backend stayed unavailable until it
+  was restarted by hand. It now shows that it is recovering and comes back by itself once cleanup
+  is confirmed; if cleanup can never be confirmed, it says a reboot is needed.
+- The root backend could stay unavailable after it restarted while the app was finishing a command.
+- Some calls replaced the details of a failure with a generic message.
+
+### 中文
+
+**新增**
+- 打开应用时会检查已安装的 Root 模块是否与应用版本一致，不一致时直接提示安装应用内置的模块。「更新」页现在只更新应用，模块随应用一起提供。
+- 报错会说明哪里出错：失败时会给出出错的步骤，系统拒绝时附带系统给出的错误；以 App 身份运行的命令也会带上 App 端的出错步骤。
+  命令未能启动时报 `EXECUTION_FAILED`，文件句柄、内存或存储耗尽时报 `RESOURCE_LIMIT`，不再一律报 `IO_ERROR`。
+
+**修复**
+- 某条命令的清理无法确认后，Root 后端会一直不可用，只能手动重启。现在会显示「正在自动恢复」，确认清理完成后自动恢复；
+  如果清理永远无法确认，会提示需要重启手机。
+- Root 后端在应用正好结束一条命令时重启，可能一直停在不可用。
+- 部分调用失败时，具体原因被替换成笼统的提示。
+
 ## 0.4.2
 
 ### English

@@ -1179,3 +1179,63 @@ async fn i8_cmd_g04_cleanup_uncertainty_is_explicit_for_sync_and_task_results() 
         true
     );
 }
+
+/// A failure below the Runtime reaches the caller with the step that failed and the system's
+/// own error, and unprovable cleanup keeps them beside its own marker.
+#[tokio::test]
+async fn i8_cmd_g04_failures_carry_their_step_and_system_error() {
+    let facts = apk_facts(APK_INSTANCE);
+    let os_error = std::io::Error::from_raw_os_error(2).to_string();
+    for (cleanup_verified, code) in [
+        (true, ErrorCode::ExecutionFailed),
+        (false, ErrorCode::IoError),
+    ] {
+        let capabilities = capabilities_of(facts);
+        let executions = FakeExecutions::default();
+        let host =
+            FakeHostControl::new(RecoveryProof::Clean).with_capabilities(capabilities.clone());
+        let core = RuntimeCore::new(
+            FakePersistence::default(),
+            FakeArtifacts::default(),
+            executions.clone(),
+            capabilities,
+            host,
+        );
+        let mut cause = DomainError::os(
+            ErrorCode::ExecutionFailed,
+            "cannot launch the execution guard",
+            &std::io::Error::from_raw_os_error(2),
+        );
+        cause.peer_reason = Some("cannot create command pipe".to_owned());
+        executions.push(Err(ExecutionFailure {
+            error: cause,
+            cleanup_verified,
+        }));
+        let error = core
+            .run_synchronous(
+                SynchronousAdmission {
+                    request_id: uuid(0x8710_0000, 1),
+                    payload_sha256: "33".repeat(32),
+                    execution_id: uuid(0x8710_0000, 2),
+                    operation: "command.run".to_owned(),
+                    route: ExecutorRequest::Command(RunAs::App),
+                    payload: ExecutionPayload::CommandCall(run_call(RunAs::App, false)),
+                    settlement_bound_bytes: RESERVE_FLOOR_BYTES,
+                    now_ms: 1,
+                },
+                "2026-09-13T00:00:00.000Z".to_owned(),
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, code);
+        let details = &serde_json::to_value(&error).unwrap()["details"];
+        assert_eq!(details["reason"], "cannot launch the execution guard");
+        assert_eq!(details["os_error"], os_error.as_str());
+        assert_eq!(details["peer_reason"], "cannot create command pipe");
+        assert_eq!(
+            details.get("cleanup_unverified").is_some(),
+            !cleanup_verified
+        );
+    }
+}

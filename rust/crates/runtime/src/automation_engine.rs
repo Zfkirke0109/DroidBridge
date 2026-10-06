@@ -268,13 +268,28 @@ where
             .await;
         let outcome = match run {
             _ if effects.cleanup_unverified => {
-                AutomationExecutionOutcome::Interrupted(execution_error(ErrorCode::IoError))
+                let mut details = run
+                    .as_ref()
+                    .err()
+                    .map(crate::core::failure_details)
+                    .unwrap_or_default();
+                details.insert(
+                    "cleanup_unverified".to_owned(),
+                    contract::ErrorDetailValue::Boolean(true),
+                );
+                AutomationExecutionOutcome::Interrupted(PublicError {
+                    details: Some(details),
+                    ..execution_error(ErrorCode::IoError)
+                })
             }
             Ok(()) => AutomationExecutionOutcome::Completed,
             Err(error) if error.code == ErrorCode::Cancelled => {
                 AutomationExecutionOutcome::Cancelled(execution_error(ErrorCode::Cancelled))
             }
-            Err(error) => AutomationExecutionOutcome::Failed(execution_error(error.code)),
+            Err(error) => AutomationExecutionOutcome::Failed(PublicError {
+                details: Some(crate::core::failure_details(&error)),
+                ..execution_error(error.code)
+            }),
         };
         self.settle_automation_execution(execution_id, outcome, clock.wall()?.0)
             .await

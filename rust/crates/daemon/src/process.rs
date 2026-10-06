@@ -22,7 +22,6 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::Arc,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -54,6 +53,7 @@ struct Daemon {
     companion_capabilities: Vec<CompanionCapabilityRegistration>,
     maintenance: crate::maintenance::MaintenanceAttempts,
     task_activity: Arc<crate::app_keepalive::TaskActivityBeacon>,
+    recycle: Arc<crate::recycle::Recycle>,
 }
 
 impl Daemon {
@@ -114,6 +114,7 @@ impl Daemon {
             companion_capabilities: Vec::new(),
             maintenance: crate::maintenance::MaintenanceAttempts::default(),
             task_activity,
+            recycle: Arc::default(),
         };
         let owner = daemon.store.read_owner()?;
         if DaemonRole::from_owner(owner.host).may_create_core() {
@@ -128,6 +129,13 @@ impl Daemon {
         loop {
             if !self.canonical_directory_is_current() {
                 return Ok(());
+            }
+            if self.recycle.due() {
+                crate::recycle::Recycle::bound_shutdown();
+                return Err(DomainError::new(
+                    ErrorCode::IoError,
+                    "execution cleanup is unverified; the supervisor restarts the daemon",
+                ));
             }
             let started = Instant::now();
             if let Ok(mut stream) = connect_abstract(self.identity.socket_name) {
@@ -163,7 +171,7 @@ impl Daemon {
             }
             let delay = CONNECT_DELAYS_SECONDS[failure_index.min(CONNECT_DELAYS_SECONDS.len() - 1)];
             failure_index = (failure_index + 1).min(CONNECT_DELAYS_SECONDS.len() - 1);
-            thread::sleep(Duration::from_secs(delay));
+            self.recycle.sleep(Duration::from_secs(delay));
         }
     }
 
@@ -296,6 +304,9 @@ impl Daemon {
                     );
                     channel.respond(&response, descriptors)?;
                 }
+            }
+            if self.recycle.due() {
+                return Ok(());
             }
         }
     }
@@ -639,6 +650,7 @@ impl Daemon {
             owner.clone(),
             self.companion_port.clone(),
             Arc::clone(&self.task_activity),
+            Arc::clone(&self.recycle),
         )?;
         host.set_app_execution_surface(self.companion.capability_state())?;
         self.host = Some(host);

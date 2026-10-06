@@ -73,19 +73,22 @@ internal fun companionResultPayload(payload: ByteArray): JsonElement? {
     return buildJsonObject { put("payload", decoded) }
 }
 
-internal fun companionFailurePayload(code: String): JsonElement = buildJsonObject {
-    put(
-        "error",
-        buildJsonObject {
-            put(
-                "code",
-                (DaemonErrorToken.entries.firstOrNull { it.wire == code }
-                    ?: DaemonErrorToken.InternalError).wire,
-            )
-            put("retryable", false)
-        },
-    )
-}
+internal fun companionFailurePayload(code: String, reason: String? = null, osError: Int? = null): JsonElement =
+    buildJsonObject {
+        put(
+            "error",
+            buildJsonObject {
+                put(
+                    "code",
+                    (DaemonErrorToken.entries.firstOrNull { it.wire == code }
+                        ?: DaemonErrorToken.InternalError).wire,
+                )
+                put("retryable", false)
+                reason?.let { put("reason", it) }
+                osError?.let { put("os_error", it) }
+            },
+        )
+    }
 
 /**
  * The instance the companion reply must repeat. An instance-fenced operation is only

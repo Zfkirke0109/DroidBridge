@@ -1,6 +1,5 @@
 package com.droidbridge.android
 
-import com.droidbridge.android.product.release.ModulePresence
 import com.droidbridge.android.product.release.ReleaseClassification
 import com.droidbridge.android.product.release.ReleaseConfig
 import com.droidbridge.android.product.update.ReleaseTransport
@@ -10,13 +9,13 @@ import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.InputStream
 import java.nio.file.Files
-import java.security.MessageDigest
 import java.util.Base64
 import java.util.Properties
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -54,7 +53,7 @@ class I12_UpdateManagerTest {
         val transport = FakeTransport(emptyMap(), fixture)
         val cache = Files.createTempDirectory("updates").toFile()
         val manager = UpdateManager(ReleaseConfig.Unconfigured, 999, cache, transport)
-        manager.check(ModulePresence.Absent)
+        manager.check()
         assertEquals(UpdateCheck.Unconfigured, manager.state.value.check)
         assertTrue(transport.requests.isEmpty())
     }
@@ -64,12 +63,12 @@ class I12_UpdateManagerTest {
         val cache = Files.createTempDirectory("updates").toFile()
         val wrongApk = ByteArray(32) { 7 }
         val manager = UpdateManager(config, 999, cache, FakeTransport(mapOf("droidbridge-0.1.0-arm64-v8a.apk" to wrongApk), fixture))
-        manager.check(ModulePresence.Absent)
+        manager.check()
         val checked = manager.state.value.check as UpdateCheck.Checked
         assertTrue(checked.classification is ReleaseClassification.ProductUpdate)
         assertTrue(manager.state.value.newerVersionAvailable)
 
-        manager.download(moduleRequired = false)
+        manager.download()
         assertTrue(manager.state.value.downloadFailed)
         assertNull(manager.state.value.downloads)
         assertFalse(File(cache, "0.1.0/droidbridge-0.1.0-arm64-v8a.apk").exists())
@@ -77,22 +76,16 @@ class I12_UpdateManagerTest {
     }
 
     @Test
-    fun I12_G01_moduleRepairDownloadsOnlyTheVerifiedModule() = runBlocking {
+    fun I12_G01_theInstalledReleaseIsUpToDateAndDownloadsNothing() = runBlocking {
         val cache = Files.createTempDirectory("updates").toFile()
-        val manifest = File(fixture, "release.json").readText()
-        val moduleSize = Regex("\"magisk\":\\{[^}]*\"size\":(\\d+)").find(manifest)!!.groupValues[1].toInt()
-        val moduleSha = Regex("\"magisk\":\\{[^}]*\"sha256\":\"([0-9a-f]{64})\"").find(manifest)!!.groupValues[1]
-        // The fixture digest names the real module ZIP; a synthetic body cannot satisfy it, so this
-        // proves the repair path requests only the module artifact and rejects anything else.
-        val transport = FakeTransport(mapOf("droidbridge-magisk-0.1.0.zip" to ByteArray(moduleSize)), fixture)
+        val transport = FakeTransport(emptyMap(), fixture)
         val manager = UpdateManager(config, 1000, cache, transport)
-        manager.check(ModulePresence.Mismatched)
-        assertTrue((manager.state.value.check as UpdateCheck.Checked).classification is ReleaseClassification.ModuleRepair)
+        manager.check()
+        assertSame(ReleaseClassification.UpToDate, (manager.state.value.check as UpdateCheck.Checked).classification)
         assertFalse(manager.state.value.newerVersionAvailable)
-        manager.download(moduleRequired = true)
-        assertEquals(listOf("release.json", "release.json.sig", "droidbridge-magisk-0.1.0.zip"), transport.requests.map { it.substringAfterLast('/') })
-        assertTrue(manager.state.value.downloadFailed)
-        assertTrue(sha256(ByteArray(moduleSize)) != moduleSha)
+        manager.download()
+        assertEquals(listOf("release.json", "release.json.sig"), transport.requests.map { it.substringAfterLast('/') })
+        assertNull(manager.state.value.downloads)
     }
 
     @Test
@@ -109,6 +102,4 @@ class I12_UpdateManagerTest {
         assertTrue(referenced.exists())
         assertTrue(fresh.exists())
     }
-
-    private fun sha256(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 }

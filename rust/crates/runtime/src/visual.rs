@@ -1239,7 +1239,7 @@ pub async fn handle_visual_public<P, A, E, C, H>(
     call: VisualCall,
     timestamp: String,
     now_ms: u64,
-) -> Result<serde_json::Value, DomainError>
+) -> Result<serde_json::Value, crate::ToolFailure>
 where
     P: PersistencePort + 'static,
     A: ArtifactPort + Clone + 'static,
@@ -1312,7 +1312,7 @@ where
         now_ms,
     )
     .await
-    .map_err(|error| DomainError::new(error.code, "visual execution failed"))
+    .map_err(crate::ToolFailure::Settled)
 }
 
 fn visual_executor_request(call: &VisualCall) -> VisualRoute {

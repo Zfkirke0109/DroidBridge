@@ -194,7 +194,12 @@ internal object NativeAndroidExecutionDispatcher {
     ): AndroidExecutionResult = try {
         runBlocking { executor.execute(request) }
     } catch (error: AndroidExecutionException) {
-        AndroidExecutionResult(byteArrayOf(), errorCode = error.code)
+        AndroidExecutionResult(
+            byteArrayOf(),
+            errorCode = error.code,
+            errorReason = error.reason,
+            errorOsError = error.osError,
+        )
     } catch (_: TimeoutCancellationException) {
         AndroidExecutionResult(byteArrayOf(), errorCode = "TIMEOUT")
     } catch (_: CancellationException) {

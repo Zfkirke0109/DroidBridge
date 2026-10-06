@@ -33,7 +33,7 @@ pub use context::*;
 pub use core::*;
 pub use execution::*;
 pub use filesystem::*;
-pub use ingress::submit_public;
+pub use ingress::{ToolFailure, submit_public};
 pub use mcp::*;
 pub use network::*;
 pub use ports::*;
