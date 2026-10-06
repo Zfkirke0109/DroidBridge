@@ -1,12 +1,8 @@
 package com.droidbridge.android.ui.updates
 
-import com.droidbridge.android.product.release.ModulePresence
-import android.content.ContentResolver
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.DrawableRes
 import androidx.annotation.StringRes
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,20 +11,15 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ListItem
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -89,49 +80,24 @@ class UpdatesViewModel(
     }
 
     fun check() {
-        val module = mutableState.value.maintenance?.module ?: return
-        viewModelScope.launch { updates.check(module) }
+        viewModelScope.launch { updates.check() }
     }
 
     fun download() {
-        val module = mutableState.value.maintenance?.module ?: return
-        viewModelScope.launch { updates.download(moduleRequired = module != ModulePresence.Absent) }
+        viewModelScope.launch { updates.download() }
     }
 
     /** Enters product-update maintenance when needed, then makes one explicit PackageInstaller attempt. */
     fun installApk() = mutate {
-        val record = mutableState.value.maintenance?.record ?: begin(product = true) ?: return@mutate FAILED
+        val record = mutableState.value.maintenance?.record ?: begin() ?: return@mutate FAILED
         client.installUpdateApk(record.updateId)
     }
 
-    fun installModule() = mutate {
-        val record = mutableState.value.maintenance?.record ?: begin(product = false) ?: return@mutate FAILED
-        client.installUpdateModule(record.updateId)
-    }
-
-    /** Exports the verified module ZIP after the module step is recorded; export never advances the phase. */
-    fun exportModule(target: Uri, resolver: ContentResolver) = mutate {
-        val record = mutableState.value.maintenance?.record ?: begin(product = false) ?: return@mutate FAILED
-        val source = File(File(cacheRoot, record.targetVersion), record.moduleFile)
-        val copied = withContext(Dispatchers.IO) {
-            runCatching {
-                checkNotNull(resolver.openOutputStream(target, "wt")).use { output -> source.inputStream().use { it.copyTo(output) } }
-            }.isSuccess
-        }
-        if (copied) EXPORTED else FAILED
-    }
-
-    fun continueWithoutModule(record: MaintenanceRecordView) = mutate { client.continueWithoutModule(record.updateId) }
-
     fun cancel(record: MaintenanceRecordView) = mutate { client.cancelUpdate(record.updateId) }
 
-    private suspend fun begin(product: Boolean): MaintenanceRecordView? {
+    private suspend fun begin(): MaintenanceRecordView? {
         val checked = updates.state.value.check as? UpdateCheck.Checked ?: return null
-        val reply = if (product) {
-            client.beginProductUpdate(checked.manifest, checked.signature)
-        } else {
-            client.beginModuleRepair(checked.manifest, checked.signature)
-        }
+        val reply = client.beginProductUpdate(checked.manifest, checked.signature)
         return (UpdateMaintenanceReplies.mutation(reply) as? MaintenanceReply.Recorded)?.record
     }
 
@@ -149,13 +115,11 @@ class UpdatesViewModel(
 
     private fun referenced(record: MaintenanceRecordView?): Set<File> {
         record ?: return emptySet()
-        val directory = File(cacheRoot, record.targetVersion)
-        return setOf(File(directory, "droidbridge-${record.targetVersion}-arm64-v8a.apk"), File(directory, record.moduleFile))
+        return setOf(File(File(cacheRoot, record.targetVersion), "droidbridge-${record.targetVersion}-arm64-v8a.apk"))
     }
 
     private companion object {
         const val FAILED = """{"schema_version":1,"error":"IO_ERROR"}"""
-        const val EXPORTED = """{"schema_version":1,"record":null}"""
     }
 }
 
@@ -165,10 +129,6 @@ fun UpdatesRoute(viewModel: UpdatesViewModel, apkVersion: String, back: () -> Un
     val state by viewModel.state.collectAsStateWithLifecycle()
     val updates by viewModel.updateState.collectAsStateWithLifecycle()
     val context = LocalContext.current
-    var confirmingApkOnly by rememberSaveable { mutableStateOf(false) }
-    val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument(ZIP_MIME)) { uri ->
-        if (uri != null) viewModel.exportModule(uri, context.contentResolver)
-    }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { viewModel.refresh() }
     val maintenance = state.maintenance
     val record = maintenance?.record
@@ -179,8 +139,6 @@ fun UpdatesRoute(viewModel: UpdatesViewModel, apkVersion: String, back: () -> Un
             context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")))
         }
     }
-    val exportModule = { name: String -> export.launch(name) }
-    val installModule = { viewModel.installModule() }
     Scaffold(
         modifier = Modifier.testTag("route:Updates"),
         topBar = {
@@ -201,14 +159,6 @@ fun UpdatesRoute(viewModel: UpdatesViewModel, apkVersion: String, back: () -> Un
                 )
             }
             item {
-                ListItem(
-                    headlineContent = { Text(stringResource(R.string.updates_component_status)) },
-                    leadingContent = { RowIcon(R.drawable.ic_extension) },
-                    supportingContent = { Text(stringResource(maintenance?.module?.let(::moduleLabel) ?: R.string.state_unknown)) },
-                    modifier = Modifier.testTag("updates:component_status"),
-                )
-            }
-            item {
                 Button(
                     onClick = viewModel::check,
                     enabled = maintenance != null && updates.check != UpdateCheck.Checking && updates.check != UpdateCheck.Unconfigured,
@@ -219,32 +169,11 @@ fun UpdatesRoute(viewModel: UpdatesViewModel, apkVersion: String, back: () -> Un
                 item { RouteError("updates:action", retry = null) }
             }
             if (record != null) {
-                maintenanceActions(record, maintenance.privilegedInstall, state.busy, installApk, installModule, exportModule, viewModel::cancel) {
-                    confirmingApkOnly = true
-                }
+                maintenanceActions(record, state.busy, installApk, viewModel::cancel)
             } else {
-                checkRegion(updates, state.busy, installApk, exportModule, viewModel::download, viewModel::check)
+                checkRegion(updates, state.busy, installApk, viewModel::download, viewModel::check)
             }
         }
-    }
-    if (confirmingApkOnly && record != null) {
-        AlertDialog(
-            onDismissRequest = { confirmingApkOnly = false },
-            title = { Text(stringResource(R.string.dialog_apk_only_title)) },
-            text = { Text(stringResource(R.string.dialog_apk_only_body)) },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        confirmingApkOnly = false
-                        viewModel.continueWithoutModule(record)
-                    },
-                    modifier = Modifier.testTag("updates:continue_apk_only:confirm"),
-                ) { Text(stringResource(R.string.action_continue)) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmingApkOnly = false }) { Text(stringResource(R.string.action_cancel)) }
-            },
-        )
     }
 }
 
@@ -252,7 +181,6 @@ private fun LazyListScope.checkRegion(
     updates: UpdateState,
     busy: Boolean,
     installApk: () -> Unit,
-    exportModule: (String) -> Unit,
     download: () -> Unit,
     retry: () -> Unit,
 ) {
@@ -274,68 +202,24 @@ private fun LazyListScope.checkRegion(
                     }
                 }
             }
-            is ReleaseClassification.ModuleRepair -> {
-                item { Status(R.string.updates_module_repair_required, classification.manifest.version, "module_repair_required", R.drawable.ic_status_error) }
-                val module = updates.downloads?.module
-                item {
-                    if (module == null) {
-                        Action(R.string.action_download_module, "download_module", !updates.downloading, download)
-                    } else {
-                        Action(R.string.updates_export_module, "export_module", !busy) { exportModule(module.name) }
-                    }
-                }
-            }
         }
     }
 }
 
 private fun LazyListScope.maintenanceActions(
     record: MaintenanceRecordView,
-    privilegedInstall: Boolean,
     busy: Boolean,
     installApk: () -> Unit,
-    installModule: () -> Unit,
-    exportModule: (String) -> Unit,
     cancel: (MaintenanceRecordView) -> Unit,
-    continueApkOnly: () -> Unit,
 ) {
-    item { Status(if (record.productUpdate) R.string.updates_available else R.string.updates_module_repair_required, record.targetVersion, "maintenance", if (record.productUpdate) R.drawable.ic_system_update else R.drawable.ic_status_error) }
-    when (record.phase) {
-        "prepared" -> item { Action(R.string.updates_install_apk, "install_apk", !busy, installApk) }
-        "apk_installing", "apk_installed" -> item { RouteLoading("updates:installing") }
-        "module_installing" -> item {
-            if (record.nativeAttemptActive) RouteLoading("updates:installing") else Status(R.string.updates_reboot_required, null, "reboot_required", R.drawable.ic_restart)
-        }
-        "module_pending" -> {
-            item {
-                // A compatible daemon installs the verified module directly; otherwise the ZIP is exported.
-                if (privilegedInstall) {
-                    Action(R.string.action_install_module, "install_module", !busy, installModule)
-                } else {
-                    Action(R.string.updates_export_module, "export_module", !busy) { exportModule(record.moduleFile) }
-                }
-            }
-            item {
-                OutlinedButton(
-                    onClick = continueApkOnly,
-                    enabled = !busy,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).heightIn(min = 56.dp).testTag("updates:continue_apk_only"),
-                ) { Text(stringResource(R.string.updates_continue_apk_only)) }
-            }
-        }
+    item { Status(R.string.updates_available, record.targetVersion, "maintenance", R.drawable.ic_system_update) }
+    // Every later phase, including a module step an earlier release recorded, is Runtime recovery.
+    if (record.phase == "prepared") {
+        item { Action(R.string.updates_install_apk, "install_apk", !busy, installApk) }
+    } else {
+        item { RouteLoading("updates:installing") }
     }
-    if (record.phase == "module_installing" && !record.nativeAttemptActive) {
-        item {
-            OutlinedButton(
-                onClick = continueApkOnly,
-                enabled = !busy,
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).heightIn(min = 56.dp).testTag("updates:continue_apk_only"),
-            ) { Text(stringResource(R.string.updates_continue_apk_only)) }
-        }
-    }
-    val settledModuleStep = record.phase == "module_pending" || (record.phase == "module_installing" && !record.nativeAttemptActive)
-    val cancellable = !record.nativeAttemptActive &&
-        (record.phase == "prepared" || record.phase == "apk_installing" || (!record.productUpdate && settledModuleStep))
+    val cancellable = !record.nativeAttemptActive && (record.phase == "prepared" || record.phase == "apk_installing")
     if (cancellable) {
         item {
             TextButton(
@@ -366,12 +250,3 @@ private fun Action(@StringRes text: Int, tag: String, enabled: Boolean, onClick:
     ) { Text(stringResource(text)) }
 }
 
-@StringRes
-private fun moduleLabel(module: ModulePresence): Int = when (module) {
-    ModulePresence.Compatible -> R.string.state_ready
-    ModulePresence.Absent -> R.string.state_not_installed
-    ModulePresence.Mismatched -> R.string.state_update_required
-    ModulePresence.Excluded -> R.string.updates_module_excluded
-}
-
-private const val ZIP_MIME = "application/zip"

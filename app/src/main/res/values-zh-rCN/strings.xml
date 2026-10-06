@@ -219,7 +219,6 @@
     <string name="theme_dark">深色</string>
     <string name="action_check_for_updates">检查更新</string>
     <string name="updates_install_apk">安装更新</string>
-    <string name="updates_export_module">导出模块</string>
     <string name="data_reset_mcp_credentials">重置本地 MCP 凭据</string>
     <string name="data_clear_chatgpt_credentials">清除 ChatGPT 凭据</string>
     <string name="data_reset_runtime_data">重置运行时数据</string>
@@ -278,13 +277,10 @@
     <string name="licenses_empty">暂无第三方许可</string>
     <string name="updates_title">更新</string>
     <string name="updates_current_version">当前版本</string>
-    <string name="updates_component_status">组件兼容状态</string>
     <string name="updates_up_to_date">已是最新版本</string>
     <string name="updates_available">发现可用更新</string>
-    <string name="updates_module_repair_required">模块需要修复</string>
     <string name="updates_configuration_unavailable">发布配置不可用</string>
     <string name="action_download_update">下载更新</string>
-    <string name="action_download_module">下载模块</string>
     <string name="dialog_reset_mcp_title">重置本地 MCP 凭据？</string>
     <string name="dialog_reset_mcp_body">当前本地 MCP 令牌将立即失效，运行时数据不受影响。</string>
     <string name="dialog_clear_chatgpt_title">清除 ChatGPT 凭据？</string>
@@ -299,11 +295,8 @@
     <string name="dialog_delete_all_automations_body">所有自动化及运行记录都会被删除，无法恢复。</string>
     <string name="snackbar_bulk_delete_result">已删除 %1$d 项；%2$d 项失败。</string>
     <string name="diagnostics_no_failures">暂无最近失败记录</string>
-    <string name="updates_continue_apk_only">暂不使用模块</string>
-    <string name="dialog_apk_only_title">继续使用 APK 能力？</string>
-    <string name="dialog_apk_only_body">将暂停模块执行并保留当前数据。恢复 Root 执行需要安装已验证的模块更新。</string>
-    <string name="updates_module_excluded">模块已暂停，APK 能力可用</string>
     <string name="reason_cleanup_unverified">无法确认执行清理完成，请重启设备后继续。</string>
+    <string name="reason_executor_recovering">执行环境正在自动恢复，请稍候。</string>
     <string name="reason_user_consent_required">请先开始屏幕捕获以允许此请求。</string>
     <string name="dialog_reset_host_title">将运行时宿主重置为 APK？</string>
     <string name="dialog_reset_host_body">将为 APK 运行时重建宿主隔离状态。运行时数据将保留。无法绕过未验证的执行清理。</string>
@@ -318,7 +311,6 @@
     <string name="settings_group_app">应用</string>
     <string name="settings_language">语言</string>
     <string name="language_system">跟随系统</string>
-    <string name="updates_reboot_required">重启手机以完成模块更新</string>
     <string name="settings_open_welcome">打开欢迎页</string>
     <string name="agent_connection_title">智能体连接</string>
     <string name="agent_connection_idle">未连接</string>
@@ -473,4 +465,5 @@
     <string name="module_unsupported_body">无法确定用哪个 root 管理器安装（没有找到，或找到了不止一个）。请导出模块 ZIP，在管理器中手动安装。</string>
     <string name="module_exported">模块 ZIP 已导出</string>
     <string name="module_export_failed">模块 ZIP 导出失败</string>
+    <string name="module_update_mismatch">已安装的 Root 模块与当前 App 版本不一致，需要安装 App 内置的新模块。</string>
 </resources>

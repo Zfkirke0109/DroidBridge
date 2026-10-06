@@ -606,6 +606,11 @@ internal class RuntimeHostController(
     /** The module fact from the authenticated companion; no connection means no stable module is running. */
     private val moduleObservation = AtomicReference(ModuleObservation.Absent)
 
+    /** The versionCode the connected module's daemon last reported; 0 until one reports. */
+    private val moduleVersionCode = java.util.concurrent.atomic.AtomicLong(0)
+
+    fun moduleVersionCode(): Long = moduleVersionCode.get()
+
     private val maintenanceHost = object : MaintenanceHost {
         override fun ensureApkHost(): String? {
             val current = runtimeSession.get()
@@ -634,11 +639,6 @@ internal class RuntimeHostController(
 
         override fun reopenAdmission(): Boolean = NativeRuntime.nativeReopenAdmission(canonicalBase.absolutePath)
 
-        override fun moduleObservation(): ModuleObservation = moduleObservation.get()
-
-        override fun cleanupVerified(): Boolean =
-            runCatching { JSONObject(maintenanceState()).optString("cleanup") == "verified" }.getOrDefault(false)
-
         override fun privilegedInstallAvailable(): Boolean {
             val session = runtimeSession.get()
             return session.started && session.host == DaemonHostToken.ApkRuntime &&
@@ -646,44 +646,29 @@ internal class RuntimeHostController(
                 companion.connection()?.isHealthy() == true
         }
 
-        override fun privilegedInstall(
-            kind: PrivilegedArtifact,
-            record: UpdateMaintenanceRecord,
-            artifact: File,
-        ): PrivilegedOutcome {
+        override fun privilegedInstall(record: UpdateMaintenanceRecord, apk: File): PrivilegedOutcome {
             // Nothing was dispatched without a connection, so no attempt can be running.
             val connection = companion.connection() ?: return PrivilegedOutcome(null, cleanupVerified = true)
             val executionId = requireNotNull(record.maintenanceExecutionId)
-            val (operation, role, payload) = when (kind) {
-                PrivilegedArtifact.Apk -> Triple(
-                    DaemonOperationToken.MaintenanceInstallApk,
-                    "verified_apk",
-                    buildJsonObject {
-                        put("update_id", record.updateId)
-                        put("execution_id", executionId)
-                        put("package", application.packageName)
-                        put("version_code", record.targetVersionCode)
-                        put("sha256", requireNotNull(record.targetApkSha256))
-                        put("signer_sha256", record.targetApkSignerSha256)
-                        put("size", requireNotNull(record.targetApkSize))
-                    },
-                )
-                PrivilegedArtifact.Module -> Triple(
-                    DaemonOperationToken.MaintenanceInstallModule,
-                    "verified_module_zip",
-                    buildJsonObject {
-                        put("update_id", record.updateId)
-                        put("execution_id", executionId)
-                        put("module_id", if (application.packageName.endsWith(".debug")) "droidbridge_debug" else "droidbridge")
-                        put("version_code", record.targetVersionCode)
-                        put("sha256", requireNotNull(record.targetModuleSha256))
-                        put("size", requireNotNull(record.targetModuleSize))
-                    },
-                )
+            val payload = buildJsonObject {
+                put("update_id", record.updateId)
+                put("execution_id", executionId)
+                put("package", application.packageName)
+                put("version_code", record.targetVersionCode)
+                put("sha256", requireNotNull(record.targetApkSha256))
+                put("signer_sha256", record.targetApkSignerSha256)
+                put("size", requireNotNull(record.targetApkSize))
             }
-            val reply = ParcelFileDescriptor.open(artifact, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
+            val reply = ParcelFileDescriptor.open(apk, ParcelFileDescriptor.MODE_READ_ONLY).use { descriptor ->
                 runCatching {
-                    connection.request(operation, payload, observeOwner(), PRIVILEGED_INSTALL_TIMEOUT_MILLIS, listOf(role), listOf(descriptor))
+                    connection.request(
+                        DaemonOperationToken.MaintenanceInstallApk,
+                        payload,
+                        observeOwner(),
+                        PRIVILEGED_INSTALL_TIMEOUT_MILLIS,
+                        listOf("verified_apk"),
+                        listOf(descriptor),
+                    )
                         .use { it.envelope.payload.jsonObject }
                 }.getOrNull()
             }
@@ -737,17 +722,9 @@ internal class RuntimeHostController(
     fun beginProductUpdate(manifest: ByteArray, signature: ByteArray): String =
         onTransitionExecutor { maintenance.beginProductUpdate(manifest, signature) }
 
-    fun beginModuleRepair(manifest: ByteArray, signature: ByteArray): String =
-        onTransitionExecutor { maintenance.beginModuleRepair(manifest, signature) }
-
     fun installUpdateApk(updateId: String): String = onTransitionExecutor { maintenance.installApk(updateId) }
 
-    fun installUpdateModule(updateId: String): String = onTransitionExecutor { maintenance.installModule(updateId) }
-
     fun cancelUpdate(updateId: String): String = onTransitionExecutor { maintenance.cancel(updateId) }
-
-    fun continueWithoutModule(updateId: String): String =
-        onTransitionExecutor { maintenance.continueWithoutModule(updateId) }
 
     private fun observeModule(observed: ModuleObservation) {
         if (moduleObservation.getAndSet(observed) != observed) recoverMaintenance()
@@ -1214,7 +1191,9 @@ internal class RuntimeHostController(
             return DaemonReplyPayload(companionFailurePayload(DaemonErrorToken.InternalError.wire))
         }
         val errorCode = result.errorCode
-        if (errorCode != null) return DaemonReplyPayload(companionFailurePayload(errorCode))
+        if (errorCode != null) {
+            return DaemonReplyPayload(companionFailurePayload(errorCode, result.errorReason, result.errorOsError))
+        }
         val payload = companionResultPayload(result.payload)
             ?: return refusedResult(result.descriptors, DaemonErrorToken.InternalError)
         val roles = companionResultRoles(result.descriptors.map(RoleDescriptor::role))
@@ -1253,7 +1232,9 @@ internal class RuntimeHostController(
             return DaemonReplyPayload(companionFailurePayload(DaemonErrorToken.InternalError.wire))
         }
         val errorCode = result.errorCode
-        if (errorCode != null) return DaemonReplyPayload(companionFailurePayload(errorCode))
+        if (errorCode != null) {
+            return DaemonReplyPayload(companionFailurePayload(errorCode, result.errorReason, result.errorOsError))
+        }
         val payload = companionResultPayload(result.payload)
             ?: return refusedResult(result.descriptors, DaemonErrorToken.InternalError)
         val roles = companionResultRoles(result.descriptors.map(RoleDescriptor::role))
@@ -1270,6 +1251,7 @@ internal class RuntimeHostController(
     }
 
     private fun handleHostStatus(connection: DaemonConnection, payload: JsonObject) {
+        (payload["version_code"] as? JsonPrimitive)?.contentOrNull?.toLongOrNull()?.let(moduleVersionCode::set)
         when (payload.getValue("role").jsonPrimitive.content) {
             "backend_only" -> {
                 val ready = payload.getValue("ready").jsonPrimitive.boolean

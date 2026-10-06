@@ -95,15 +95,17 @@ object CapabilityRows {
      * [rootDetected]: a root manager or `su` is present on the device, found without asking `su`.
      * [moduleAbsent]: the Runtime has been ready long enough for a module daemon to connect, and none did.
      * [moduleRebootPending]: this APK's module was installed during this boot and waits for a reboot.
+     * [moduleOutdated]: the running module is not the one this APK carries.
      */
     fun project(
         reported: RuntimeSnapshot,
         rootDetected: Boolean = false,
         moduleAbsent: Boolean = false,
         moduleRebootPending: Boolean = false,
+        moduleOutdated: Boolean = false,
     ): List<CapabilityRow> = buildList {
         add(runtime(reported))
-        add(root(reported, rootDetected, moduleAbsent, moduleRebootPending))
+        add(root(reported, rootDetected, moduleAbsent, moduleRebootPending, moduleOutdated))
         // Without a module the Magisk facts never settle; waiting on them would leave every access
         // row at "unknown, recheck" instead of offering the switch the user can turn on.
         val snapshot = if (moduleAbsent) withoutModule(reported) else reported
@@ -220,15 +222,20 @@ object CapabilityRows {
         rootDetected: Boolean,
         moduleAbsent: Boolean,
         moduleRebootPending: Boolean,
+        moduleOutdated: Boolean,
     ): CapabilityRow {
         val root = snapshot.grant("magisk.root")
         val module = snapshot.grant("magisk.module")
-        if (root.state == AvailabilityState.Available) {
-            return CapabilityRow(CapabilityRowKey.RootBackend, CapabilityRowState.Ready)
-        }
         // A module installed this boot is staged by the manager; whatever runs now is the old one.
         if (moduleRebootPending) {
             return CapabilityRow(CapabilityRowKey.RootBackend, CapabilityRowState.PendingReboot, CapabilityAction.Reboot)
+        }
+        // A running module from another release still works; the APK carries the matching one.
+        if (moduleOutdated) {
+            return CapabilityRow(CapabilityRowKey.RootBackend, CapabilityRowState.UpdateRequired, CapabilityAction.UpdateModule)
+        }
+        if (root.state == AvailabilityState.Available) {
+            return CapabilityRow(CapabilityRowKey.RootBackend, CapabilityRowState.Ready)
         }
         return when (module.reason) {
             "MODULE_NOT_INSTALLED" -> CapabilityRow(CapabilityRowKey.RootBackend, CapabilityRowState.NotInstalled, CapabilityAction.InstallModule)

@@ -908,10 +908,11 @@ pub(crate) fn sync_directory(path: &std::path::Path) -> Result<(), DomainError> 
 }
 
 pub(crate) fn io_error(error: std::io::Error) -> DomainError {
-    // The public error carries only the code; the OS error is the one fact that tells a denied
-    // label from a full disk, so it goes to stderr, which the root supervisor keeps in its log.
+    // The OS error is the one fact that tells a denied label from a full disk. It travels with
+    // the error and also goes to stderr, which the root supervisor keeps, for the failures no
+    // request reports.
     eprintln!("droidbridge persistence: I/O failed: {error}");
-    DomainError::new(ErrorCode::IoError, "persistence I/O failed")
+    DomainError::os(ErrorCode::IoError, "persistence I/O failed", &error)
 }
 
 #[cfg(test)]

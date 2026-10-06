@@ -178,6 +178,12 @@ class DroidBridgeClient(
         return withContext(Dispatchers.IO) { service.isModuleRebootPending }
     }
 
+    /** The versionCode of the root module that last connected, or 0 when none has. */
+    suspend fun moduleVersionCode(): Long {
+        val service = runtime ?: error("Runtime unavailable")
+        return withContext(Dispatchers.IO) { service.moduleVersionCode }
+    }
+
     suspend fun rebootForModule(): Boolean {
         val service = runtime ?: error("Runtime unavailable")
         return withContext(Dispatchers.IO) { service.rebootForModule() }
@@ -185,22 +191,15 @@ class DroidBridgeClient(
 
     suspend fun resetRuntimeHostToApk(): String = mcpCall(IDroidBridgeRuntime::resetRuntimeHostToApk)
 
-    /** The S-UPD-002 `{schema_version,configured,module,privileged_install,installed_version_code,record}` reply. */
+    /** The S-UPD-002 `{schema_version,configured,privileged_install,installed_version_code,record}` reply. */
     suspend fun updateMaintenance(): String = mcpCall(IDroidBridgeRuntime::getUpdateMaintenance)
 
     suspend fun beginProductUpdate(manifest: ByteArray, signature: ByteArray): String =
         mcpCall { it.beginProductUpdate(manifest, signature) }
 
-    suspend fun beginModuleRepair(manifest: ByteArray, signature: ByteArray): String =
-        mcpCall { it.beginModuleRepair(manifest, signature) }
-
     suspend fun installUpdateApk(updateId: String): String = mcpCall { it.installUpdateApk(updateId) }
 
-    suspend fun installUpdateModule(updateId: String): String = mcpCall { it.installUpdateModule(updateId) }
-
     suspend fun cancelUpdate(updateId: String): String = mcpCall { it.cancelUpdate(updateId) }
-
-    suspend fun continueWithoutModule(updateId: String): String = mcpCall { it.continueWithoutModule(updateId) }
 
     private suspend fun mcpCall(call: (IDroidBridgeRuntime) -> String): String {
         val service = runtime ?: error("Runtime unavailable")

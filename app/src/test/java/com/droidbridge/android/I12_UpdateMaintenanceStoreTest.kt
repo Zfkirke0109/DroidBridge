@@ -3,7 +3,6 @@ package com.droidbridge.android
 import com.droidbridge.android.runtimehost.ApkInstallProvider
 import com.droidbridge.android.runtimehost.MaintenanceKind
 import com.droidbridge.android.runtimehost.MaintenancePhase
-import com.droidbridge.android.runtimehost.ModuleExclusion
 import com.droidbridge.android.runtimehost.UpdateMaintenanceRecord
 import com.droidbridge.android.runtimehost.UpdateMaintenanceStore
 import java.io.File
@@ -79,19 +78,12 @@ class I12_UpdateMaintenanceStoreTest {
     }
 
     @Test
-    fun I12_G02_apkOnlyExitCommitsExclusionBeforeRemovingTheRecord() {
-        val pending = prepared.copy(
-            requiresModule = true,
-            targetModuleSha256 = sha,
-            targetModuleSize = 20,
-            phase = MaintenancePhase.ModulePending,
-        )
-        store.create(pending)
-        store.excludeModuleAndFinish(pending, ModuleExclusion("droidbridge", pending.updateId, "2026-09-15T00:00:00Z"))
-        assertNull(store.read())
-        assertTrue(store.exclusionPresent())
+    fun I12_G02_anExclusionFromAnEarlierReleaseIsRemoved() {
+        val exclusion = File(base, UpdateMaintenanceStore.EXCLUSION)
+        exclusion.writeText("""{"schema_version":1,"module_id":"droidbridge","update_id":"x","created_at":"2026-09-15T00:00:00Z"}""")
         store.removeExclusion()
-        assertFalse(store.exclusionPresent())
+        assertFalse(exclusion.exists())
+        store.removeExclusion()
     }
 
     @Test

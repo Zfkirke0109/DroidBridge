@@ -293,8 +293,8 @@ internal fun RuntimeHealthGate.serveApk(
 }
 
 /**
- * What one Runtime reply proves. IO_ERROR and INTERNAL_ERROR are the codes a lost bridge, store or
- * descriptor table collapse into, and a reply that cannot be read proves nothing was answered.
+ * What one Runtime reply proves. An [INFRASTRUCTURE_CODES] failure can mean the instance itself is
+ * broken, and a reply that cannot be read proves nothing was answered.
  * Only a successful business request ([provesExecution]) shows the instance executes.
  */
 internal fun runtimeSettlement(response: ByteArray, provesExecution: Boolean): RuntimeSettlement {
@@ -304,7 +304,7 @@ internal fun runtimeSettlement(response: ByteArray, provesExecution: Boolean): R
         "success" -> if (provesExecution) RuntimeSettlement.Served else RuntimeSettlement.Inconclusive
         "error" -> {
             val code = ((envelope["error"] as? JsonObject)?.get("code") as? JsonPrimitive)?.content
-            if (code == DaemonErrorToken.IoError.wire || code == DaemonErrorToken.InternalError.wire) {
+            if (code in INFRASTRUCTURE_CODES) {
                 RuntimeSettlement.Suspicious
             } else {
                 RuntimeSettlement.Inconclusive
@@ -313,6 +313,17 @@ internal fun runtimeSettlement(response: ByteArray, provesExecution: Boolean): R
         else -> RuntimeSettlement.Suspicious
     }
 }
+
+/**
+ * The codes a lost bridge, store or descriptor table collapse into. Since 0.4.3 exhausted files,
+ * memory or storage report RESOURCE_LIMIT rather than IO_ERROR, which is exactly the process-wide
+ * exhaustion a false-green instance can hide behind.
+ */
+private val INFRASTRUCTURE_CODES = setOf(
+    DaemonErrorToken.IoError.wire,
+    DaemonErrorToken.InternalError.wire,
+    DaemonErrorToken.ResourceLimit.wire,
+)
 
 /**
  * Whether one submission exercises execution. `context` reads are projections and `task_control`

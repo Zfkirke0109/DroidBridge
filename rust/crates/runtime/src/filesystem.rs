@@ -60,7 +60,7 @@ pub async fn handle_filesystem_public<P, A, E, C, H>(
     call: contract::FilesystemCall,
     timestamp: String,
     now_ms: u64,
-) -> Result<serde_json::Value, DomainError>
+) -> Result<serde_json::Value, crate::ToolFailure>
 where
     P: PersistencePort + 'static,
     A: ArtifactPort + Clone + 'static,
@@ -79,7 +79,8 @@ where
             FilesystemExecutionResult::Task(_) => Err(DomainError::new(
                 ErrorCode::InternalError,
                 "executor-free filesystem request produced a Task",
-            )),
+            )
+            .into()),
         };
     };
     let action = filesystem_action(&call);
@@ -117,7 +118,9 @@ where
         serde_json::to_value(TaskAccepted {
             task_id: admitted_task_id,
         })
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "Task result encoding failed"))
+        .map_err(|_| {
+            DomainError::new(ErrorCode::InternalError, "Task result encoding failed").into()
+        })
     } else {
         core.run_synchronous(
             SynchronousAdmission {
@@ -134,7 +137,7 @@ where
             now_ms,
         )
         .await
-        .map_err(|error| DomainError::new(error.code, "filesystem execution failed"))
+        .map_err(crate::ToolFailure::Settled)
     }
 }
 

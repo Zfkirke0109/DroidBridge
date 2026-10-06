@@ -935,6 +935,6 @@ fn io_domain(reason: &'static str) -> DomainError {
     DomainError::new(ErrorCode::IoError, reason)
 }
 
-fn io_error(_error: std::io::Error) -> DomainError {
-    io_domain("visual file operation failed")
+fn io_error(error: std::io::Error) -> DomainError {
+    DomainError::os(ErrorCode::IoError, "visual file operation failed", &error)
 }

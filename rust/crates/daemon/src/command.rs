@@ -8,7 +8,7 @@
 
 use crate::companion::{CompanionPort, CompanionPrimitiveRequest};
 use crate::magisk_guard_recovery::{
-    ProcFacts, create_guard_directory, guard_proof_capacity_available, io_error, sync_directory,
+    ProcFacts, create_guard_directory, guard_proof_capacity_available, sync_directory,
 };
 use contract::{ErrorCode, RunAs, UuidV4};
 use domain::DomainError;
@@ -172,7 +172,7 @@ impl RootCommandGuard {
             )));
         }
         let directory = self.directory();
-        create_guard_directory(&self.base, &directory).map_err(pre_start)?;
+        create_guard_directory(&self.base, &directory).map_err(setup)?;
         let identity = self.identity(execution_id);
         let proof_path = directory.join(format!("{}.proof", identity.execution_id.as_str()));
         let mut proof = fs::OpenOptions::new()
@@ -181,24 +181,30 @@ impl RootCommandGuard {
             .create_new(true)
             .mode(0o600)
             .open(&proof_path)
-            .map_err(|_| pre_start(io_error("cannot create root guard proof")))?;
+            .map_err(|error| {
+                setup(DomainError::os(
+                    ErrorCode::IoError,
+                    "cannot create root guard proof",
+                    &error,
+                ))
+            })?;
         crate::magisk_guard_recovery::copy_canonical_metadata(
             &self.base.join("runtime-state.json"),
             &proof,
             0o600,
         )
-        .map_err(pre_start)?;
-        if proof
+        .map_err(setup)?;
+        if let Err(error) = proof
             .write_all(&encode_guard_frame(&identity).map_err(pre_start)?)
             .and_then(|_| proof.sync_all())
-            .is_err()
         {
             drop(proof);
             let _ = fs::remove_file(&proof_path);
             let _ = sync_directory(&directory);
-            return Err(pre_start(DomainError::new(
+            return Err(setup(DomainError::os(
                 ErrorCode::IoError,
                 "root guard proof header write failed",
+                &error,
             )));
         }
         Ok(proof)
@@ -241,8 +247,15 @@ impl RootCommandGuard {
         };
         let directory = self.directory();
         if result.cleanup_verified {
-            fs::remove_file(directory.join(format!("{}.proof", execution_id.as_str())))
-                .map_err(|_| io_error("cannot remove clean root guard proof"))?;
+            fs::remove_file(directory.join(format!("{}.proof", execution_id.as_str()))).map_err(
+                |error| {
+                    DomainError::os(
+                        ErrorCode::IoError,
+                        "cannot remove clean root guard proof",
+                        &error,
+                    )
+                },
+            )?;
             sync_directory(&directory)?;
         } else {
             self.quarantine.observe();
@@ -259,12 +272,20 @@ impl RootCommandGuard {
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(_) => return Err(io_error("cannot read root guard proof")),
+            Err(error) => {
+                return Err(DomainError::os(
+                    ErrorCode::IoError,
+                    "cannot read root guard proof",
+                    &error,
+                ));
+            }
         };
         if bytes != encode_guard_frame(&identity)? {
             return Ok(false);
         }
-        fs::remove_file(path).map_err(|_| io_error("cannot retire root guard proof"))?;
+        fs::remove_file(path).map_err(|error| {
+            DomainError::os(ErrorCode::IoError, "cannot retire root guard proof", &error)
+        })?;
         sync_directory(&directory)?;
         Ok(true)
     }
@@ -503,7 +524,13 @@ impl RootCommandGuard {
         let output = output
             .map(fs::File::try_clone)
             .transpose()
-            .map_err(|_| pre_start(io_error("cannot duplicate visual output file")))?;
+            .map_err(|error| {
+                setup(DomainError::os(
+                    ErrorCode::IoError,
+                    "cannot duplicate visual output file",
+                    &error,
+                ))
+            })?;
         let settlement = self.run_with_stdout(
             execution_id,
             CommandProcessRequest {
@@ -573,8 +600,13 @@ impl RootCommandGuard {
                 (read, Some((write, bytes.clone())))
             }
             None => (
-                fs::File::open("/dev/null")
-                    .map_err(|_| pre_start(io_error("cannot open root command input")))?,
+                fs::File::open("/dev/null").map_err(|error| {
+                    setup(DomainError::os(
+                        ErrorCode::IoError,
+                        "cannot open root command input",
+                        &error,
+                    ))
+                })?,
                 None,
             ),
         };
@@ -606,13 +638,17 @@ impl RootCommandGuard {
         }
         let mut child = match command.spawn() {
             Ok(child) => child,
-            Err(_) => {
+            Err(error) => {
                 drop(proof);
                 drop(lifetime_read);
                 drop(lifetime_write);
                 return Err(self.unstarted(
                     execution_id,
-                    DomainError::new(ErrorCode::IoError, "cannot launch the root execution guard"),
+                    DomainError::os(
+                        ErrorCode::ExecutionFailed,
+                        "cannot launch the root execution guard",
+                        &error,
+                    ),
                 ));
             }
         };
@@ -725,10 +761,11 @@ impl RootCommandGuard {
                     });
                 }
                 Ok(None) => {}
-                Err(_) => {
-                    return Err(pre_start(DomainError::new(
+                Err(error) => {
+                    return Err(pre_start(DomainError::os(
                         ErrorCode::IoError,
                         "cannot observe the root execution guard",
+                        &error,
                     )));
                 }
             }
@@ -991,6 +1028,19 @@ fn pre_start(error: DomainError) -> ExecutionFailure {
     }
 }
 
+/// A step that sets up a root process which never starts. Its I/O failure means the request
+/// could not be executed; a resource limit or a more exact cause keeps its own code.
+fn setup(error: DomainError) -> ExecutionFailure {
+    pre_start(if error.code == ErrorCode::IoError {
+        DomainError {
+            code: ErrorCode::ExecutionFailed,
+            ..error
+        }
+    } else {
+        error
+    })
+}
+
 fn clear_cloexec(fd: i32) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
@@ -1018,7 +1068,11 @@ fn block_guard_termination_signals() -> io::Result<()> {
 fn pipe() -> Result<(fs::File, fs::File), ExecutionFailure> {
     let mut ends = [0_i32; 2];
     if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(pre_start(io_error("cannot create root command pipe")));
+        return Err(setup(DomainError::os(
+            ErrorCode::IoError,
+            "cannot create root command pipe",
+            &io::Error::last_os_error(),
+        )));
     }
     Ok(unsafe {
         (
@@ -1077,7 +1131,11 @@ fn drain(file: fs::File, limit: usize, stop: &AtomicBool) -> Result<BoundedStrea
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(io_error("cannot poll a root command stream"));
+            return Err(DomainError::os(
+                ErrorCode::IoError,
+                "cannot poll a root command stream",
+                &error,
+            ));
         }
         if ready == 0 {
             if stopped {
@@ -1092,7 +1150,11 @@ fn drain(file: fs::File, limit: usize, stop: &AtomicBool) -> Result<BoundedStrea
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(io_error("cannot read a root command stream"));
+            return Err(DomainError::os(
+                ErrorCode::IoError,
+                "cannot read a root command stream",
+                &error,
+            ));
         }
         if count == 0 {
             return Ok(BoundedStream { bytes, truncated });
@@ -1136,16 +1198,20 @@ fn drain_to_file(
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(io_error("cannot poll a visual root stream"));
+            return Err(DomainError::os(
+                ErrorCode::IoError,
+                "cannot poll a visual root stream",
+                &error,
+            ));
         }
         if ready == 0 {
             if stopped {
-                output
-                    .flush()
-                    .map_err(|_| io_error("cannot flush visual output"))?;
-                output
-                    .sync_all()
-                    .map_err(|_| io_error("cannot sync visual output"))?;
+                output.flush().map_err(|error| {
+                    DomainError::os(ErrorCode::IoError, "cannot flush visual output", &error)
+                })?;
+                output.sync_all().map_err(|error| {
+                    DomainError::os(ErrorCode::IoError, "cannot sync visual output", &error)
+                })?;
                 return Ok(BoundedStream {
                     bytes: Vec::new(),
                     truncated,
@@ -1160,15 +1226,19 @@ fn drain_to_file(
             if error.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(io_error("cannot read a visual root stream"));
+            return Err(DomainError::os(
+                ErrorCode::IoError,
+                "cannot read a visual root stream",
+                &error,
+            ));
         }
         if count == 0 {
-            output
-                .flush()
-                .map_err(|_| io_error("cannot flush visual output"))?;
-            output
-                .sync_all()
-                .map_err(|_| io_error("cannot sync visual output"))?;
+            output.flush().map_err(|error| {
+                DomainError::os(ErrorCode::IoError, "cannot flush visual output", &error)
+            })?;
+            output.sync_all().map_err(|error| {
+                DomainError::os(ErrorCode::IoError, "cannot sync visual output", &error)
+            })?;
             return Ok(BoundedStream {
                 bytes: Vec::new(),
                 truncated,
@@ -1178,9 +1248,9 @@ fn drain_to_file(
         let remaining = limit.saturating_sub(written);
         if remaining > 0 {
             let take = remaining.min(count);
-            output
-                .write_all(&buffer[..take])
-                .map_err(|_| io_error("cannot write visual output"))?;
+            output.write_all(&buffer[..take]).map_err(|error| {
+                DomainError::os(ErrorCode::IoError, "cannot write visual output", &error)
+            })?;
             written += take;
         }
         if count > remaining {
@@ -1246,4 +1316,33 @@ fn collect_streams(
 /// The root guard path the Magisk package installs, relative to the module root.
 pub(crate) fn guard_path(module_root: &Path) -> PathBuf {
     module_root.join("bin/droidbridge-exec-guard")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::setup;
+    use contract::ErrorCode;
+    use domain::DomainError;
+
+    #[test]
+    fn a_setup_io_failure_is_an_execution_failure_that_keeps_its_cause() {
+        let failure = setup(DomainError::os(
+            ErrorCode::IoError,
+            "cannot create root command pipe",
+            &std::io::Error::from_raw_os_error(5),
+        ));
+        assert!(failure.cleanup_verified);
+        assert_eq!(failure.error.code, ErrorCode::ExecutionFailed);
+        assert_eq!(failure.error.reason, "cannot create root command pipe");
+        assert_eq!(failure.error.os_error, Some(5));
+
+        let exhausted = setup(DomainError::os(
+            ErrorCode::IoError,
+            "cannot create root command pipe",
+            &std::io::Error::from_raw_os_error(24),
+        ));
+        assert_eq!(exhausted.error.code, ErrorCode::ResourceLimit);
+        let admission = setup(DomainError::new(ErrorCode::ResourceLimit, "x"));
+        assert_eq!(admission.error.code, ErrorCode::ResourceLimit);
+    }
 }

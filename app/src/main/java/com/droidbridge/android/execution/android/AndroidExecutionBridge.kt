@@ -2,7 +2,12 @@ package com.droidbridge.android.execution.android
 
 import android.os.ParcelFileDescriptor
 
-internal open class AndroidExecutionException(val code: String) : IllegalStateException(code)
+/** [reason] and [osError] are the native step and system error behind [code], when it reported them. */
+internal open class AndroidExecutionException(
+    val code: String,
+    val reason: String? = null,
+    val osError: Int? = null,
+) : IllegalStateException(code)
 
 enum class AndroidPrimitive {
     AppPathFsPrimitive,
@@ -58,6 +63,8 @@ data class AndroidExecutionResult(
     val payload: ByteArray,
     val descriptors: List<RoleDescriptor> = emptyList(),
     val errorCode: String? = null,
+    val errorReason: String? = null,
+    val errorOsError: Int? = null,
 ) {
     init {
         require(descriptors.size <= 4)

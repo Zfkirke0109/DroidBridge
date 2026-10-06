@@ -521,6 +521,8 @@ class I16_RuntimeHealthGateTest {
     fun i16_replyClassificationSeparatesProofFromSuspicion() {
         assertEquals(RuntimeSettlement.Suspicious, runtimeSettlement(failed("IO_ERROR"), true))
         assertEquals(RuntimeSettlement.Suspicious, runtimeSettlement(failed("INTERNAL_ERROR"), true))
+        assertEquals(RuntimeSettlement.Suspicious, runtimeSettlement(failed("RESOURCE_LIMIT"), true))
+        assertEquals(RuntimeSettlement.Inconclusive, runtimeSettlement(failed("EXECUTION_FAILED"), true))
         assertEquals(RuntimeSettlement.Served, runtimeSettlement(ok(), true))
         // A status read is served from projection: issue #2's false green is exactly that answer.
         assertEquals(RuntimeSettlement.Inconclusive, runtimeSettlement(ok(), false))

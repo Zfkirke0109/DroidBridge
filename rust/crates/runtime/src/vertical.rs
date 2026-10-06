@@ -339,12 +339,13 @@ pub struct ApkCapabilityPort {
 
 impl ApkCapabilityPort {
     pub fn withdraw_readiness(&self) -> Result<(), DomainError> {
+        self.withdraw_readiness_as("CLEANUP_UNVERIFIED")
+    }
+
+    pub fn withdraw_readiness_as(&self, reason: &str) -> Result<(), DomainError> {
         *self.condition.lock().map_err(|_| {
             DomainError::new(ErrorCode::InternalError, "Runtime condition lock failed")
-        })? = (
-            RuntimeReadiness::Unavailable,
-            Some("CLEANUP_UNVERIFIED".to_owned()),
-        );
+        })? = (RuntimeReadiness::Unavailable, Some(reason.to_owned()));
         Ok(())
     }
 }

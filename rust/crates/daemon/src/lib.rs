@@ -1209,6 +1209,9 @@ mod magisk_guard_recovery;
 mod magisk_host;
 
 #[cfg(unix)]
+mod recycle;
+
+#[cfg(unix)]
 mod automation_wake;
 
 #[cfg(any(unix, test))]

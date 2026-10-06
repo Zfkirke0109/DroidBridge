@@ -482,6 +482,12 @@ class I7_GatesTest {
             Json.parseToJsonElement("""{"error":{"code":"INTERNAL_ERROR","retryable":false}}"""),
             companionFailurePayload("NOT_A_CODE"),
         )
+        assertEquals(
+            Json.parseToJsonElement(
+                """{"error":{"code":"EXECUTION_FAILED","retryable":false,"reason":"cannot launch","os_error":2}}""",
+            ),
+            companionFailurePayload("EXECUTION_FAILED", "cannot launch", 2),
+        )
         assertEquals(listOf("stdout", "content"), companionResultRoles(listOf("stdout", "content")))
         assertNull(companionResultRoles(listOf("content_read")))
         assertEquals(emptyList<String>(), companionResultRoles(emptyList()))

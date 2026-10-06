@@ -3,6 +3,7 @@ package com.droidbridge.android.ui.state
 import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.droidbridge.android.BuildConfig
 import com.droidbridge.android.client.ClientState
 import com.droidbridge.android.client.ModuleInstallOutcome
 import com.droidbridge.android.client.ModuleInstallResult
@@ -40,6 +41,8 @@ data class AppUiState(
     val setupRoute: SetupRoute? = null,
     /** This APK's module was installed during the current boot and takes effect after a reboot. */
     val moduleRebootPending: Boolean = false,
+    /** The running root module is not the one this APK carries. */
+    val moduleOutdated: Boolean = false,
 )
 
 class AppViewModel(
@@ -49,6 +52,7 @@ class AppViewModel(
     private val maintenance = MutableStateFlow<MaintenanceState?>(null)
     private val moduleAbsent = MutableStateFlow(false)
     private val moduleRebootPending = MutableStateFlow(false)
+    private val moduleOutdated = MutableStateFlow(false)
 
     val state: StateFlow<AppUiState> = combine(
         settings.onboardingCompleted,
@@ -63,6 +67,7 @@ class AppViewModel(
         .combine(moduleAbsent) { state, absent -> state.copy(moduleAbsent = absent) }
         .combine(settings.setupRoute) { state, route -> state.copy(setupRoute = route) }
         .combine(moduleRebootPending) { state, pending -> state.copy(moduleRebootPending = pending) }
+        .combine(moduleOutdated) { state, outdated -> state.copy(moduleOutdated = outdated) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), AppUiState())
 
     init {
@@ -82,13 +87,16 @@ class AppViewModel(
         viewModelScope.launch {
             client.state.collect { connection ->
                 if (connection is ClientState.Available || connection is ClientState.Unavailable) refreshMaintenance()
-                if (connection is ClientState.Available) refreshModuleRebootPending()
+                if (connection is ClientState.Available) refreshModuleState()
             }
         }
     }
 
     fun startRuntime() = client.bind()
-    fun recheckRuntime() = client.recheck()
+    fun recheckRuntime() {
+        client.recheck()
+        refreshModuleState()
+    }
     fun requestShizukuAuthorization() = client.requestShizukuAuthorization()
     fun deliverMediaProjectionConsent(resultCode: Int, resultData: Intent) =
         client.deliverMediaProjectionConsent(resultCode, resultData)
@@ -108,18 +116,31 @@ class AppViewModel(
     suspend fun installModule(): ModuleInstallResult {
         val result = runCatching { client.installEmbeddedModule() }
             .getOrElse { ModuleInstallResult(ModuleInstallOutcome.Failed, listOfNotNull(it.message)) }
-        refreshModuleRebootPending()
+        refreshModuleState()
         client.recheck()
         return result
+    }
+
+    private var moduleUpdatePrompted = false
+
+    /** True once per App session: Home offers the APK's module when the running one differs. */
+    fun claimModuleUpdatePrompt(): Boolean {
+        if (moduleUpdatePrompted) return false
+        moduleUpdatePrompted = true
+        return true
     }
 
     fun rebootForModule() {
         viewModelScope.launch { runCatching { client.rebootForModule() } }
     }
 
-    private fun refreshModuleRebootPending() {
+    /** Whether a module waits for a reboot, and whether the running one differs from this APK's. */
+    private fun refreshModuleState() {
         viewModelScope.launch {
             runCatching { client.moduleRebootPending() }.getOrNull()?.let { moduleRebootPending.value = it }
+            runCatching { client.moduleVersionCode() }.getOrNull()?.let { code ->
+                moduleOutdated.value = code > 0 && code != BuildConfig.VERSION_CODE.toLong()
+            }
         }
     }
 

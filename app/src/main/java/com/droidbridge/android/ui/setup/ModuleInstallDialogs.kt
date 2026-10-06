@@ -80,6 +80,7 @@ fun ModuleInstallDialogs(
             title = { Text(stringResource(if (dialog.update) R.string.module_update_title else R.string.module_install_title)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (dialog.update) Text(stringResource(R.string.module_update_mismatch))
                     Text(stringResource(R.string.module_install_body))
                     manager?.let { Text(stringResource(R.string.module_install_detected, it.label)) }
                     if (manager?.grantsInManager == true) {

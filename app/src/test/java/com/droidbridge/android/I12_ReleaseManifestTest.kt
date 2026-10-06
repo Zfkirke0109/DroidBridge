@@ -1,6 +1,5 @@
 package com.droidbridge.android
 
-import com.droidbridge.android.product.release.ModulePresence
 import com.droidbridge.android.product.release.ReleaseClassification
 import com.droidbridge.android.product.release.ReleaseConfig
 import com.droidbridge.android.product.release.ReleaseManifests
@@ -100,12 +99,9 @@ class I12_ReleaseManifestTest {
     @Test
     fun I12_G01_classificationNeverOffersALowerOrSameVersionApk() {
         val manifest = ReleaseManifests.verify(config(), manifestBytes, signature)
-        assertThrows(ReleaseRejected::class.java) { ReleaseManifests.classify(manifest, 1001, ModulePresence.Compatible) }
-        assertSame(ReleaseClassification.UpToDate, ReleaseManifests.classify(manifest, 1000, ModulePresence.Compatible))
-        listOf(ModulePresence.Absent, ModulePresence.Mismatched, ModulePresence.Excluded).forEach { module ->
-            assertEquals(ReleaseClassification.ModuleRepair(manifest), ReleaseManifests.classify(manifest, 1000, module))
-        }
-        assertEquals(ReleaseClassification.ProductUpdate(manifest), ReleaseManifests.classify(manifest, 999, ModulePresence.Absent))
+        assertThrows(ReleaseRejected::class.java) { ReleaseManifests.classify(manifest, 1001) }
+        assertSame(ReleaseClassification.UpToDate, ReleaseManifests.classify(manifest, 1000))
+        assertEquals(ReleaseClassification.ProductUpdate(manifest), ReleaseManifests.classify(manifest, 999))
     }
 
     @Test

@@ -3901,8 +3901,12 @@ fn parse_capability_state(value: &str) -> Result<CapabilityState, DomainError> {
     }
 }
 
-fn io_error(_: std::io::Error) -> DomainError {
-    DomainError::new(ErrorCode::IoError, "native filesystem operation failed")
+fn io_error(error: std::io::Error) -> DomainError {
+    DomainError::os(
+        ErrorCode::IoError,
+        "native filesystem operation failed",
+        &error,
+    )
 }
 
 fn error_code_token(code: ErrorCode) -> &'static str {

@@ -10,8 +10,8 @@ use crate::{
 };
 use chrono::DateTime;
 use contract::{
-    ErrorCode, MotherTool, PublicError, RequestId, RuntimeReadiness, TaskControlCall, TaskId,
-    TaskListResult, TaskSnapshot, TaskState, TaskSummary, UuidV4,
+    ErrorCode, ErrorDetailValue, MotherTool, PublicError, RequestId, RuntimeReadiness,
+    TaskControlCall, TaskId, TaskListResult, TaskSnapshot, TaskState, TaskSummary, UuidV4,
 };
 use domain::{
     DedupDecision, DomainError, ExecutorRequest, MAX_QUEUED_TASKS, MAX_RUNNING_TASKS, TaskEvent,
@@ -248,7 +248,7 @@ where
                 let mut state = self
                     .persistence
                     .load()
-                    .map_err(|error| public_error(error.code, &admission.operation, false))?;
+                    .map_err(|error| domain_error(&error, &admission.operation))?;
                 prune_synchronous_history(&mut state, admission.now_ms);
                 match state
                     .dedup
@@ -258,7 +258,7 @@ where
                         admission.now_ms,
                         false,
                     )
-                    .map_err(|error| public_error(error.code, &admission.operation, false))?
+                    .map_err(|error| domain_error(&error, &admission.operation))?
                 {
                     DedupDecision::Replay => {
                         let existing = state
@@ -286,16 +286,14 @@ where
                         let permit = self.leaf_permits.try_acquire().map_err(|_| {
                             public_error(ErrorCode::ResourceLimit, &admission.operation, false)
                         })?;
-                        let capability = self.capabilities.current().map_err(|error| {
-                            public_error(error.code, &admission.operation, false)
-                        })?;
-                        require_ready(capability.context.readiness).map_err(|error| {
-                            public_error(error.code, &admission.operation, false)
-                        })?;
+                        let capability = self
+                            .capabilities
+                            .current()
+                            .map_err(|error| domain_error(&error, &admission.operation))?;
+                        require_ready(capability.context.readiness)
+                            .map_err(|error| domain_error(&error, &admission.operation))?;
                         let executor = crate::resolve_execution(&capability, admission.route)
-                            .map_err(|error| {
-                                public_error(error.code, &admission.operation, false)
-                            })?;
+                            .map_err(|error| domain_error(&error, &admission.operation))?;
                         let reservation = admission.settlement_bound_bytes.max(RESERVE_FLOOR_BYTES);
                         let total = state
                             .total_committed_and_reserved()
@@ -355,7 +353,7 @@ where
                                 .lock()
                                 .expect("synchronous waiter lock")
                                 .remove(admission.request_id.as_str());
-                            return Err(public_error(error.code, &admission.operation, false));
+                            return Err(domain_error(&error, &admission.operation));
                         }
                         break (execution, permit);
                     }
@@ -403,7 +401,7 @@ where
                     .settle_synchronous(
                         &admission.request_id,
                         ExecutionOutcome::Failed {
-                            error: public_error(error.code, &admission.operation, false),
+                            error: domain_error(&error, &admission.operation),
                             encoded_bytes: RESERVE_FLOOR_BYTES,
                         },
                         true,
@@ -445,10 +443,11 @@ where
                 .await
             }
             Err(failure) => {
+                log_failure(&admission.operation, &failure);
                 self.settle_synchronous(
                     &admission.request_id,
                     ExecutionOutcome::Failed {
-                        error: public_error(failure.error.code, &admission.operation, false),
+                        error: domain_error(&failure.error, &admission.operation),
                         encoded_bytes: RESERVE_FLOOR_BYTES,
                     },
                     failure.cleanup_verified,
@@ -606,7 +605,7 @@ where
                         .settle(
                             task_id,
                             ExecutionOutcome::Failed {
-                                error: public_error(error.code, "runtime.execution", false),
+                                error: domain_error(&error, "runtime.execution"),
                                 encoded_bytes: RESERVE_FLOOR_BYTES,
                             },
                             true,
@@ -639,6 +638,7 @@ where
             Ok(completion) => completion,
             Err(failure) => {
                 drop(permit);
+                log_failure("runtime.execution", &failure);
                 let outcome = if failure.error.code == ErrorCode::Cancelled {
                     ExecutionOutcome::Cancelled {
                         error: public_error(ErrorCode::Cancelled, "runtime.execution", false),
@@ -646,7 +646,7 @@ where
                     }
                 } else {
                     ExecutionOutcome::Failed {
-                        error: public_error(failure.error.code, "runtime.execution", false),
+                        error: domain_error(&failure.error, "runtime.execution"),
                         encoded_bytes: RESERVE_FLOOR_BYTES,
                     }
                 };
@@ -1144,7 +1144,7 @@ where
             task.error = Some(if cleanup_verified {
                 public_error(ErrorCode::ResourceLimit, "runtime.execution", false)
             } else {
-                cleanup_unverified_error("runtime.execution")
+                cleanup_unverified_error("runtime.execution", error.and_then(|error| error.details))
             });
             RESERVE_FLOOR_BYTES.min(task.reserved_bytes)
         };
@@ -1184,7 +1184,7 @@ where
         let mut state = self
             .persistence
             .load()
-            .map_err(|error| public_error(error.code, "runtime.execution", false))?;
+            .map_err(|error| domain_error(&error, "runtime.execution"))?;
         let record_index = state
             .synchronous_executions
             .iter()
@@ -1207,11 +1207,17 @@ where
                     },
                     &record.execution_id,
                 )
-                .map_err(|error| public_error(error.code, &record.operation, false))?;
+                .map_err(|error| domain_error(&error, &record.operation))?;
         }
         let operation = state.synchronous_executions[record_index].operation.clone();
         let reservation = state.synchronous_executions[record_index].reserved_bytes;
         let outcome = measured_execution_outcome(outcome, &operation)?;
+        let cause = match &outcome {
+            ExecutionOutcome::Failed { error, .. } | ExecutionOutcome::Cancelled { error, .. } => {
+                error.details.clone()
+            }
+            _ => None,
+        };
         let (encoded_bytes, record_state, result, mut error) = match outcome {
             ExecutionOutcome::SynchronousCompleted {
                 result,
@@ -1239,7 +1245,7 @@ where
                 RESERVE_FLOOR_BYTES.min(reservation),
                 SynchronousExecutionState::Interrupted,
                 None,
-                Some(cleanup_unverified_error(&operation)),
+                Some(cleanup_unverified_error(&operation, cause)),
             ),
             _ => (
                 RESERVE_FLOOR_BYTES.min(reservation),
@@ -1286,9 +1292,9 @@ where
         state
             .dedup
             .settle(request_id, terminal_at_ms)
-            .map_err(|error| public_error(error.code, &operation, false))?;
+            .map_err(|error| domain_error(&error, &operation))?;
         self.commit(state)
-            .map_err(|error| public_error(error.code, &operation, false))?;
+            .map_err(|error| domain_error(&error, &operation))?;
         if let Some(sender) = self
             .synchronous_waiters
             .lock()
@@ -1679,17 +1685,71 @@ fn public_error(code: ErrorCode, operation: &str, retryable: bool) -> PublicErro
     }
 }
 
-fn cleanup_unverified_error(operation: &str) -> PublicError {
+/// The settled error data of a Runtime failure: the step that failed and, when the operating
+/// system refused it, the system's own description, so two failures sharing a code differ.
+pub(crate) fn failure_details(error: &DomainError) -> BTreeMap<String, ErrorDetailValue> {
+    let mut details = BTreeMap::from([(
+        "reason".to_owned(),
+        ErrorDetailValue::String(error.reason.to_owned()),
+    )]);
+    if let Some(peer_reason) = &error.peer_reason {
+        details.insert(
+            "peer_reason".to_owned(),
+            ErrorDetailValue::String(peer_reason.clone()),
+        );
+    }
+    if let Some(errno) = error.os_error {
+        details.insert(
+            "os_error".to_owned(),
+            ErrorDetailValue::String(std::io::Error::from_raw_os_error(errno).to_string()),
+        );
+    }
+    details
+}
+
+/// An execution that failed below the Runtime also goes to stderr, which the root supervisor
+/// keeps, so its cause outlives the pruned execution record.
+fn log_failure(operation: &str, failure: &crate::ExecutionFailure) {
+    if failure.error.code == ErrorCode::Cancelled {
+        return;
+    }
+    let peer_reason = failure
+        .error
+        .peer_reason
+        .as_ref()
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default();
+    let os_error = failure
+        .error
+        .os_error
+        .map(|errno| format!(" ({})", std::io::Error::from_raw_os_error(errno)))
+        .unwrap_or_default();
+    eprintln!(
+        "droidbridge runtime: {operation} failed: {:?} {}{peer_reason}{os_error}; cleanup verified: {}",
+        failure.error.code, failure.error.reason, failure.cleanup_verified,
+    );
+}
+
+fn domain_error(error: &DomainError, operation: &str) -> PublicError {
     PublicError {
-        code: ErrorCode::IoError,
-        operation: operation.to_owned(),
-        retryable: false,
-        message: None,
-        capability: None,
-        details: Some(std::collections::BTreeMap::from([(
-            "cleanup_unverified".to_owned(),
-            contract::ErrorDetailValue::Boolean(true),
-        )])),
+        details: Some(failure_details(error)),
+        ..public_error(error.code, operation, false)
+    }
+}
+
+/// Unprovable cleanup keeps the details of the failure that led to it, when there was one.
+fn cleanup_unverified_error(
+    operation: &str,
+    cause: Option<BTreeMap<String, ErrorDetailValue>>,
+) -> PublicError {
+    let mut details = cause.unwrap_or_default();
+    details.insert(
+        "cleanup_unverified".to_owned(),
+        ErrorDetailValue::Boolean(true),
+    );
+    PublicError {
+        details: Some(details),
+        ..public_error(ErrorCode::IoError, operation, false)
     }
 }
 

@@ -246,6 +246,17 @@ impl GuardRecoveryPlan {
             .iter()
             .any(|record| matches!(record.recovery, GuardRecovery::Live { .. }))
     }
+
+    /// Whether every unproven guard is still alive to write its own verdict; a guard that died
+    /// without one leaves its boot unproven until the next boot.
+    pub fn may_settle(&self) -> bool {
+        self.records.iter().all(|record| {
+            matches!(
+                record.recovery,
+                GuardRecovery::Clean { .. } | GuardRecovery::Live { .. }
+            )
+        })
+    }
 }
 
 pub fn await_guard_recovery_plan(

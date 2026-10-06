@@ -76,13 +76,9 @@ data class ReleaseManifest(
     val releaseNotesUrl: String,
 )
 
-/** The observed stable module fact used by S-UPD-001 classification. */
-enum class ModulePresence { Compatible, Absent, Mismatched, Excluded }
-
 sealed interface ReleaseClassification {
     data object UpToDate : ReleaseClassification
     data class ProductUpdate(val manifest: ReleaseManifest) : ReleaseClassification
-    data class ModuleRepair(val manifest: ReleaseManifest) : ReleaseClassification
 }
 
 class ReleaseRejected(message: String) : Exception(message)
@@ -198,15 +194,11 @@ object ReleaseManifests {
         return ReleaseArtifact(name, url, size, sha256)
     }
 
-    /**
-     * S-UPD-001/R-UPD-004: lower is rejected; higher is a product update; equal only offers the
-     * matching module artifact when the observed module is absent, mismatched or excluded.
-     */
-    fun classify(manifest: ReleaseManifest, installedVersionCode: Long, module: ModulePresence): ReleaseClassification = when {
+    /** S-UPD-001/R-UPD-004: lower is rejected; higher is a product update; equal is up to date. */
+    fun classify(manifest: ReleaseManifest, installedVersionCode: Long): ReleaseClassification = when {
         manifest.versionCode < installedVersionCode -> throw ReleaseRejected("signed release is older than the installed APK")
         manifest.versionCode > installedVersionCode -> ReleaseClassification.ProductUpdate(manifest)
-        module == ModulePresence.Compatible -> ReleaseClassification.UpToDate
-        else -> ReleaseClassification.ModuleRepair(manifest)
+        else -> ReleaseClassification.UpToDate
     }
 
     private fun JsonElement.exactObject(keys: Set<String>, what: String): JsonObject {

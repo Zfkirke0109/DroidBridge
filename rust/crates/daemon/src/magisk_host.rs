@@ -16,6 +16,7 @@ use crate::{
         NativeNetworkPort,
     },
     process_network::ProcessNetworkAttachment,
+    recycle::CleanupWatch,
     unix_transport::{peer_uid, receive_json},
     visual::MagiskVisualPort,
 };
@@ -72,6 +73,7 @@ pub(crate) struct MagiskHost {
     capability_generation: SourceGeneration,
     helper_generation: SourceGeneration,
     command_quarantine: Arc<CommandQuarantine>,
+    cleanup_watch: CleanupWatch,
     executor: MagiskExecutorHandle,
     companion_network_events: Arc<MagiskCompanionNetworkEventSource>,
     native_network_events: Arc<NativeNetworkDefaultEventSource>,
@@ -169,6 +171,7 @@ impl NetworkDefaultEventSource for MagiskCompanionNetworkEventSource {
 }
 
 impl MagiskHost {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn activate(
         store: Arc<StateStore>,
         module_root: &Path,
@@ -177,6 +180,7 @@ impl MagiskHost {
         owner: RuntimeOwner,
         companion: CompanionPort,
         task_activity: Arc<crate::app_keepalive::TaskActivityBeacon>,
+        recycle: Arc<crate::recycle::Recycle>,
     ) -> Result<Self, DomainError> {
         let instance_id = new_uuid()?;
         let boot_id = read_boot_id()?;
@@ -288,11 +292,24 @@ impl MagiskHost {
             vertical.set_unavailable("CLEANUP_UNVERIFIED")?;
         }
         let capabilities = vertical.capability_port(instance_id.clone());
+        let cleanup_watch = CleanupWatch::new(
+            Arc::clone(&store),
+            Arc::clone(&lease),
+            canonical_base.to_path_buf(),
+            boot_id.clone(),
+            companion.clone(),
+            capabilities.clone(),
+            recycle,
+        );
+        // Guards this start found unsettled may still write their verdicts.
+        if !recovery.guards_are_clean() {
+            cleanup_watch.start()?;
+        }
         let host_control = MagiskHostControl {
             store: Arc::clone(&store),
             lease: Arc::clone(&lease),
-            capabilities: capabilities.clone(),
             task_activity,
+            cleanup_watch: cleanup_watch.clone(),
             recovery_proof: if recovery.guards_are_clean() {
                 RecoveryProof::Clean
             } else {
@@ -447,6 +464,7 @@ impl MagiskHost {
             capability_generation,
             helper_generation,
             command_quarantine,
+            cleanup_watch,
             executor,
             companion_network_events,
             native_network_events,
@@ -670,7 +688,10 @@ impl MagiskHost {
         }
         if self.guard_ready && self.command_quarantine.is_flagged() {
             self.guard_ready = false;
-            self.vertical.set_unavailable("CLEANUP_UNVERIFIED")?;
+            // A replacement already under way keeps reporting that it is recovering.
+            if !self.cleanup_watch.active() {
+                self.vertical.set_unavailable("CLEANUP_UNVERIFIED")?;
+            }
             let generation = self.capability_generation.advance()?;
             for key in ["magisk.root", "execution.root_guard"] {
                 register(
@@ -1167,9 +1188,9 @@ impl Drop for FrameworkHelper {
 struct MagiskHostControl {
     store: Arc<StateStore>,
     lease: Arc<LifetimeLease>,
-    capabilities: runtime::ApkCapabilityPort,
     recovery_proof: RecoveryProof,
     task_activity: Arc<crate::app_keepalive::TaskActivityBeacon>,
+    cleanup_watch: CleanupWatch,
 }
 
 impl HostControlPort for MagiskHostControl {
@@ -1179,7 +1200,7 @@ impl HostControlPort for MagiskHostControl {
         _execution_id: &UuidV4,
     ) -> Result<(), DomainError> {
         self.activate(fence)?;
-        self.capabilities.withdraw_readiness()
+        self.cleanup_watch.start()
     }
 
     fn prepare(&self) -> Result<(), DomainError> {
@@ -1204,7 +1225,7 @@ impl HostControlPort for MagiskHostControl {
     fn recover(&self, _: &UuidV4) -> Result<RecoveryProof, DomainError> {
         self.store.validate_lease(&self.lease)?;
         if self.recovery_proof == RecoveryProof::CleanupUnverified {
-            self.capabilities.withdraw_readiness()?;
+            self.cleanup_watch.start()?;
         }
         Ok(self.recovery_proof)
     }
@@ -1241,7 +1262,7 @@ fn register(
     Ok(())
 }
 
-fn new_uuid() -> Result<UuidV4, DomainError> {
+pub(crate) fn new_uuid() -> Result<UuidV4, DomainError> {
     UuidV4::parse(uuid::Uuid::new_v4().hyphenated().to_string())
         .map_err(|_| DomainError::new(ErrorCode::InternalError, "UUID generation failed"))
 }

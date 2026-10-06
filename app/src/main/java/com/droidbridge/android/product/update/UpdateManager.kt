@@ -1,6 +1,5 @@
 package com.droidbridge.android.product.update
 
-import com.droidbridge.android.product.release.ModulePresence
 import com.droidbridge.android.product.release.ReleaseArtifact
 import com.droidbridge.android.product.release.ReleaseClassification
 import com.droidbridge.android.product.release.ReleaseConfig
@@ -91,7 +90,7 @@ sealed interface UpdateCheck {
 }
 
 /** Artifacts already verified against the signed manifest and renamed into the update cache. */
-data class VerifiedDownloads(val manifest: ReleaseManifest, val apk: File?, val module: File?)
+data class VerifiedDownloads(val manifest: ReleaseManifest, val apk: File)
 
 data class UpdateState(
     val check: UpdateCheck,
@@ -120,7 +119,7 @@ class UpdateManager(
     )
     val state: StateFlow<UpdateState> = mutableState.asStateFlow()
 
-    suspend fun check(module: ModulePresence) {
+    suspend fun check() {
         val configured = config as? ReleaseConfig.Configured ?: return
         mutableState.update { it.copy(check = UpdateCheck.Checking, downloadFailed = false) }
         val result = withContext(Dispatchers.IO) {
@@ -128,7 +127,7 @@ class UpdateManager(
                 val bytes = transport.get(configured.manifestUrl, ReleaseManifests.MAX_METADATA_BYTES.toLong()) { it.readBytes() }
                 val signature = transport.get(configured.manifestUrl + ".sig", ReleaseManifests.MAX_METADATA_BYTES.toLong()) { it.readBytes() }
                 UpdateCheck.Checked(
-                    ReleaseManifests.classify(ReleaseManifests.verify(configured, bytes, signature), installedVersionCode, module),
+                    ReleaseManifests.classify(ReleaseManifests.verify(configured, bytes, signature), installedVersionCode),
                     bytes,
                     signature,
                 )
@@ -146,26 +145,13 @@ class UpdateManager(
         }
     }
 
-    /**
-     * Downloads the artifacts the verified classification needs: a product update takes the APK
-     * and, when a module is part of this device, the module ZIP; a repair takes only the module.
-     */
-    suspend fun download(moduleRequired: Boolean) {
-        val checked = (mutableState.value.check as? UpdateCheck.Checked)?.classification ?: return
-        val (manifest, wantApk, wantModule) = when (checked) {
-            is ReleaseClassification.ProductUpdate -> Triple(checked.manifest, true, moduleRequired)
-            is ReleaseClassification.ModuleRepair -> Triple(checked.manifest, false, true)
-            ReleaseClassification.UpToDate -> return
-        }
+    /** Downloads the APK of a verified product update; the module travels inside it. */
+    suspend fun download() {
+        val checked = (mutableState.value.check as? UpdateCheck.Checked)?.classification
+        val manifest = (checked as? ReleaseClassification.ProductUpdate)?.manifest ?: return
         mutableState.update { it.copy(downloading = true, downloadFailed = false) }
         val result = withContext(Dispatchers.IO) {
-            runCatching {
-                VerifiedDownloads(
-                    manifest = manifest,
-                    apk = if (wantApk) fetchVerified(manifest.version, manifest.apk) else null,
-                    module = if (wantModule) fetchVerified(manifest.version, manifest.module) else null,
-                )
-            }
+            runCatching { VerifiedDownloads(manifest, fetchVerified(manifest.version, manifest.apk)) }
         }
         mutableState.update { current ->
             current.copy(downloading = false, downloadFailed = result.isFailure, downloads = result.getOrNull() ?: current.downloads)
@@ -221,16 +207,12 @@ class UpdateManager(
         }
         cacheRoot.walkBottomUp().filter { it.isDirectory && it != cacheRoot }.forEach { it.delete() }
         mutableState.update { current ->
-            val downloads = current.downloads ?: return@update current
-            val apk = downloads.apk?.takeIf(File::isFile)
-            val module = downloads.module?.takeIf(File::isFile)
-            current.copy(downloads = if (apk == null && module == null) null else downloads.copy(apk = apk, module = module))
+            current.copy(downloads = current.downloads?.takeIf { it.apk.isFile })
         }
     }
 
     private fun ReleaseClassification?.manifestOrNull(): ReleaseManifest? = when (this) {
         is ReleaseClassification.ProductUpdate -> manifest
-        is ReleaseClassification.ModuleRepair -> manifest
         else -> null
     }
 
