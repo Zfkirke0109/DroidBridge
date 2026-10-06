@@ -159,6 +159,25 @@ export class DeviceHub {
     return true;
   }
 
+  /**
+   * Settles the delivered request holding this shard token, when the phone's reply could not be
+   * read for its request_id (too large). Compares against every delivered entry in constant
+   * time per entry. False when none matches.
+   * @param {unknown} shardToken
+   * @param {Record<string, any>} payload
+   */
+  settleByShardToken(shardToken, payload) {
+    if (typeof shardToken !== 'string' || shardToken === '') return false;
+    /** @type {Entry | null} */
+    let match = null;
+    for (const entry of this.entries.values()) {
+      if (entry.state === 'delivered' && constantTimeEqual(shardToken, entry.shardToken)) match = entry;
+    }
+    if (!match) return false;
+    this.#finish(match, { kind: 'settled', payload });
+    return true;
+  }
+
   /** Counters for tests and diagnostics; carries no secrets. */
   inspect() {
     let delivered = 0;

@@ -88,9 +88,13 @@ test('status reports the protocol, authorized clients and pairing state', async 
   assert.equal(status.pairing_active, false, 'pairing consumed');
 });
 
-/** @param {ReturnType<typeof makeRelay>} t */
-async function consent(t) {
-  const client = await (await register(t)).json();
+/**
+ * Opens a consent page and returns its request id.
+ * @param {ReturnType<typeof makeRelay>} t
+ * @param {string} [clientId] an existing client; a new one is registered when omitted
+ */
+async function consent(t, clientId) {
+  const client = clientId ? { client_id: clientId } : await (await register(t)).json();
   const page = await authorizeGet(t, {
     response_type: 'code',
     client_id: client.client_id,
@@ -103,42 +107,73 @@ async function consent(t) {
   return requestIdFrom(await page.text());
 }
 
-test('pairing: 5 wrong attempts invalidate the code', async () => {
+test('pairing: 5 wrong attempts across consent requests invalidate the code', async () => {
   const t = makeRelay();
-  const requestId = await consent(t);
   await pair(t, 'R2D2C3P0');
-  for (let attempt = 1; attempt <= 4; attempt += 1) {
-    const res = await authorizePost(t, { request_id: requestId, pairing_code: 'WXYZ-WXYZ', action: 'allow' });
+  // Request A: 3 wrong codes cancel the request (pairing attempts 1..3).
+  const a = await consent(t);
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const res = await authorizePost(t, { request_id: a, pairing_code: 'WXYZ-WXYZ', action: 'allow' });
     assert.equal(res.status, 403);
-    assert.match(await res.text(), /not correct/);
-    assert.equal((await t.storage.get('pairing')).attempts, attempt);
+    assert.match(await res.text(), /That code did not work/);
   }
-  const fifth = await authorizePost(t, { request_id: requestId, pairing_code: 'nope', action: 'allow' });
-  assert.equal(fifth.status, 403);
-  assert.match(await fifth.text(), /Too many wrong codes/);
+  const third = await authorizePost(t, { request_id: a, pairing_code: 'WXYZ-WXYZ', action: 'allow' });
+  assert.equal(third.status, 403);
+  assert.match(await third.text(), /this request was cancelled/);
+  assert.equal((await t.storage.get('pairing')).attempts, 3);
+  // Request B: 2 more wrong codes reach 5 and cancel the pairing code.
+  const b = await consent(t);
+  await authorizePost(t, { request_id: b, pairing_code: 'nope', action: 'allow' });
+  assert.equal((await t.storage.get('pairing')).attempts, 4);
+  await authorizePost(t, { request_id: b, pairing_code: 'nope', action: 'allow' });
   assert.equal(await t.storage.get('pairing'), undefined);
   // Even the right code no longer works.
-  const right = await authorizePost(t, { request_id: requestId, pairing_code: 'R2D2-C3P0', action: 'allow' });
-  assert.equal(right.status, 409);
-  assert.match(await right.text(), /tap Pair Claude first/);
+  const c = await consent(t);
+  const right = await authorizePost(t, { request_id: c, pairing_code: 'R2D2-C3P0', action: 'allow' });
+  assert.equal(right.status, 403);
+  assert.match(await right.text(), /That code did not work/);
 });
 
-test('pairing: no active code does not consume an attempt; an empty code is not an attempt', async () => {
+test('pairing: 3 failed submissions discard the consent request, not the pairing code', async () => {
   const t = makeRelay();
+  await pair(t, 'HJKM2222');
   const requestId = await consent(t);
-  const none = await authorizePost(t, { request_id: requestId, pairing_code: 'ABCD-EFGH', action: 'allow' });
-  assert.equal(none.status, 409);
-  const html = await none.text();
-  assert.match(html, /Open DroidBridge and tap Pair Claude first/);
-  assert.equal(requestIdFrom(html), requestId, 'the form can be submitted again');
+  for (let i = 0; i < 3; i += 1) {
+    await authorizePost(t, { request_id: requestId, pairing_code: 'BAAD-0000', action: 'allow' });
+  }
+  assert.equal(t.storage.keys('pending:').length, 0);
+  const after = await authorizePost(t, { request_id: requestId, pairing_code: 'HJKM-2222', action: 'allow' });
+  assert.equal(after.status, 400);
+  assert.match(await after.text(), /expired or was already answered/);
+  // The pairing code survives (3 < 5) and works on a fresh request.
+  assert.equal((await t.storage.get('pairing')).attempts, 3);
+  const fresh = await consent(t);
+  assert.equal((await authorizePost(t, { request_id: fresh, pairing_code: 'HJKM-2222', action: 'allow' })).status, 302);
+});
+test('pairing: no active code answers exactly like a wrong code; an empty code is not an attempt', async () => {
+  const t = makeRelay();
+  const clientId = (await (await register(t)).json()).client_id;
+  const withoutPairing = await consent(t, clientId);
+  const none = await authorizePost(t, { request_id: withoutPairing, pairing_code: 'ABCD-EFGH', action: 'allow' });
   await pair(t, 'ABCDEFGH');
-  const blank = await authorizePost(t, { request_id: requestId, pairing_code: '  ', action: 'allow' });
+  const withPairing = await consent(t, clientId);
+  const wrong = await authorizePost(t, { request_id: withPairing, pairing_code: 'ZZZZ-ZZZZ', action: 'allow' });
+  assert.equal(none.status, wrong.status);
+  assert.equal(none.status, 403);
+  const strip = (/** @type {string} */ html, /** @type {string} */ id) => html.replaceAll(id, 'REQUEST_ID');
+  const noneHtml = await none.text();
+  assert.equal(strip(noneHtml, withoutPairing), strip(await wrong.text(), withPairing));
+  assert.equal(requestIdFrom(noneHtml), withoutPairing, 'the form can be submitted again');
+  assert.deepEqual([...none.headers.keys()], [...wrong.headers.keys()]);
+  // Both count against their consent request.
+  for (const key of t.storage.keys('pending:')) assert.equal((await t.storage.get(key)).attempts, 1);
+  // An empty submission is not an attempt anywhere.
+  const blank = await authorizePost(t, { request_id: withPairing, pairing_code: '  ', action: 'allow' });
   assert.equal(blank.status, 400);
-  assert.equal((await t.storage.get('pairing')).attempts, 0);
-  const ok = await authorizePost(t, { request_id: requestId, pairing_code: 'abcd efgh', action: 'allow' });
+  assert.equal((await t.storage.get('pairing')).attempts, 1);
+  const ok = await authorizePost(t, { request_id: withPairing, pairing_code: 'abcd efgh', action: 'allow' });
   assert.equal(ok.status, 302);
 });
-
 test('pairing: Crockford look-alikes are accepted (O->0, I/L->1)', async () => {
   const t = makeRelay();
   const requestId = await consent(t);
@@ -153,7 +188,8 @@ test('pairing: an expired code is rejected', async () => {
   await pair(t, 'TTTT0000', 60);
   await t.clock.advance(60_000);
   const res = await authorizePost(t, { request_id: requestId, pairing_code: 'TTTT-0000', action: 'allow' });
-  assert.equal(res.status, 409);
+  assert.equal(res.status, 403);
+  assert.match(await res.text(), /That code did not work/);
   assert.equal(await t.storage.get('pairing'), undefined);
   assert.equal((await (await deviceFetch(t, '/device/v1/status')).json()).pairing_active, false);
 });
@@ -165,7 +201,7 @@ test('pairing: DELETE cancels the code', async () => {
   const res = await deviceFetch(t, '/device/v1/pairing', { method: 'DELETE' });
   assert.equal(res.status, 204);
   const attempt = await authorizePost(t, { request_id: requestId, pairing_code: 'KKKK-2222', action: 'allow' });
-  assert.equal(attempt.status, 409);
+  assert.equal(attempt.status, 403);
 });
 
 test('pairing: a new code replaces the old one and resets attempts', async () => {
@@ -217,25 +253,35 @@ test('consent page: an expired pending request is an error page', async () => {
   assert.equal((await t.storage.get('pairing')).attempts, 0);
 });
 
-test('consent page: at most 50 pending requests', async () => {
+test('consent page: at most 10 pending requests per client and 50 overall', async () => {
   const t = makeRelay();
-  const client = await (await register(t)).json();
-  const params = {
+  /** @param {string} clientId */
+  const params = (clientId) => ({
     response_type: 'code',
-    client_id: client.client_id,
+    client_id: clientId,
     redirect_uri: CLAUDE_CALLBACK,
     code_challenge: pkcePair().challenge,
     code_challenge_method: 'S256',
-  };
-  for (let i = 0; i < 50; i += 1) assert.equal((await authorizeGet(t, params)).status, 200);
-  const full = await authorizeGet(t, params);
-  assert.equal(full.status, 429);
-  assert.equal(full.headers.get('location'), null);
+  });
+  const clients = [];
+  for (let i = 0; i < 6; i += 1) clients.push((await (await register(t)).json()).client_id);
+  // Per client: 10, then refused, while another client still gets in.
+  for (let i = 0; i < 10; i += 1) assert.equal((await authorizeGet(t, params(clients[0]))).status, 200);
+  const perClient = await authorizeGet(t, params(clients[0]));
+  assert.equal(perClient.status, 429);
+  assert.equal(perClient.headers.get('location'), null);
+  assert.equal((await authorizeGet(t, params(clients[1]))).status, 200);
+  // Overall: 50.
+  for (let i = 0; i < 9; i += 1) assert.equal((await authorizeGet(t, params(clients[1]))).status, 200);
+  for (const clientId of clients.slice(2, 5)) {
+    for (let i = 0; i < 10; i += 1) assert.equal((await authorizeGet(t, params(clientId))).status, 200);
+  }
+  assert.equal(t.storage.keys('pending:').length, 50);
+  assert.equal((await authorizeGet(t, params(clients[5]))).status, 429);
   await t.clock.advance(10 * 60 * 1000);
-  assert.equal((await authorizeGet(t, params)).status, 200, 'expired requests are pruned first');
+  assert.equal((await authorizeGet(t, params(clients[0]))).status, 200, 'expired requests are pruned first');
   assert.equal(t.storage.keys('pending:').length, 1);
 });
-
 test('revoke: tokens stop working, clients are removed, status shows 0 authorized clients', async () => {
   const t = makeRelay();
   const a = await obtainTokens(t, { pairingCode: 'AAAA1111' });
@@ -251,7 +297,8 @@ test('revoke: tokens stop working, clients are removed, status shows 0 authorize
   for (const tokens of [a, b]) {
     assert.equal((await mcp(t, tokens.access_token, toolsCall())).status, 401);
     const refresh = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId });
-    assert.equal(refresh.status, 401, 'the registered client is gone');
+    assert.equal(refresh.status, 400, 'the grant is gone');
+    assert.equal((await refresh.json()).error, 'invalid_grant');
   }
   const status = await (await deviceFetch(t, '/device/v1/status')).json();
   assert.equal(status.authorized_clients, 0);

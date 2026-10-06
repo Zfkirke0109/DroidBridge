@@ -39,7 +39,9 @@ export const MESSAGES = Object.freeze({
   unknown:
     'DroidBridge did not report the outcome in time. The request may or may not have run on the phone, and it was not retried.',
   invalid:
-    'DroidBridge sent an invalid response. The request may or may not have run on the phone, and it was not retried.',
+    'DroidBridge sent an invalid reply. The request may or may not have run on the phone, and it was not retried.',
+  relayFailure:
+    'The DroidBridge relay failed while handling the request. It may or may not have reached the phone, and it was not retried.',
 });
 
 /**
@@ -48,7 +50,7 @@ export const MESSAGES = Object.freeze({
  * @param {string} message
  * @param {Record<string, unknown>} [relayData]
  */
-function rpcError(id, code, message, relayData) {
+export function rpcError(id, code, message, relayData) {
   /** @type {Record<string, unknown>} */
   const error = { code, message };
   if (relayData) error.data = { droidbridge_relay: relayData };
@@ -187,12 +189,14 @@ export function outcomeResponse(outcome, isRequest, id) {
       const payload = outcome.payload;
       const status = payload.resp_code;
       // 100..199 cannot be sent as a final response, so they count as invalid like 600+.
+      // A request gets HTTP 200 (no HTTP-layer replay of something that may have run) with a
+      // JSON-RPC error; a notification has no body to carry that, so it gets 502.
       if (!Number.isInteger(status) || status < 200 || status > 599) {
-        return relayError(502, -32603, MESSAGES.invalid, {
-          state: 'invalid_response',
-          delivered: true,
-          retried: false,
-        });
+        if (!isRequest) return empty(502);
+        return json(
+          200,
+          rpcError(id, -32603, MESSAGES.invalid, { state: 'invalid_device_reply', delivered: true, retried: false }),
+        );
       }
       const bodyless = status === 204 || status === 205 || status === 304;
       if (

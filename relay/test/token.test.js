@@ -245,3 +245,51 @@ test('an access token stays valid across requests until it expires', async () =>
     assert.equal((await answer).status, 200);
   }
 });
+
+test('replaying the first refresh token after 20 rotations still revokes the whole family', async () => {
+  const t = makeRelay();
+  const first = await obtainTokens(t);
+  let latest = first;
+  for (let i = 0; i < 20; i += 1) {
+    const res = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: latest.refresh_token, client_id: first.clientId });
+    assert.equal(res.status, 200);
+    latest = { ...latest, ...(await res.json()) };
+  }
+  // The first token's own record was trimmed long ago; storage stays bounded.
+  assert.ok(t.storage.keys('rt:').length <= 16);
+  assert.ok(await tokenWorks(t, latest.access_token));
+
+  const replay = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: first.refresh_token, client_id: first.clientId });
+  assert.equal(replay.status, 400);
+  const error = await replay.json();
+  assert.equal(error.error, 'invalid_grant');
+  assert.match(error.error_description, /revoked/);
+
+  assert.equal(t.storage.keys('family:').length, 0);
+  assert.equal(await tokenWorks(t, latest.access_token), false, 'latest access token revoked');
+  const refresh = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: latest.refresh_token, client_id: first.clientId });
+  assert.equal(refresh.status, 400, 'latest refresh token revoked');
+  assert.equal(t.storage.keys('at:').length + t.storage.keys('rt:').length, 0);
+});
+
+test('a replayed refresh token revokes even with a wrong client_id; garbage tokens revoke nothing', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  const rotated = await (
+    await tokenPost(t, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId })
+  ).json();
+  // Unknown or malformed tokens with no live family: plain invalid_grant, grant untouched.
+  for (const garbage of ['dbrr_nope', `dbrr_${'A'.repeat(22)}.${'B'.repeat(43)}`, 'x'.repeat(80)]) {
+    const res = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: garbage, client_id: tokens.clientId });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).error, 'invalid_grant');
+  }
+  assert.ok(await tokenWorks(t, rotated.access_token));
+  const replay = await tokenPost(t, {
+    grant_type: 'refresh_token',
+    refresh_token: tokens.refresh_token,
+    client_id: 'dbrcl_CCCCCCCCCCCCCCCCCCCCCC',
+  });
+  assert.equal(replay.status, 400);
+  assert.equal(await tokenWorks(t, rotated.access_token), false);
+});

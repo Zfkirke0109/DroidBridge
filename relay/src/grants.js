@@ -8,7 +8,8 @@
  *   pending:<sha256(id)>  pending consent request, 10 min
  *   code:<sha256(code)>   authorization code, 60 s (kept 10 more minutes for reuse detection)
  *   at:<sha256(token)>    access token { family, client_id, resource, scope, expiresAt }
- *   rt:<sha256(token)>    refresh token { family, client_id, used, expiresAt }
+ *   rt:<sha256(token)>    refresh token { family, client_id, used, expiresAt }; the token
+ *                         itself is dbrr_<family id>.<secret> so reuse survives trimming
  *   family:<id>           grant from one code exchange { access[], refresh[], ... }
  *   client:<client_id>    dynamically registered client
  *   cimd:<sha256(url)>    cached client ID metadata document, at most 1 h
@@ -32,6 +33,20 @@ export const TTL = {
 const FAMILY_ACCESS_KEEP = 8;
 const FAMILY_REFRESH_KEEP = 16;
 const EXPIRING_PREFIXES = ['pending:', 'code:', 'at:', 'rt:', 'cimd:'];
+/** `dbrr_<family id: 16 random bytes>.<secret: 32 random bytes>`, both base64url. */
+const REFRESH_TOKEN = /^dbrr_([A-Za-z0-9_-]{22})\.[A-Za-z0-9_-]{43}$/;
+
+/**
+ * The family id carried in a refresh token, or null when the token is not in that format.
+ * Embedding it lets reuse be detected even after the token's own hash record was trimmed
+ * or purged: a well-formed token of a live family that matches no live record was rotated.
+ * The family id is random and not a secret on its own; the token stays a 256-bit secret.
+ * @param {string} token
+ */
+export function refreshTokenFamily(token) {
+  const match = REFRESH_TOKEN.exec(token);
+  return match ? match[1] : null;
+}
 
 /**
  * @typedef {{ get: (key: string) => Promise<any>, put: (key: string, value: any) => Promise<void>,
@@ -67,6 +82,7 @@ export class GrantStore {
   async createFamily({ client_id, resource, scope }) {
     /** @type {Family} */
     const family = {
+      // 128-bit random, base64url (22 characters); also embedded in every refresh token.
       id: randomBase64url(this.random, 16),
       client_id,
       resource,
@@ -88,7 +104,7 @@ export class GrantStore {
   async issue(family) {
     const now = this.now();
     const accessToken = `dbra_${randomBase64url(this.random)}`;
-    const refreshToken = `dbrr_${randomBase64url(this.random)}`;
+    const refreshToken = `dbrr_${family.id}.${randomBase64url(this.random)}`;
     const accessHash = await sha256Hex(accessToken);
     const refreshHash = await sha256Hex(refreshToken);
     await this.storage.put(`at:${accessHash}`, {

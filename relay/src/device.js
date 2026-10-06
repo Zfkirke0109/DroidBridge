@@ -18,7 +18,8 @@ import {
 } from './util.js';
 
 export const PROTOCOL = 'droidbridge-relay/1';
-export const DEVICE_RESPONSE_LIMIT_BYTES = 16 * 1024 * 1024;
+/** The phone's MCP_RESPONSE_LIMIT_BYTES (12,000,000) plus 1 MiB for the tunnel envelope. */
+export const DEVICE_RESPONSE_LIMIT_BYTES = 12_000_000 + 1024 * 1024;
 const SMALL_BODY_LIMIT_BYTES = 4096;
 const POLL_LIMIT_MAX = 8;
 const POLL_DEFAULT_TIMEOUT_MS = 15_000;
@@ -123,7 +124,16 @@ async function poll(relay, request, url) {
  */
 async function respond(relay, request) {
   const bytes = await readBody(request, DEVICE_RESPONSE_LIMIT_BYTES);
-  if (!bytes) return json(413, { error: 'payload_too_large' });
+  if (!bytes) {
+    // Too large to read, so the request_id is unknown, but the shard token header still names
+    // the request. Settle it now as an invalid device reply (resp_code 0 is outside 200..599)
+    // instead of letting Claude wait out the deadline.
+    relay.hub.settleByShardToken(request.headers.get('x-tunnel-shard-token'), {
+      resp_code: 0,
+      resp_type: 'oversize',
+    });
+    return json(413, { error: 'payload_too_large' });
+  }
   const body = parseJson(decodeUtf8(bytes));
   if (!isPlainObject(body) || typeof body.request_id !== 'string') {
     return json(400, { error: 'invalid_request' });

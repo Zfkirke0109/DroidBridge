@@ -79,7 +79,13 @@ Command shape (one element of `commands`):
 
 Response body posted by the phone: `{"request_id","channel","resp_json"?,"resp_headers"?,
 "resp_code","resp_type":"jsonrpc_response"|"notify_ack"}`. The relay answers Claude with
-`resp_code` (100–599, else 502) and `resp_json` as `application/json`.
+`resp_code` and `resp_json` as `application/json`. A `resp_code` outside 200–599 (a 1xx cannot be
+a final response) is an invalid device reply: a request with an `id` gets HTTP 200 with a
+JSON-RPC error (`code -32603`, `data.droidbridge_relay` = `{"state":"invalid_device_reply",
+"delivered":true,"retried":false}`), and a notification gets HTTP 502. The response body may be
+up to 13 048 576 bytes (the phone's 12 000 000-byte MCP response limit plus 1 MiB of envelope); a
+larger one is answered 413, and if its `x-tunnel-shard-token` matches a delivered request, that
+request is settled at once as an invalid device reply instead of waiting for its deadline.
 
 Forwarded header allowlist (case-insensitive in, canonical case out, each value ≤ 4096 bytes):
 `Content-Type`, `Accept`, `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`. Nothing else is
@@ -126,7 +132,10 @@ Follows the MCP 2026-07-28 authorization spec.
   (only `droidbridge`), stores the request for 10 minutes and shows a page naming the client and
   its redirect host, asking for the pairing code shown in DroidBridge. The code is 8 characters
   of Crockford base32 (shown `XXXX-XXXX`, 40 bits), lives at most 10 minutes, is single-use, and
-  is invalidated after 5 wrong attempts. Only its SHA-256 (of the normalized uppercase code
+  is invalidated after 5 wrong attempts across all consent requests. Each consent request is
+  discarded after 3 failed attempts, and at most 10 requests per client (50 in all) wait at once.
+  The page answers a wrong code and a missing or expired pairing code identically, so it never
+  reveals whether a pairing is active. Only its SHA-256 (of the normalized uppercase code
   without the dash) ever reaches the relay. The page sends `Content-Security-Policy` with
   `frame-ancestors 'none'` and a `form-action` limited to `'self'` and the redirect origin, plus
   `X-Frame-Options: DENY` and `Cache-Control: no-store`.

@@ -5,7 +5,7 @@
  * page, and the token endpoint with PKCE, refresh rotation and reuse detection.
  */
 
-import { TTL } from './grants.js';
+import { TTL, refreshTokenFamily } from './grants.js';
 import { consentPage, messagePage } from './pages.js';
 import {
   constantTimeEqual,
@@ -46,9 +46,13 @@ export const OAUTH_LIMITS = Object.freeze({
   cimdTimeoutMs: 5000,
   cimdCacheMax: 20,
   pendingMax: 50,
+  pendingPerClientMax: 10,
   clientsMax: 100,
   registrationsPerHour: 20,
+  /** wrong codes before the pairing code itself is cancelled, across all consent requests */
   pairingMaxAttempts: 5,
+  /** failed submissions before one consent request is discarded */
+  requestMaxAttempts: 3,
   stateMaxLength: 2048,
   redirectUrisMax: 10,
   clientNameMax: 200,
@@ -419,11 +423,17 @@ export class OAuthServer {
     return this.relay.lock.run(async () => {
       const now = this.relay.now();
       let live = 0;
+      let liveForClient = 0;
       for (const [key, record] of await this.storage.list({ prefix: 'pending:' })) {
-        if (!record || record.expiresAt <= now) await this.storage.delete(key);
-        else live += 1;
+        if (!record || record.expiresAt <= now) {
+          await this.storage.delete(key);
+          continue;
+        }
+        live += 1;
+        if (record.client_id === client.client_id) liveForClient += 1;
       }
-      if (live >= OAUTH_LIMITS.pendingMax) {
+      // A global cap, and a per-client cap so one client cannot take every slot.
+      if (live >= OAUTH_LIMITS.pendingMax || liveForClient >= OAUTH_LIMITS.pendingPerClientMax) {
         return messagePage(
           429,
           'Too many waiting requests',
@@ -440,6 +450,7 @@ export class OAuthServer {
         state,
         resource,
         scope,
+        attempts: 0,
         expiresAt: now + TTL.pendingMs,
       };
       await this.storage.put(`pending:${await sha256Hex(requestId)}`, pending);
@@ -516,27 +527,33 @@ export class OAuthServer {
 
       const typed = param(form, 'pairing_code') ?? '';
       if (!typed.trim()) return again(400, 'Enter the pairing code shown in DroidBridge.');
-      const pairing = await this.storage.get('pairing');
-      if (!pairing || pairing.expiresAt <= now) {
-        if (pairing) await this.storage.delete('pairing');
-        return again(
-          409,
-          'There is no active pairing code. Open DroidBridge and tap Pair Claude first, then enter the code it shows.',
-        );
-      }
+      const stored = await this.storage.get('pairing');
+      const pairing = stored && stored.expiresAt > now ? stored : null;
+      if (stored && !pairing) await this.storage.delete('pairing');
       const normalized = typed.length <= 64 ? normalizePairingCode(typed) : '';
       const typedHash = await sha256Hex(normalized);
-      if (!constantTimeEqual(typedHash, pairing.hash)) {
-        const attempts = (Number(pairing.attempts) || 0) + 1;
-        if (attempts >= OAUTH_LIMITS.pairingMaxAttempts) {
-          await this.storage.delete('pairing');
-          return again(
+      if (!pairing || !constantTimeEqual(typedHash, pairing.hash)) {
+        // A wrong code and a missing or expired pairing get the same answer, so this page never
+        // reveals whether a pairing code is active. Both count against this consent request.
+        if (pairing) {
+          const attempts = (Number(pairing.attempts) || 0) + 1;
+          if (attempts >= OAUTH_LIMITS.pairingMaxAttempts) await this.storage.delete('pairing');
+          else await this.storage.put('pairing', { ...pairing, attempts });
+        }
+        const requestAttempts = (Number(pending.attempts) || 0) + 1;
+        if (requestAttempts >= OAUTH_LIMITS.requestMaxAttempts) {
+          await this.storage.delete(pendingKey);
+          return messagePage(
             403,
-            'Too many wrong codes, so the pairing code was cancelled. Tap Pair Claude in DroidBridge again to get a new code.',
+            'Request cancelled',
+            'The pairing code was not accepted 3 times, so this request was cancelled. In DroidBridge, tap Pair Claude for a new code, then start connecting again from Claude.',
           );
         }
-        await this.storage.put('pairing', { ...pairing, attempts });
-        return again(403, 'That pairing code is not correct. Check the code shown in DroidBridge and try again.');
+        await this.storage.put(pendingKey, { ...pending, attempts: requestAttempts });
+        return again(
+          403,
+          'That code did not work. In DroidBridge, tap Pair Claude and type the code it shows. Each code works once, for up to 10 minutes.',
+        );
       }
 
       await this.storage.delete('pairing');
@@ -643,16 +660,21 @@ export class OAuthServer {
     if (!parseScope(param(form, 'scope'))) {
       return tokenError(400, 'invalid_scope', `Only the ${SCOPE} scope is supported.`);
     }
-    if (!(await this.#clientKnown(clientId))) {
-      return tokenError(401, 'invalid_client', 'The client is not known to this relay.');
-    }
     const key = `rt:${await sha256Hex(refreshToken)}`;
     const record = await this.storage.get(key);
-    if (!record) return tokenError(400, 'invalid_grant', 'The refresh token is not valid.');
-    if (record.used) {
-      // A rotated refresh token came back: someone holds a copy. Revoke the whole grant.
-      await this.relay.grants.revokeFamily(record.family);
-      return tokenError(400, 'invalid_grant', 'The refresh token was already used. The grant was revoked.');
+    if (!record || record.used) {
+      // A rotated refresh token came back: someone holds a copy. Revoke the whole grant. Its
+      // record may already be trimmed or purged, so the family id inside the token decides.
+      // This runs before the client check so a replay with any client_id still revokes.
+      const familyId = record ? record.family : refreshTokenFamily(refreshToken);
+      if (familyId && (await this.storage.get(`family:${familyId}`))) {
+        await this.relay.grants.revokeFamily(familyId);
+        return tokenError(400, 'invalid_grant', 'The refresh token was already used. The grant was revoked.');
+      }
+      return tokenError(400, 'invalid_grant', 'The refresh token is not valid.');
+    }
+    if (!(await this.#clientKnown(clientId))) {
+      return tokenError(401, 'invalid_client', 'The client is not known to this relay.');
     }
     if (record.expiresAt <= this.relay.now()) {
       await this.storage.delete(key);

@@ -102,7 +102,7 @@ test('happy path: register, consent with pairing code, PKCE token, MCP round tri
   assert.equal(tokens.expires_in, 3600);
   assert.equal(tokens.scope, 'droidbridge');
   assert.match(tokens.access_token, /^dbra_[A-Za-z0-9_-]{43}$/);
-  assert.match(tokens.refresh_token, /^dbrr_[A-Za-z0-9_-]{43}$/);
+  assert.match(tokens.refresh_token, /^dbrr_[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}$/);
   const stored = JSON.stringify([...t.storage.map.entries()]);
   assert.ok(!stored.includes(tokens.access_token) && !stored.includes(tokens.refresh_token), 'tokens are hashed');
   assert.ok(!stored.includes(t.device.key));
@@ -185,7 +185,7 @@ test('notification round trip: phone notify_ack status reaches Claude with no bo
   assert.equal(await answer.text(), '');
 });
 
-test('phone status code outside 100..599 becomes 502 for Claude', async () => {
+test('an invalid phone status code: HTTP 200 JSON-RPC error for requests, 502 for notifications', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
   for (const bad of [700, 99, 150, 'x']) {
@@ -195,11 +195,21 @@ test('phone status code outside 100..599 becomes 502 for Claude', async () => {
     const [command] = (await (await pollPromise).json()).commands;
     assert.equal((await respond(t, command, { resp_code: bad })).status, 200);
     const answer = await answerPromise;
-    assert.equal(answer.status, 502, `resp_code ${bad}`);
+    assert.equal(answer.status, 200, `resp_code ${bad}`);
     const body = await answer.json();
     assert.equal(body.id, 3);
-    assert.deepEqual(body.error.data.droidbridge_relay, { state: 'invalid_response', delivered: true, retried: false });
+    assert.equal(body.error.code, -32603);
+    assert.deepEqual(body.error.data.droidbridge_relay, { state: 'invalid_device_reply', delivered: true, retried: false });
+    assert.match(body.error.message, /not retried/);
   }
+  const pollPromise = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const notePromise = mcp(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' });
+  const [command] = (await (await pollPromise).json()).commands;
+  assert.equal((await respond(t, command, { resp_code: 42 })).status, 200);
+  const note = await notePromise;
+  assert.equal(note.status, 502);
+  assert.equal(await note.text(), '');
 });
 
 test('metadata endpoints follow the design', async () => {

@@ -108,3 +108,67 @@ test('helpers: pairing normalization, resource normalization, constant-time comp
   assert.equal(constantTimeEqual('abc', 'abcd'), false);
   assert.equal(constantTimeEqual('', ''), true);
 });
+
+/** A namespace whose object reads the body, then fails or answers. */
+function failingNamespace(/** @type {boolean} */ fail) {
+  /** @type {string[]} */
+  const bodies = [];
+  const stub = {
+    /** @param {Request} request */
+    fetch: async (request) => {
+      bodies.push(await request.text());
+      if (fail) throw new Error('Durable Object reset because its code was updated.');
+      return new Response('{"jsonrpc":"2.0","id":1,"result":{}}', { status: 200 });
+    },
+  };
+  return { namespace: { idFromName: () => ({}), get: () => stub }, bodies };
+}
+
+/** @param {string} body */
+function mcpPost(body) {
+  return new Request('https://relay.example/mcp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer t' },
+    body,
+  });
+}
+
+test('a Durable Object failure on POST /mcp is a final HTTP 200 JSON-RPC -32002, never a 5xx', async () => {
+  const { namespace, bodies } = failingNamespace(true);
+  const env = { RELAY: namespace };
+  const expectedData = { droidbridge_relay: { state: 'settlement_unknown', delivered: null, retried: false } };
+
+  const withId = await worker.fetch(mcpPost('{"jsonrpc":"2.0","id":"r-9","method":"tools/call"}'), env);
+  assert.equal(withId.status, 200);
+  const body = await withId.json();
+  assert.equal(body.id, 'r-9');
+  assert.equal(body.error.code, -32002);
+  assert.deepEqual(body.error.data, expectedData);
+  assert.match(body.error.message, /not retried/);
+  assert.equal(bodies[0], '{"jsonrpc":"2.0","id":"r-9","method":"tools/call"}', 'the object received the full body');
+
+  const numeric = await (await worker.fetch(mcpPost('{"jsonrpc":"2.0","id":7,"method":"ping"}'), env)).json();
+  assert.equal(numeric.id, 7);
+
+  const unparseable = await worker.fetch(mcpPost('{oops'), env);
+  assert.equal(unparseable.status, 200);
+  const unparsed = await unparseable.json();
+  assert.equal(unparsed.id, null);
+  assert.deepEqual(unparsed.error.data, expectedData);
+
+  const notification = await worker.fetch(mcpPost('{"jsonrpc":"2.0","method":"notifications/initialized"}'), env);
+  assert.equal(notification.status, 200);
+  assert.equal(await notification.text(), '');
+
+  // Only POST /mcp is wrapped: other routes still surface the failure to the runtime.
+  await assert.rejects(worker.fetch(new Request('https://relay.example/token', { method: 'POST', body: 'x' }), env));
+  await assert.rejects(worker.fetch(new Request('https://relay.example/mcp'), env));
+});
+
+test('a healthy Durable Object answer on POST /mcp passes through unchanged', async () => {
+  const { namespace, bodies } = failingNamespace(false);
+  const res = await worker.fetch(mcpPost('{"jsonrpc":"2.0","id":1,"method":"ping"}'), { RELAY: namespace });
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), '{"jsonrpc":"2.0","id":1,"result":{}}');
+  assert.equal(bodies[0], '{"jsonrpc":"2.0","id":1,"method":"ping"}');
+});

@@ -2,6 +2,7 @@
 // Execution settlement rules: offline, hand-off window, exactly-once delivery, unknown outcome.
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { DEVICE_RESPONSE_LIMIT_BYTES } from '../src/device.js';
 import { makeRelay, mcp, obtainTokens, poll, respond, toolsCall, waitFor } from './helpers.js';
 
 /** @param {ReturnType<typeof makeRelay>} t */
@@ -190,11 +191,10 @@ test('device response body limits and format', async () => {
   assert.equal((await send('{oops')).status, 400);
   assert.equal((await send('[]')).status, 400);
   assert.equal((await send('{"request_id":5}')).status, 400);
-  const huge = new Uint8Array(16 * 1024 * 1024 + 1).fill(0x20);
-  assert.equal((await send(huge)).status, 413);
   assert.equal(t.relay.hub.inspect().delivered, 1, 'still pending after bad bodies');
-  // A large but allowed body settles.
-  const result = { jsonrpc: '2.0', id: 1, result: { text: 'z'.repeat(5 * 1024 * 1024) } };
+  // A body just under the cap (the phone's 12,000,000-byte MCP limit plus envelope) settles.
+  assert.equal(DEVICE_RESPONSE_LIMIT_BYTES, 12_000_000 + 1024 * 1024);
+  const result = { jsonrpc: '2.0', id: 1, result: { text: 'z'.repeat(12_000_000) } };
   const ok = await send(
     JSON.stringify({
       request_id: command.request_id,
@@ -207,7 +207,50 @@ test('device response body limits and format', async () => {
   assert.equal(ok.status, 200);
   const res = await answer;
   assert.equal(res.status, 200);
-  assert.equal((await res.json()).result.text.length, 5 * 1024 * 1024);
+  assert.equal((await res.json()).result.text.length, 12_000_000);
+});
+
+test('an oversized device reply is 413 and settles its request at once as invalid_device_reply', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const tooBig = new Uint8Array(DEVICE_RESPONSE_LIMIT_BYTES + 1).fill(0x20);
+  const send = (/** @type {string | undefined} */ shardToken) =>
+    t.relay.fetch(
+      new Request('https://relay.example/device/v1/response', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${t.device.key}`,
+          'content-type': 'application/json',
+          ...(shardToken === undefined ? {} : { 'x-tunnel-shard-token': shardToken }),
+        },
+        body: tooBig,
+      }),
+    );
+
+  // A request: oversized replies with a wrong or missing shard token settle nothing.
+  const { answer, command } = await deliverOne(t, token, toolsCall('big'));
+  assert.equal((await send('A'.repeat(43))).status, 413);
+  assert.equal((await send(undefined)).status, 413);
+  assert.equal(t.relay.hub.inspect().delivered, 1);
+  // With the right shard token, Claude is answered without the clock moving.
+  const startedAt = t.clock.now();
+  assert.equal((await send(command.shard_token)).status, 413);
+  const res = await answer;
+  assert.equal(t.clock.now(), startedAt, 'no waiting for the 245 s deadline');
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.id, 'big');
+  assert.equal(body.error.code, -32603);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'invalid_device_reply', delivered: true, retried: false });
+  assert.equal((await respond(t, command)).status, 404, 'settled: a later reply is 404');
+  assert.equal(t.clock.pendingTimers(), 0);
+
+  // A notification: 502 with no body.
+  const note = await deliverOne(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' });
+  assert.equal((await send(note.command.shard_token)).status, 413);
+  const noteRes = await note.answer;
+  assert.equal(noteRes.status, 502);
+  assert.equal(await noteRes.text(), '');
 });
 
 test('a new poll supersedes a parked one: the old poll gets 204', async () => {
