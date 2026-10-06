@@ -32,4 +32,10 @@ interface IDroidBridgeRuntime {
     boolean isModuleRebootPending();
     boolean rebootForModule();
     long getModuleVersionCode();
+    String getClaudeRelaySettings();
+    String configureClaudeRelay(String relayUrl, String deviceKey);
+    String setClaudeRelayEnabled(boolean enabled);
+    String clearClaudeRelay();
+    String pairClaudeRelay();
+    String revokeClaudeRelayClients();
 }

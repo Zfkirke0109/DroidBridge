@@ -33,16 +33,19 @@ const PUBLISH_SPACING: Duration = Duration::from_secs(1);
 const SERVICE_CLASS: &str = "com.droidbridge.android.runtimehost.DroidBridgeService";
 /// The App's committed agent connections; only their `enabled` flags are read here.
 const TUNNEL_SETTINGS: &str = "tunnel.json";
+const CLAUDE_RELAY_SETTINGS: &str = "claude-relay.json";
 const MCP_SETTINGS: &str = "mcp.json";
 /// Minimum spacing after the n-th consecutive wake; a Runtime that answers resets the sequence.
 const WAKE_SPACING_SECONDS: [u64; 5] = [0, 15, 60, 180, 300];
 #[cfg(unix)]
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Whether the committed ChatGPT tunnel preference is enabled. The tunnel dials out and is
-/// restored on its own, so it wakes the App even before this device has ever run it.
+/// Whether a committed dial-out connection preference is enabled: the ChatGPT tunnel or the
+/// Claude relay. Both dial out and are restored on their own, so either wakes the App even before
+/// this device has ever run it.
 pub(crate) fn connection_wanted(canonical_base: &Path) -> bool {
     enabled(&canonical_base.join(TUNNEL_SETTINGS))
+        || enabled(&canonical_base.join(CLAUDE_RELAY_SETTINGS))
 }
 
 /// Whether the committed local MCP preference is enabled. It opens a loopback listener, so a
@@ -477,6 +480,31 @@ mod tests {
             fs::write(&settings, contents).unwrap();
             assert_eq!(connection_wanted(&base), wanted, "{contents}");
         }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn keepalive_follows_the_committed_claude_relay_preference_too() {
+        let base = std::env::temp_dir().join(format!("keepalive-relay-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let relay = base.join("claude-relay.json");
+        fs::write(
+            &relay,
+            r#"{"schema_version":1,"enabled":true,"relay_url":"https://r.example"}"#,
+        )
+        .unwrap();
+        assert!(connection_wanted(&base), "an enabled relay alone wakes");
+        fs::write(&relay, r#"{"schema_version":1,"enabled":false}"#).unwrap();
+        assert!(!connection_wanted(&base));
+        fs::write(
+            base.join("tunnel.json"),
+            r#"{"schema_version":1,"enabled":true}"#,
+        )
+        .unwrap();
+        assert!(
+            connection_wanted(&base),
+            "a disabled relay never hides the tunnel"
+        );
         fs::remove_dir_all(&base).unwrap();
     }
 

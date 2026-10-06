@@ -59,7 +59,10 @@ internal interface TunnelCredentialCipher {
     fun deleteKey()
 }
 
-internal class AndroidTunnelCredentialCipher : TunnelCredentialCipher {
+/** Encrypts one credential under its own Keystore key; each trust domain names its own alias. */
+internal class AndroidTunnelCredentialCipher(
+    private val keyAlias: String = TUNNEL_KEY_ALIAS,
+) : TunnelCredentialCipher {
     override fun encrypt(tunnelId: String, apiKey: String): EncryptedTunnelCredential {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, key(create = true))
@@ -84,17 +87,17 @@ internal class AndroidTunnelCredentialCipher : TunnelCredentialCipher {
     }
 
     override fun deleteKey() {
-        keyStore().run { if (containsAlias(KEY_ALIAS)) deleteEntry(KEY_ALIAS) }
+        keyStore().run { if (containsAlias(keyAlias)) deleteEntry(keyAlias) }
     }
 
     private fun key(create: Boolean): SecretKey {
         val store = keyStore()
-        (store.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
+        (store.getKey(keyAlias, null) as? SecretKey)?.let { return it }
         check(create)
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE).run {
             init(
                 KeyGenParameterSpec.Builder(
-                    KEY_ALIAS,
+                    keyAlias,
                     KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
                 )
                     .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
@@ -111,7 +114,6 @@ internal class AndroidTunnelCredentialCipher : TunnelCredentialCipher {
 
     private companion object {
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
-        const val KEY_ALIAS = "droidbridge_tunnel_api_key_v1"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
         const val GCM_TAG_BITS = 128
         const val GCM_IV_BYTES = 12
@@ -459,6 +461,9 @@ internal class TunnelSettingsController(
     }
 }
 
+/** The OpenAI tunnel's API key; the Claude relay's device key has its own alias. */
+internal const val TUNNEL_KEY_ALIAS = "droidbridge_tunnel_api_key_v1"
+internal const val CLAUDE_RELAY_KEY_ALIAS = "droidbridge_claude_relay_device_key_v1"
 internal const val TUNNEL_STOPPED = "stopped"
 internal const val TUNNEL_CONNECTING = "connecting"
 internal const val TUNNEL_RUNNING = "running"

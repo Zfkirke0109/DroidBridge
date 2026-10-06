@@ -153,6 +153,19 @@ class DroidBridgeClient(
 
     suspend fun clearTunnel(): String = mcpCall(IDroidBridgeRuntime::clearTunnel)
 
+    suspend fun claudeRelaySettings(): String = mcpCall(IDroidBridgeRuntime::getClaudeRelaySettings)
+
+    suspend fun configureClaudeRelay(relayUrl: String, deviceKey: String): String =
+        mcpCall { it.configureClaudeRelay(relayUrl, deviceKey) }
+
+    suspend fun setClaudeRelayEnabled(enabled: Boolean): String = mcpCall { it.setClaudeRelayEnabled(enabled) }
+
+    suspend fun clearClaudeRelay(): String = mcpCall(IDroidBridgeRuntime::clearClaudeRelay)
+
+    suspend fun pairClaudeRelay(): String = mcpCall(IDroidBridgeRuntime::pairClaudeRelay)
+
+    suspend fun revokeClaudeRelayClients(): String = mcpCall(IDroidBridgeRuntime::revokeClaudeRelayClients)
+
     /** The S-UI-017 `{schema_version,blocker,cleanup}` reply or `{error}`. */
     suspend fun maintenanceState(): String = mcpCall(IDroidBridgeRuntime::getMaintenanceState)
 
