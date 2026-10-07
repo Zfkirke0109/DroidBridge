@@ -255,6 +255,7 @@ pub fn contract_metadata() -> Value {
             {"path":"error.details.*.key","min":1,"max":64},
             {"path":"error.details.*.string","max":1024},
             {"path":"context.status.device.timezone","min":1,"max":255},
+            {"path":"context.status.device.name","min":1,"max":256},
             {"path":"context.status.device.manufacturer","max":256},
             {"path":"context.status.device.model","max":256},
             {"path":"context.status.device.device","max":256},

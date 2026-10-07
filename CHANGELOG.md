@@ -1,5 +1,42 @@
 # Changelog / 更新日志
 
+## 0.5.1
+
+### English
+
+**Changed**
+- Status now reports the phone's name (the device name set in Android Settings, else its model) as
+  `device.name`, so several phones connected to one ChatGPT account can be told apart. The ChatGPT
+  setup page suggests this name for the plugin instead of the fixed `DroidBridge`.
+- The command tool's schema now says that the default timeout is 30 seconds (root allows up to one
+  hour), that `as_task` suits long work, and that every process a command starts, background ones
+  included, ends with the command.
+
+**Fixed**
+- When the Runtime's store could not be written for a moment while a task or automation was
+  finishing, the task stayed `running` and the Runtime stayed `STORE_UNAVAILABLE` until it was
+  restarted. The finished result is now written again until the store takes it, after which the
+  Runtime is ready again by itself.
+- In the root edition, one denied launch, clipboard or notification call marked that whole function
+  family unavailable until the backend restarted. A denial now only answers that call; the family is
+  checked again at once and stays available unless the check fails too, and a family whose check
+  failed is checked again every minute.
+- Wake alarm and store write failures in the root edition's log now include the system error number.
+
+### 中文
+
+**变更**
+- 状态中新增 `device.name`，即手机名称（Android 设置中的设备名称，未设置时为型号），同一个 ChatGPT 账号连接多台手机时可以区分。
+  ChatGPT 设置页建议的插件名称改为这个手机名称，不再固定为 `DroidBridge`。
+- 命令工具的说明现在写明：默认超时 30 秒（Root 最长一小时）；耗时的工作适合用 `as_task`；命令启动的所有进程（包括后台进程）都会随命令结束。
+
+**修复**
+- 任务或自动化结束时，如果 Runtime 的存储恰好暂时无法写入，任务会一直停在 `running`，Runtime 也一直是 `STORE_UNAVAILABLE`，
+  只能重启恢复。现在结束结果会重试写入直到存储恢复，之后 Runtime 自动回到就绪。
+- Root 版中，启动、剪贴板或通知只要被拒绝一次，整个功能族就会被标为不可用，直到后端重启。现在一次拒绝只影响那一次调用：
+  会立即重新检测该功能族，只有检测也失败才标为不可用；检测失败的功能族每分钟重新检测一次。
+- Root 版日志中的唤醒闹钟和存储写入失败现在附带系统错误码。
+
 ## 0.5.0
 
 ### English

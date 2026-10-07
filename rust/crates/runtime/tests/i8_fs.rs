@@ -322,6 +322,7 @@ fn i8_fs_g03_i5_proof_only_filesystem_vertical_is_absent() {
         sdk_int: 35,
         abi: "arm64-v8a".to_owned(),
         timezone: "UTC".to_owned(),
+        name: "fixture".to_owned(),
         manufacturer: "fixture".to_owned(),
         model: "fixture".to_owned(),
         device: "fixture".to_owned(),

@@ -345,7 +345,7 @@
     <string name="tunnel_enable">安全隧道</string>
     <string name="tunnel_finish_blocked">请完成配置并调用</string>
     <string name="tunnel_first_call_title">第一次 ChatGPT 调用</string>
-    <string name="tunnel_first_call_waiting">新建一个 ChatGPT 对话，点输入框的「+」，选择「开发者模式」并勾选 DroidBridge，然后让它读取一下手机状态。</string>
+    <string name="tunnel_first_call_waiting">新建一个 ChatGPT 对话，点输入框的「+」，选择「开发者模式」并勾选「%1$s」，然后让它读取一下手机状态。</string>
     <string name="tunnel_id">隧道 ID</string>
     <string name="tunnel_intro_body">需要网页版 ChatGPT，以及 Plus、Pro、Business、Enterprise 或 Education 账号。以下链接请在电脑浏览器中打开，或把浏览器标识（UA）设为 Windows 等桌面标识。</string>
     <string name="tunnel_intro_title">连接 ChatGPT</string>
@@ -354,7 +354,7 @@
     <string name="tunnel_open_create_plugin">打开 ChatGPT 插件页</string>
     <string name="tunnel_open_developer_settings">打开 ChatGPT 安全设置</string>
     <string name="tunnel_open_tunnels">打开 Tunnel ID 设置</string>
-    <string name="tunnel_plugin_confirm_body">请确认已在 ChatGPT 安全设置中打开开发者模式，并用这个隧道、认证选「无」创建了 DroidBridge 插件。</string>
+    <string name="tunnel_plugin_confirm_body">请确认已在 ChatGPT 安全设置中打开开发者模式，并用这个隧道、认证选「无」创建了「%1$s」插件。</string>
     <string name="tunnel_plugin_confirm_no">再检查一下</string>
     <string name="tunnel_plugin_confirm_title">插件配置好了吗？</string>
     <string name="tunnel_plugin_confirm_yes">已配置好</string>

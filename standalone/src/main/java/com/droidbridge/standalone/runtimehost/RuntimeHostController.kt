@@ -9,6 +9,7 @@ import android.os.ParcelFileDescriptor
 import com.droidbridge.standalone.BuildConfig
 import com.droidbridge.standalone.execution.android.NetworkDefaultObservation
 import com.droidbridge.standalone.product.release.ReleaseConfig
+import com.droidbridge.ui.product.deviceName
 import java.io.File
 import java.time.ZoneId
 import java.util.concurrent.ExecutorService
@@ -89,6 +90,7 @@ internal class RuntimeHostController(
             .put("sdk_int", Build.VERSION.SDK_INT)
             .put("abi", Build.SUPPORTED_ABIS.firstOrNull().orEmpty())
             .put("timezone", ZoneId.systemDefault().id)
+            .put("name", deviceName(application))
             .put("manufacturer", Build.MANUFACTURER)
             .put("model", Build.MODEL)
             .put("device", Build.DEVICE)

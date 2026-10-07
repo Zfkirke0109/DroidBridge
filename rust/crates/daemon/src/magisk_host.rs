@@ -15,6 +15,7 @@ use crate::{
         NativeNetworkPort,
     },
     recycle::CleanupWatch,
+    reprobe_families,
     unix_transport::{peer_uid, receive_json},
     visual::MagiskVisualPort,
 };
@@ -61,7 +62,7 @@ pub(crate) struct MagiskHost {
     helper: Option<FrameworkHelper>,
     helper_port: HelperPort,
     family_probes: [bool; 3],
-    published_denials: [bool; 3],
+    family_probed_at: Instant,
     guard_ready: bool,
     module_ready: bool,
     wake_alarm_ready: bool,
@@ -188,6 +189,8 @@ type MagiskFilesystemSurface =
 
 /// The root edition runs commands as root only.
 const COMMAND_IDENTITIES: &[RunAs] = &[RunAs::Root];
+/// How often a helper family whose probe failed is probed again while the helper lives.
+const FAMILY_REPROBE_EVERY: Duration = Duration::from_secs(60);
 
 /// The Magisk host's own capture backend and observation source, so this host owns every
 /// `network.inspect` field family and the raw capture/injection primitive (S-NET-001, S-NET-005).
@@ -243,12 +246,14 @@ impl MagiskHost {
             &persistence::GuardProofDirectory::new(canonical_base),
             &ProcFacts,
         )?;
+        let model = fixed_property("ro.product.model")?;
         let environment = VerticalEnvironment {
             sdk_int,
             abi: fixed_property("ro.product.cpu.abi")?,
             timezone: fixed_property("persist.sys.timezone")?,
+            name: model.clone(),
             manufacturer: fixed_property("ro.product.manufacturer")?,
-            model: fixed_property("ro.product.model")?,
+            model,
             device: fixed_property("ro.product.device")?,
             build_fingerprint: fixed_property("ro.build.fingerprint")?,
             version_name: env!("CARGO_PKG_VERSION").to_owned(),
@@ -305,6 +310,7 @@ impl MagiskHost {
         let helper_port = HelperPort::default();
         let family_probes = helper.as_ref().map_or([false; 3], |helper| {
             helper_port.publish(Arc::clone(&helper.connection), helper.jar.clone());
+            name_device(&vertical);
             probe_families(helper)
         });
         register(
@@ -315,11 +321,9 @@ impl MagiskHost {
             helper.is_some(),
             capability_generation.current(),
         )?;
-        for fact in helper_family_facts(
-            helper.is_some(),
-            |family| family_probes[family_index(family)],
-            |_| false,
-        ) {
+        for fact in helper_family_facts(helper.is_some(), |family| {
+            family_probes[family_index(family)]
+        }) {
             register(
                 &vertical,
                 fact.family.key(),
@@ -494,7 +498,7 @@ impl MagiskHost {
             helper,
             helper_port,
             family_probes,
-            published_denials: [false; 3],
+            family_probed_at: Instant::now(),
             guard_ready,
             module_ready: true,
             wake_alarm_ready,
@@ -626,10 +630,21 @@ impl MagiskHost {
         }
 
         if self.helper.as_mut().is_some_and(FrameworkHelper::is_alive) {
-            let denials = HelperFamily::ALL.map(|family| self.helper_port.operation_denied(family));
-            if denials != self.published_denials {
-                self.published_denials = denials;
-                self.publish_helper_state(true)?;
+            let retry_failed = self.family_probed_at.elapsed() >= FAMILY_REPROBE_EVERY;
+            if retry_failed {
+                self.family_probed_at = Instant::now();
+            }
+            if let Some(helper) = self.helper.as_ref() {
+                let probes = reprobe_families(
+                    self.family_probes,
+                    |family| self.helper_port.take_denial(family),
+                    retry_failed,
+                    |family| probe_family(helper, family),
+                );
+                if probes != self.family_probes {
+                    self.family_probes = probes;
+                    self.publish_helper_state(true)?;
+                }
             }
             return Ok(());
         }
@@ -647,8 +662,9 @@ impl MagiskHost {
         if let Ok(helper) = FrameworkHelper::start(module_root, sdk_int, helper_generation) {
             self.helper_port
                 .publish(Arc::clone(&helper.connection), helper.jar.clone());
+            name_device(&self.vertical);
             self.family_probes = probe_families(&helper);
-            self.published_denials = [false; 3];
+            self.family_probed_at = Instant::now();
             self.helper = Some(helper);
             self.publish_helper_state(true)?;
         }
@@ -665,11 +681,9 @@ impl MagiskHost {
             available,
             generation,
         )?;
-        for fact in helper_family_facts(
-            available,
-            |family| self.family_probes[family_index(family)],
-            |family| self.published_denials[family_index(family)],
-        ) {
+        for fact in
+            helper_family_facts(available, |family| self.family_probes[family_index(family)])
+        {
             register(
                 &self.vertical,
                 fact.family.key(),
@@ -715,6 +729,38 @@ pub(crate) fn observe_module(
 /// only after the Android system services it probes have finished booting.
 fn framework_boot_completed() -> bool {
     fixed_property("sys.boot_completed").is_ok_and(|value| value == "1")
+}
+
+/// Names the device after its Settings name once the framework answers, which the helper's start
+/// proves; until then, and when it has none, the model stands.
+fn name_device(vertical: &ApkRuntimeVertical) {
+    if let Some(name) = device_name()
+        && let Err(failed) = vertical.set_device_name(name)
+    {
+        eprintln!(
+            "droidbridged: cannot set the device name: {:?}",
+            failed.code
+        );
+    }
+}
+
+/// The name the owner gave this phone in Settings, bounded to the status contract's 256 bytes.
+fn device_name() -> Option<String> {
+    let output = Command::new("/system/bin/settings")
+        .args(["get", "global", "device_name"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let mut name = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    if name.is_empty() || name == "null" {
+        return None;
+    }
+    let mut end = name.len().min(256);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+    Some(name)
 }
 
 pub(crate) fn fixed_property(name: &str) -> Result<String, DomainError> {
@@ -769,8 +815,8 @@ fn spawn_automation_scheduler(
     let scheduler = AutomationScheduler::new(core, Arc::new(BoottimeClock)).reporting_faults(
         Arc::new(|error: &DomainError| {
             eprintln!(
-                "droidbridged: automation scheduler pass failed: {:?} {}",
-                error.code, error.reason
+                "droidbridged: automation scheduler pass failed: {:?} {} errno={:?}",
+                error.code, error.reason, error.os_error
             );
         }),
     );
@@ -999,7 +1045,11 @@ impl FrameworkHelper {
 /// Runs each S-MAGISK-005 family probe once for this helper generation. A failed probe
 /// records only its own family.
 fn probe_families(helper: &FrameworkHelper) -> [bool; 3] {
-    HelperFamily::ALL.map(|family| match family {
+    HelperFamily::ALL.map(|family| probe_family(helper, family))
+}
+
+fn probe_family(helper: &FrameworkHelper, family: HelperFamily) -> bool {
+    match family {
         HelperFamily::Launch => helper
             .connection
             .request(&serde_json::json!({"operation": "probe_launch"}))
@@ -1011,7 +1061,7 @@ fn probe_families(helper: &FrameworkHelper) -> [bool; 3] {
         HelperFamily::Clipboard => {
             run_clipboard_child(&helper.jar, "probe", &serde_json::json!({}), None).is_ok()
         }
-    })
+    }
 }
 
 const fn family_index(family: HelperFamily) -> usize {
@@ -1074,8 +1124,8 @@ impl HostControlPort for MagiskHostControl {
 
     fn store_write_failed(&self, error: &DomainError) {
         eprintln!(
-            "droidbridged: canonical commit failed: {:?} {}",
-            error.code, error.reason
+            "droidbridged: canonical commit failed: {:?} {} errno={:?}",
+            error.code, error.reason, error.os_error
         );
         if let Err(failed) = self.capabilities.withdraw_readiness_as("STORE_UNAVAILABLE") {
             eprintln!("droidbridged: cannot withdraw readiness: {:?}", failed.code);
@@ -1085,6 +1135,16 @@ impl HostControlPort for MagiskHostControl {
                 "droidbridged: cannot record the store fault: {:?}",
                 failed.code
             );
+        }
+    }
+
+    fn store_write_recovered(&self) {
+        eprintln!("droidbridged: canonical store takes writes again");
+        if let Err(failed) = self
+            .capabilities
+            .restore_readiness_from("STORE_UNAVAILABLE")
+        {
+            eprintln!("droidbridged: cannot restore readiness: {:?}", failed.code);
         }
     }
 }

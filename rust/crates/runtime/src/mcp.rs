@@ -1090,8 +1090,8 @@ fn next_step(code: &str) -> Option<&'static str> {
             "The referenced item does not exist or has expired. Obtain a fresh reference first."
         }
         "TIMEOUT" => concat!(
-            "It did not finish in time. Retry; for long-running commands use command run with ",
-            "as_task and follow the task with task_control."
+            "It did not finish in time. For a long command, set a larger timeout_ms (root allows ",
+            "up to 3600000) and run it with as_task, following the task with task_control."
         ),
         "RESOURCE_LIMIT" => concat!(
             "A size or count limit was reached. Ask for less, for example fewer nodes, no image ",

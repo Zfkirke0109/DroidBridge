@@ -75,8 +75,8 @@ impl HostControlPort for AppHostControl {
 
     fn store_write_failed(&self, error: &DomainError) {
         eprintln!(
-            "DroidBridge canonical commit failed: {:?} {}",
-            error.code, error.reason
+            "DroidBridge canonical commit failed: {:?} {} errno={:?}",
+            error.code, error.reason, error.os_error
         );
         if let Err(failed) = self.capabilities.withdraw_readiness_as("STORE_UNAVAILABLE") {
             eprintln!("DroidBridge cannot withdraw readiness: {:?}", failed.code);
@@ -86,6 +86,16 @@ impl HostControlPort for AppHostControl {
                 "DroidBridge cannot record the store fault: {:?}",
                 failed.code
             );
+        }
+    }
+
+    fn store_write_recovered(&self) {
+        eprintln!("DroidBridge: canonical store takes writes again");
+        if let Err(failed) = self
+            .capabilities
+            .restore_readiness_from("STORE_UNAVAILABLE")
+        {
+            eprintln!("DroidBridge: cannot restore readiness: {:?}", failed.code);
         }
     }
 

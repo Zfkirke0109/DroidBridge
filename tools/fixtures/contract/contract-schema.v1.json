@@ -655,11 +655,12 @@
           "type": "object",
           "properties": {
             "as_task": {
+              "description": "Runs the command as a Task: the call returns a task_id at once and task_control waits for,\nreads or cancels it. Use it for work that may outlast one tool call.",
               "type": "boolean",
               "default": false
             },
             "command": {
-              "description": "The shell command, at most 32768 bytes of UTF-8.",
+              "description": "The shell command, at most 32768 bytes of UTF-8. Every process it starts stays in its\nprocess group (setsid and setpgid fail with EPERM) and is stopped when the command exits,\ntimes out or is cancelled, background (`&`, `nohup`) ones included: nothing it starts\noutlives it.",
               "type": "string"
             },
             "cwd": {
@@ -687,6 +688,7 @@
               ]
             },
             "timeout_ms": {
+              "description": "The deadline in milliseconds, 30000 unless set: at most 150000 for app and shell and\n3600000 for root. At the deadline the command and every process it started are stopped.",
               "type": "integer",
               "format": "uint64",
               "default": 30000,
@@ -2472,11 +2474,12 @@
           "type": "object",
           "properties": {
             "as_task": {
+              "description": "Runs the command as a Task: the call returns a task_id at once and task_control waits for,\nreads or cancels it. Use it for work that may outlast one tool call.",
               "type": "boolean",
               "default": false
             },
             "command": {
-              "description": "The shell command, at most 32768 bytes of UTF-8.",
+              "description": "The shell command, at most 32768 bytes of UTF-8. Every process it starts stays in its\nprocess group (setsid and setpgid fail with EPERM) and is stopped when the command exits,\ntimes out or is cancelled, background (`&`, `nohup`) ones included: nothing it starts\noutlives it.",
               "type": "string"
             },
             "cwd": {
@@ -2504,6 +2507,7 @@
               ]
             },
             "timeout_ms": {
+              "description": "The deadline in milliseconds, 30000 unless set: at most 150000 for app and shell and\n3600000 for root. At the deadline the command and every process it started are stopped.",
               "type": "integer",
               "format": "uint64",
               "default": 30000,
@@ -6112,11 +6116,12 @@
           "type": "object",
           "properties": {
             "as_task": {
+              "description": "Runs the command as a Task: the call returns a task_id at once and task_control waits for,\nreads or cancels it. Use it for work that may outlast one tool call.",
               "type": "boolean",
               "default": false
             },
             "command": {
-              "description": "The shell command, at most 32768 bytes of UTF-8.",
+              "description": "The shell command, at most 32768 bytes of UTF-8. Every process it starts stays in its\nprocess group (setsid and setpgid fail with EPERM) and is stopped when the command exits,\ntimes out or is cancelled, background (`&`, `nohup`) ones included: nothing it starts\noutlives it.",
               "type": "string"
             },
             "cwd": {
@@ -6144,6 +6149,7 @@
               ]
             },
             "timeout_ms": {
+              "description": "The deadline in milliseconds, 30000 unless set: at most 150000 for app and shell and\n3600000 for root. At the deadline the command and every process it started are stopped.",
               "type": "integer",
               "format": "uint64",
               "default": 30000,
@@ -7530,11 +7536,12 @@
           "type": "object",
           "properties": {
             "as_task": {
+              "description": "Runs the command as a Task: the call returns a task_id at once and task_control waits for,\nreads or cancels it. Use it for work that may outlast one tool call.",
               "type": "boolean",
               "default": false
             },
             "command": {
-              "description": "The shell command, at most 32768 bytes of UTF-8.",
+              "description": "The shell command, at most 32768 bytes of UTF-8. Every process it starts stays in its\nprocess group (setsid and setpgid fail with EPERM) and is stopped when the command exits,\ntimes out or is cancelled, background (`&`, `nohup`) ones included: nothing it starts\noutlives it.",
               "type": "string"
             },
             "cwd": {
@@ -7562,6 +7569,7 @@
               ]
             },
             "timeout_ms": {
+              "description": "The deadline in milliseconds, 30000 unless set: at most 150000 for app and shell and\n3600000 for root. At the deadline the command and every process it started are stopped.",
               "type": "integer",
               "format": "uint64",
               "default": 30000,
@@ -8803,11 +8811,12 @@
           "type": "object",
           "properties": {
             "as_task": {
+              "description": "Runs the command as a Task: the call returns a task_id at once and task_control waits for,\nreads or cancels it. Use it for work that may outlast one tool call.",
               "type": "boolean",
               "default": false
             },
             "command": {
-              "description": "The shell command, at most 32768 bytes of UTF-8.",
+              "description": "The shell command, at most 32768 bytes of UTF-8. Every process it starts stays in its\nprocess group (setsid and setpgid fail with EPERM) and is stopped when the command exits,\ntimes out or is cancelled, background (`&`, `nohup`) ones included: nothing it starts\noutlives it.",
               "type": "string"
             },
             "cwd": {
@@ -8835,6 +8844,7 @@
               ]
             },
             "timeout_ms": {
+              "description": "The deadline in milliseconds, 30000 unless set: at most 150000 for app and shell and\n3600000 for root. At the deadline the command and every process it started are stopped.",
               "type": "integer",
               "format": "uint64",
               "default": 30000,
@@ -9688,6 +9698,10 @@
             "abi": {
               "type": "string"
             },
+            "name": {
+              "description": "The name the owner gave the phone in Settings, else its model, as of Runtime start; it\ntells apart several phones connected to the same client.",
+              "type": "string"
+            },
             "sdk_int": {
               "type": "integer",
               "format": "uint32",
@@ -9701,7 +9715,8 @@
           "required": [
             "sdk_int",
             "abi",
-            "timezone"
+            "timezone",
+            "name"
           ]
         },
         "EffectiveCapabilities": {
@@ -9947,6 +9962,10 @@
             "model": {
               "type": "string"
             },
+            "name": {
+              "description": "The name the owner gave the phone in Settings, else its model, as of Runtime start; it\ntells apart several phones connected to the same client.",
+              "type": "string"
+            },
             "sdk_int": {
               "type": "integer",
               "format": "uint32",
@@ -9961,6 +9980,7 @@
             "sdk_int",
             "abi",
             "timezone",
+            "name",
             "manufacturer",
             "model",
             "device",

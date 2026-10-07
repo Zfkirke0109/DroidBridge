@@ -19,9 +19,17 @@ use domain::{
 };
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::{Mutex, Notify, Semaphore, watch};
+
+/// The reason of a canonical commit the store refused for I/O; the settlement retry keys on it.
+pub(crate) const STORE_WRITE_FAILED: &str = "canonical store write failed";
+const STORE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+const STORE_RETRY_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 const MAX_TERMINAL_TASKS: usize = 500;
 const TASK_HISTORY_RETENTION_MS: u64 = 7 * 86_400_000;
@@ -72,6 +80,8 @@ pub struct RuntimeCore<P, A, E, C, H> {
     network_event_source: Arc<StdMutex<Option<Arc<dyn NetworkDefaultEventSource>>>>,
     automation_cancellations: Arc<StdMutex<BTreeMap<String, Arc<crate::AutomationCancellation>>>>,
     canonical_changes: Arc<Notify>,
+    /// The last canonical write failed and none has succeeded since.
+    store_failed: Arc<AtomicBool>,
 }
 
 impl<P, A, E, C, H> Clone for RuntimeCore<P, A, E, C, H> {
@@ -89,6 +99,7 @@ impl<P, A, E, C, H> Clone for RuntimeCore<P, A, E, C, H> {
             network_event_source: Arc::clone(&self.network_event_source),
             automation_cancellations: Arc::clone(&self.automation_cancellations),
             canonical_changes: Arc::clone(&self.canonical_changes),
+            store_failed: Arc::clone(&self.store_failed),
         }
     }
 }
@@ -121,6 +132,39 @@ where
             network_event_source: Arc::new(StdMutex::new(None)),
             automation_cancellations: Arc::new(StdMutex::new(BTreeMap::new())),
             canonical_changes: Arc::new(Notify::new()),
+            store_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Writes the current canonical state unchanged once the last write failed, proving the store
+    /// takes writes again; the successful commit lets the host restore readiness. A host loop
+    /// calls it, and a failed probe is that loop's failed pass.
+    pub async fn recover_store(&self) -> Result<(), DomainError> {
+        if !self.store_failed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.state_transition(|_, _| Ok(((), true))).await
+    }
+
+    /// Repeats a settlement whose outcome is known until the store takes it. Only a failed
+    /// canonical write is repeated; any other error is the settlement's own answer. It ends with
+    /// this instance, whose successor's recovery then settles what is left.
+    pub(crate) async fn until_stored<T, F, Fut>(&self, mut attempt: F) -> Result<T, DomainError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, DomainError>>,
+    {
+        let mut delay = STORE_RETRY_INITIAL;
+        loop {
+            match attempt().await {
+                Err(error)
+                    if error.code == ErrorCode::IoError && error.reason == STORE_WRITE_FAILED =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(STORE_RETRY_LIMIT);
+                }
+                answer => return answer,
+            }
         }
     }
 
@@ -1009,6 +1053,18 @@ where
         ended_at: String,
         terminal_at_ms: u64,
     ) -> Result<TaskSnapshot, DomainError> {
+        self.until_stored(|| {
+            self.interrupt_before_execution_once(task_id, ended_at.clone(), terminal_at_ms)
+        })
+        .await
+    }
+
+    async fn interrupt_before_execution_once(
+        &self,
+        task_id: &TaskId,
+        ended_at: String,
+        terminal_at_ms: u64,
+    ) -> Result<TaskSnapshot, DomainError> {
         let _guard = self.mutation.lock().await;
         let mut state = self.persistence.load()?;
         let task_index = state
@@ -1066,6 +1122,26 @@ where
     }
 
     async fn settle(
+        &self,
+        task_id: &TaskId,
+        outcome: ExecutionOutcome,
+        cleanup_verified: bool,
+        ended_at: String,
+        terminal_at_ms: u64,
+    ) -> Result<TaskSnapshot, DomainError> {
+        self.until_stored(|| {
+            self.settle_once(
+                task_id,
+                outcome.clone(),
+                cleanup_verified,
+                ended_at.clone(),
+                terminal_at_ms,
+            )
+        })
+        .await
+    }
+
+    async fn settle_once(
         &self,
         task_id: &TaskId,
         outcome: ExecutionOutcome,
@@ -1415,9 +1491,19 @@ where
         if let Err(error) = self.persistence.compare_and_commit(expected, state) {
             // A conflict or a stale lease is another writer's turn; an I/O failure is this store's.
             if error.code == ErrorCode::IoError {
+                self.store_failed.store(true, Ordering::Release);
                 self.host_control.store_write_failed(&error);
+                // The resident loop wakes to probe the store until it takes writes again.
+                self.canonical_changes.notify_one();
+                return Err(DomainError {
+                    reason: STORE_WRITE_FAILED,
+                    ..error
+                });
             }
             return Err(error);
+        }
+        if self.store_failed.swap(false, Ordering::AcqRel) {
+            self.host_control.store_write_recovered();
         }
         self.host_control
             .task_activity_changed(active_tasks, canonical_revision);

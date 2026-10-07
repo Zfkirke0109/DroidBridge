@@ -26,12 +26,15 @@ impl RealtimeAlarmWake {
             )
         };
         if descriptor < 0 {
-            return Err(wake_error("wake alarm timer creation failed"));
+            return Err(wake_error(
+                "wake alarm timer creation failed",
+                &io::Error::last_os_error(),
+            ));
         }
         // SAFETY: timerfd_create returned a new descriptor that nothing else owns.
         let timer = unsafe { OwnedFd::from_raw_fd(descriptor) };
         let timer = AsyncFd::with_interest(timer, Interest::READABLE)
-            .map_err(|_| wake_error("wake alarm timer registration failed"))?;
+            .map_err(|error| wake_error("wake alarm timer registration failed", &error))?;
         Ok(Self { timer })
     }
 
@@ -53,7 +56,10 @@ impl RealtimeAlarmWake {
             )
         };
         if result != 0 {
-            return Err(wake_error("wake alarm timer arm failed"));
+            return Err(wake_error(
+                "wake alarm timer arm failed",
+                &io::Error::last_os_error(),
+            ));
         }
         Ok(())
     }
@@ -96,7 +102,7 @@ impl AutomationWakeProjection for RealtimeAlarmWake {
                     .timer
                     .readable()
                     .await
-                    .map_err(|_| wake_error("wake alarm timer wait failed"))?;
+                    .map_err(|error| wake_error("wake alarm timer wait failed", &error))?;
                 let mut expirations = [0_u8; 8];
                 // The read consumes the delivery synchronously after readiness, so dropping this
                 // future at its only await point loses nothing.
@@ -120,8 +126,14 @@ impl AutomationWakeProjection for RealtimeAlarmWake {
                     Ok(Err(error)) if error.raw_os_error() == Some(libc::ECANCELED) => {
                         return Ok(());
                     }
-                    Ok(Ok(_)) | Ok(Err(_)) => {
-                        return Err(wake_error("wake alarm timer read failed"));
+                    Ok(Ok(_)) => {
+                        return Err(DomainError::new(
+                            ErrorCode::IoError,
+                            "wake alarm timer read failed",
+                        ));
+                    }
+                    Ok(Err(error)) => {
+                        return Err(wake_error("wake alarm timer read failed", &error));
                     }
                     Err(_would_block) => {}
                 }
@@ -130,6 +142,6 @@ impl AutomationWakeProjection for RealtimeAlarmWake {
     }
 }
 
-fn wake_error(message: &'static str) -> DomainError {
-    DomainError::new(ErrorCode::IoError, message)
+fn wake_error(message: &'static str, error: &io::Error) -> DomainError {
+    DomainError::os(ErrorCode::IoError, message, error)
 }

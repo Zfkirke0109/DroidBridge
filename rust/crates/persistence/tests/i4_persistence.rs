@@ -1266,6 +1266,11 @@ impl runtime::HostControlPort for CleanupQuarantine {
         self.unavailable
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
+
+    fn store_write_recovered(&self) {
+        self.unavailable
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[test]

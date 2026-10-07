@@ -71,6 +71,26 @@ impl HelperFamily {
     }
 }
 
+/// The families' probe facts after one refresh of a live helper. A denied operation is that
+/// operation's own answer: the family's probe, run again at once, alone decides whether the
+/// family is lost. A failed family is probed again when `retry_failed`, so it recovers while the
+/// helper lives.
+pub fn reprobe_families(
+    current: [bool; 3],
+    denied: impl Fn(HelperFamily) -> bool,
+    retry_failed: bool,
+    mut probe: impl FnMut(HelperFamily) -> bool,
+) -> [bool; 3] {
+    HelperFamily::ALL.map(|family| {
+        let succeeded = current[family.index()];
+        if denied(family) || (retry_failed && !succeeded) {
+            probe(family)
+        } else {
+            succeeded
+        }
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HelperFamilyFact {
     pub family: HelperFamily,
@@ -78,20 +98,17 @@ pub struct HelperFamilyFact {
     pub reason: Option<&'static str>,
 }
 
-/// Projects each family from its own probe and denial facts only; a failed family never
-/// changes a sibling. Helper loss alone withdraws every family.
+/// Projects each family from its own probe fact only; a failed family never changes a sibling.
+/// Helper loss alone withdraws every family.
 pub fn helper_family_facts(
     helper_ready: bool,
     probe_succeeded: impl Fn(HelperFamily) -> bool,
-    operation_denied: impl Fn(HelperFamily) -> bool,
 ) -> [HelperFamilyFact; 3] {
     HelperFamily::ALL.map(|family| {
         let reason = if !helper_ready {
             Some("HELPER_UNAVAILABLE")
         } else if !probe_succeeded(family) {
             Some(family.probe_failure())
-        } else if operation_denied(family) {
-            Some("OPERATION_DENIED")
         } else {
             None
         };

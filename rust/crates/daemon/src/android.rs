@@ -148,8 +148,9 @@ impl HelperPort {
         }
     }
 
-    pub(crate) fn operation_denied(&self, family: HelperFamily) -> bool {
-        self.denied[family.index()].load(Ordering::Acquire)
+    /// Whether an operation of [family] was denied since the last call; the host re-probes it.
+    pub(crate) fn take_denial(&self, family: HelperFamily) -> bool {
+        self.denied[family.index()].swap(false, Ordering::AcqRel)
     }
 
     fn published(&self) -> Result<PublishedHelper, DomainError> {

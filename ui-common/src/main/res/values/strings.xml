@@ -346,7 +346,7 @@
     <string name="tunnel_enable">Secure tunnel</string>
     <string name="tunnel_finish_blocked">Finish the setup and make a call</string>
     <string name="tunnel_first_call_title">First ChatGPT call</string>
-    <string name="tunnel_first_call_waiting">Start a new ChatGPT conversation, tap + in the message box, choose Developer mode and check DroidBridge, then ask it to read the phone status.</string>
+    <string name="tunnel_first_call_waiting">Start a new ChatGPT conversation, tap + in the message box, choose Developer mode and check %1$s, then ask it to read the phone status.</string>
     <string name="tunnel_id">Tunnel ID</string>
     <string name="tunnel_intro_body">Requires ChatGPT on the web and a Plus, Pro, Business, Enterprise or Education account. Open the links below in a computer browser, or set the browser to a desktop user agent.</string>
     <string name="tunnel_intro_title">Connect ChatGPT</string>
@@ -355,7 +355,7 @@
     <string name="tunnel_open_create_plugin">Open ChatGPT plugins</string>
     <string name="tunnel_open_developer_settings">Open ChatGPT security settings</string>
     <string name="tunnel_open_tunnels">Open Tunnel ID settings</string>
-    <string name="tunnel_plugin_confirm_body">Confirm that you turned on developer mode in ChatGPT\'s security settings and created the DroidBridge plugin with this tunnel and Authentication set to None.</string>
+    <string name="tunnel_plugin_confirm_body">Confirm that you turned on developer mode in ChatGPT\'s security settings and created the %1$s plugin with this tunnel and Authentication set to None.</string>
     <string name="tunnel_plugin_confirm_no">Check again</string>
     <string name="tunnel_plugin_confirm_title">Is the plugin set up?</string>
     <string name="tunnel_plugin_confirm_yes">It is set up</string>

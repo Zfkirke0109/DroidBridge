@@ -53,11 +53,11 @@ import com.droidbridge.ui.R
 import com.droidbridge.ui.common.RowIcon
 import com.droidbridge.ui.client.ClientState
 import com.droidbridge.ui.client.RuntimeConnection
+import com.droidbridge.ui.product.deviceName
 import com.droidbridge.ui.product.mcp.CHATGPT_DEVELOPER_SETTINGS_URL
 import com.droidbridge.ui.product.mcp.CHATGPT_PLUGINS_URL
 import com.droidbridge.ui.product.mcp.OPENAI_API_KEYS_URL
 import com.droidbridge.ui.product.mcp.OPENAI_TUNNELS_URL
-import com.droidbridge.ui.product.mcp.TUNNEL_PLUGIN_NAME
 import com.droidbridge.ui.product.mcp.TunnelRuntimeState
 import com.droidbridge.ui.product.mcp.TunnelSettingsReplies
 import com.droidbridge.ui.product.mcp.TunnelSettingsError
@@ -174,6 +174,7 @@ fun TunnelRoute(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val pluginName = remember(context) { deviceName(context) }
     var tunnelId by remember { mutableStateOf("") }
     var apiKey by remember { mutableStateOf("") }
     var editing by remember { mutableStateOf(false) }
@@ -499,9 +500,9 @@ fun TunnelRoute(
                             CopyValueRow(
                                 title = R.string.tunnel_plugin_name,
                                 icon = R.drawable.ic_extension,
-                                value = TUNNEL_PLUGIN_NAME,
+                                value = pluginName,
                                 tag = "tunnel:copy_plugin_name",
-                            ) { context.copyText(TUNNEL_PLUGIN_NAME) }
+                            ) { context.copyText(pluginName) }
                         }
                         item {
                             CopyValueRow(
@@ -531,7 +532,7 @@ fun TunnelRoute(
                             supportingContent = {
                                 Text(
                                     settings.lastCallEpochMs?.let(::formatLastCall)
-                                        ?: stringResource(R.string.tunnel_first_call_waiting),
+                                        ?: stringResource(R.string.tunnel_first_call_waiting, pluginName),
                                 )
                             },
                             modifier = Modifier.testTag("tunnel:first_call"),
@@ -561,7 +562,7 @@ fun TunnelRoute(
         AlertDialog(
             onDismissRequest = { confirmPlugin = false },
             title = { Text(stringResource(R.string.tunnel_plugin_confirm_title)) },
-            text = { Text(stringResource(R.string.tunnel_plugin_confirm_body)) },
+            text = { Text(stringResource(R.string.tunnel_plugin_confirm_body, pluginName)) },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -718,7 +719,7 @@ private fun android.content.Context.openWebPage(url: String) {
 
 private fun android.content.Context.copyText(value: String) {
     getSystemService(ClipboardManager::class.java)
-        .setPrimaryClip(ClipData.newPlainText(TUNNEL_PLUGIN_NAME, value))
+        .setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), value))
 }
 
 private fun android.content.Context.clipboardText(): String? =

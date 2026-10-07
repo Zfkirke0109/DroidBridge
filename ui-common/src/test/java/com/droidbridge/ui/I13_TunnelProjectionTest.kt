@@ -7,7 +7,6 @@ import com.droidbridge.ui.product.mcp.CHATGPT_DEVELOPER_SETTINGS_URL
 import com.droidbridge.ui.product.mcp.CHATGPT_PLUGINS_URL
 import com.droidbridge.ui.product.mcp.OPENAI_API_KEYS_URL
 import com.droidbridge.ui.product.mcp.OPENAI_TUNNELS_URL
-import com.droidbridge.ui.product.mcp.TUNNEL_PLUGIN_NAME
 import com.droidbridge.ui.product.mcp.isTunnelConfigurationInputValid
 import com.droidbridge.ui.product.mcp.isTunnelPluginCreationReady
 import com.droidbridge.ui.product.mcp.isTunnelStepActionEnabled
@@ -64,7 +63,6 @@ class I13_TunnelProjectionTest {
         assertEquals("https://platform.openai.com/api-keys", OPENAI_API_KEYS_URL)
         assertEquals("https://chatgpt.com/settings/security", CHATGPT_DEVELOPER_SETTINGS_URL)
         assertEquals("https://chatgpt.com/plugins", CHATGPT_PLUGINS_URL)
-        assertEquals("DroidBridge", TUNNEL_PLUGIN_NAME)
     }
 
     @Test

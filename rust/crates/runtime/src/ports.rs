@@ -430,6 +430,10 @@ pub trait HostControlPort: Send + Sync {
     /// instance; the caller still receives the commit's own error.
     fn store_write_failed(&self, error: &DomainError);
 
+    /// A canonical write succeeded after one failed: the store takes writes again, so the host
+    /// restores the readiness it withdrew for that failure, and only that.
+    fn store_write_recovered(&self);
+
     /// Publishes the authoritative count of non-terminal Tasks after a canonical commit. This is
     /// a derived platform projection: it cannot recast an already committed mutation as failed,
     /// and an implementation must report its own delivery failure. Headless hosts do nothing.
