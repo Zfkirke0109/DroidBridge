@@ -7,7 +7,8 @@
  *
  *   offline      no poll waiting and none ended within the online grace: not delivered
  *   busy         too many requests in flight: not delivered
- *   unavailable  online, but no poll arrived within the hand-off window: not delivered
+ *   unavailable  online, but no poll arrived within the hand-off window, or Claude gave up
+ *                before a poll took it: not delivered
  *   settled      delivered, and the phone posted a response with the right shard token
  *   invalid      delivered, and the phone posted a reply that could not be read (too large,
  *                not JSON, or no request_id) carrying the request's shard token
@@ -15,6 +16,14 @@
  *
  * A command is "delivered" the moment it is placed into a poll response body, and it is
  * removed from the hand-off list at that moment, so no later poll can see it again.
+ *
+ * Delivery is all or nothing. Each command is encoded to its wire form (JSON text) when it is
+ * submitted, so a poll response body is only joined strings and cannot fail to build after its
+ * commands were marked delivered. Every deadline timer a poll needs is armed before anything
+ * changes: if arming one fails, no command of that poll is marked delivered, every one of them
+ * stays in the hand-off list (or the parked poll stays parked), and the failure surfaces to the
+ * caller. So a delivered command always has a deadline, and a command is never reported as
+ * delivered unless its poll response body exists.
  */
 
 import { constantTimeEqual } from './util.js';
@@ -23,12 +32,12 @@ import { constantTimeEqual } from './util.js';
  * @typedef {{ kind: 'offline' } | { kind: 'busy' } | { kind: 'unavailable' } | { kind: 'unknown' }
  *   | { kind: 'invalid' } | { kind: 'settled', payload: Record<string, any> }} Outcome
  * @typedef {{
- *   id: string, shardToken: string, command: Record<string, any>,
+ *   id: string, shardToken: string, command: Record<string, any>, wire: string,
  *   state: 'handoff' | 'delivered' | 'done', settleWithinMs: number,
  *   resolve: (outcome: Outcome) => void, timer: unknown, detach: () => void,
  *   onDelivered: () => void
  * }} Entry
- * @typedef {{ resolve: (commands: Record<string, any>[]) => void, timer: unknown, detach: () => void }} ParkedPoll
+ * @typedef {{ resolve: (commands: string[]) => void, timer: unknown, detach: () => void }} ParkedPoll
  * @typedef {{ setTimeout: (fn: () => void, ms: number) => unknown, clearTimeout: (id: unknown) => void }} Timers
  */
 
@@ -63,7 +72,8 @@ export class DeviceHub {
 
   /**
    * Offers a command to the phone. Resolves once the request has an outcome. `onDelivered` runs
-   * at the moment the command is placed into a poll response.
+   * at the moment the command is placed into a poll response. Throws (leaving the hub
+   * unchanged) when the command cannot be encoded or a timer cannot be armed.
    * @param {Record<string, any>} command
    * @param {{ configured: boolean, settleWithinMs: number, signal?: AbortSignal | null,
    *   onDelivered?: () => void }} options
@@ -71,47 +81,65 @@ export class DeviceHub {
    */
   submit(command, { configured, settleWithinMs, signal, onDelivered = () => {} }) {
     if (!configured || !this.isOnline()) return Promise.resolve({ kind: 'offline' });
+    // Claude already gave up (its request was aborted while it was authenticated or read):
+    // the command is never offered to the phone.
+    if (signal?.aborted) return Promise.resolve({ kind: 'unavailable' });
     if (this.entries.size >= this.maxInFlight) return Promise.resolve({ kind: 'busy' });
-    return new Promise((resolve) => {
-      /** @type {Entry} */
-      const entry = {
-        id: command.request_id,
-        shardToken: command.shard_token,
-        command,
-        state: 'handoff',
-        settleWithinMs,
-        resolve,
-        timer: undefined,
-        detach: () => {},
-        onDelivered,
-      };
-      this.entries.set(entry.id, entry);
-      const poll = this.parked;
-      if (poll) {
-        this.#endParkedPoll(poll);
-        this.#deliver(entry);
-        poll.resolve([command]);
-        return;
-      }
-      this.handoff.push(entry);
-      entry.timer = this.timers.setTimeout(() => this.#expireHandoff(entry), this.timings.handoffMs);
-      // If Claude gives up while the command still waits for a poll, it is never delivered.
-      if (signal && !signal.aborted) {
-        const onAbort = () => this.#expireHandoff(entry);
-        signal.addEventListener('abort', onAbort, { once: true });
-        entry.detach = () => signal.removeEventListener('abort', onAbort);
-      }
+    const wire = JSON.stringify(command);
+    /** @type {(outcome: Outcome) => void} */
+    let resolve = () => {};
+    /** @type {Promise<Outcome>} */
+    const outcome = new Promise((settle) => {
+      resolve = settle;
     });
+    /** @type {Entry} */
+    const entry = {
+      id: command.request_id,
+      shardToken: command.shard_token,
+      command,
+      wire,
+      state: 'handoff',
+      settleWithinMs,
+      resolve,
+      timer: undefined,
+      detach: () => {},
+      onDelivered,
+    };
+    const poll = this.parked;
+    if (poll) {
+      // Armed before anything changes: if this throws, the poll stays parked and the hub
+      // never held the command.
+      const deadline = this.#armDeadline(entry);
+      this.entries.set(entry.id, entry);
+      this.#endParkedPoll(poll);
+      this.#markDelivered(entry, deadline);
+      poll.resolve([entry.wire]);
+      return outcome;
+    }
+    entry.timer = this.timers.setTimeout(() => this.#expireHandoff(entry), this.timings.handoffMs);
+    this.entries.set(entry.id, entry);
+    this.handoff.push(entry);
+    // If Claude gives up while the command still waits for a poll, it is never delivered.
+    if (signal) {
+      const onAbort = () => this.#expireHandoff(entry);
+      signal.addEventListener('abort', onAbort, { once: true });
+      entry.detach = () => signal.removeEventListener('abort', onAbort);
+    }
+    return outcome;
   }
 
   /**
-   * A long poll from the phone. Resolves with the delivered commands (empty on timeout).
+   * A long poll from the phone. Resolves with the delivered commands in wire form (JSON text),
+   * empty on timeout. Throws (delivering nothing) when a timer cannot be armed.
    * @param {number} limit 1..8
    * @param {number} timeoutMs already capped by the caller
    * @param {AbortSignal | null} [signal]
-   * @returns {Promise<Record<string, any>[]>}
+   * @returns {Promise<string[]>}
    */
   poll(limit, timeoutMs, signal) {
+    // The phone already went away (its poll was aborted while the device key was checked): the
+    // poll is treated as never having arrived, so it takes no command and is never parked.
+    if (signal?.aborted) return Promise.resolve([]);
     // Only one parked poll at a time: a new poll ends the previous one with no commands.
     const previous = this.parked;
     if (previous) {
@@ -119,10 +147,12 @@ export class DeviceHub {
       previous.resolve([]);
     }
     if (this.handoff.length > 0) {
-      const batch = this.handoff.splice(0, limit);
-      for (const entry of batch) this.#deliver(entry);
+      const batch = this.handoff.slice(0, limit);
+      const deadlines = this.#armDeadlines(batch);
+      this.handoff.splice(0, batch.length);
+      batch.forEach((entry, index) => this.#markDelivered(entry, deadlines[index]));
       this.lastPollEndedAt = this.now();
-      return Promise.resolve(batch.map((entry) => entry.command));
+      return Promise.resolve(batch.map((entry) => entry.wire));
     }
     if (timeoutMs <= 0) {
       this.lastPollEndedAt = this.now();
@@ -136,7 +166,7 @@ export class DeviceHub {
         this.#endParkedPoll(poll);
         resolve([]);
       }, timeoutMs);
-      if (signal && !signal.aborted) {
+      if (signal) {
         const onAbort = () => {
           if (this.parked !== poll) return;
           this.#endParkedPoll(poll);
@@ -214,23 +244,69 @@ export class DeviceHub {
     };
   }
 
+  /**
+   * Clears a timer. Best effort: every timer callback checks that its target is still in the
+   * state it was armed for, so a timer that could not be cleared does nothing when it fires.
+   * @param {unknown} timer
+   */
+  #clear(timer) {
+    try {
+      this.timers.clearTimeout(timer);
+    } catch {
+      // See above.
+    }
+  }
+
   /** @param {ParkedPoll} poll */
   #endParkedPoll(poll) {
-    this.timers.clearTimeout(poll.timer);
+    this.#clear(poll.timer);
     poll.detach();
     if (this.parked === poll) this.parked = null;
     this.lastPollEndedAt = this.now();
   }
 
-  /** @param {Entry} entry */
-  #deliver(entry) {
-    this.timers.clearTimeout(entry.timer);
+  /**
+   * Arms the settle deadline of a command about to be delivered. It fires only while the entry
+   * is delivered and still holds this very timer.
+   * @param {Entry} entry
+   */
+  #armDeadline(entry) {
+    /** @type {unknown} */
+    let timer;
+    timer = this.timers.setTimeout(() => {
+      if (entry.state === 'delivered' && entry.timer === timer) this.#finish(entry, { kind: 'unknown' });
+    }, entry.settleWithinMs);
+    return timer;
+  }
+
+  /**
+   * Arms the deadlines of a whole batch, or none: on a failure the ones already armed are
+   * cleared and the error is rethrown before any entry changes.
+   * @param {Entry[]} batch
+   */
+  #armDeadlines(batch) {
+    /** @type {unknown[]} */
+    const armed = [];
+    try {
+      for (const entry of batch) armed.push(this.#armDeadline(entry));
+    } catch (error) {
+      for (const timer of armed) this.#clear(timer);
+      throw error;
+    }
+    return armed;
+  }
+
+  /**
+   * Marks an entry delivered with its already armed deadline. Nothing here can fail.
+   * @param {Entry} entry
+   * @param {unknown} deadline
+   */
+  #markDelivered(entry, deadline) {
+    this.#clear(entry.timer);
     entry.detach();
     entry.detach = () => {};
     entry.state = 'delivered';
-    entry.timer = this.timers.setTimeout(() => {
-      if (entry.state === 'delivered') this.#finish(entry, { kind: 'unknown' });
-    }, entry.settleWithinMs);
+    entry.timer = deadline;
     entry.onDelivered();
   }
 
@@ -249,7 +325,7 @@ export class DeviceHub {
   #finish(entry, outcome) {
     if (entry.state === 'done') return;
     entry.state = 'done';
-    this.timers.clearTimeout(entry.timer);
+    this.#clear(entry.timer);
     entry.detach();
     this.entries.delete(entry.id);
     entry.resolve(outcome);

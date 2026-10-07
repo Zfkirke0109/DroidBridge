@@ -6,7 +6,7 @@
  */
 
 import { TTL, refreshTokenFamily } from './grants.js';
-import { consentPage, messagePage } from './pages.js';
+import { consentPage, cspOrigin, messagePage } from './pages.js';
 import {
   constantTimeEqual,
   decodeUtf8,
@@ -75,7 +75,10 @@ export function redirectUriAllowed(uri, extraRedirectUris) {
 
 /**
  * EXTRA_REDIRECT_URIS: comma or whitespace separated absolute URIs. Only https URIs, or http on
- * a loopback host, without fragment or userinfo, are kept; anything else is ignored.
+ * localhost or 127.0.0.1, without fragment or userinfo, whose origin the consent page's CSP
+ * form-action can name (a DNS name or IPv4 address, so no IPv6 literal such as `[::1]`), are
+ * kept; anything else is ignored. A URI the browser would refuse to be redirected to after the
+ * consent form is never accepted.
  * @param {unknown} value
  */
 export function parseExtraRedirectUris(value) {
@@ -87,9 +90,9 @@ export function parseExtraRedirectUris(value) {
       if (uri.includes('#')) return false;
       try {
         const url = new URL(uri);
-        if (url.username || url.password) return false;
+        if (url.username || url.password || cspOrigin(url.origin) === null) return false;
         if (url.protocol === 'https:') return true;
-        return url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+        return url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname);
       } catch {
         return false;
       }

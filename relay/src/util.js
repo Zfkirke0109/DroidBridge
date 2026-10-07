@@ -241,7 +241,17 @@ const SECURITY_HEADERS = { 'X-Content-Type-Options': 'nosniff' };
  * @param {Record<string, string>} [headers]
  */
 export function json(status, body, headers = {}) {
-  return new Response(JSON.stringify(body), {
+  return jsonText(status, JSON.stringify(body), headers);
+}
+
+/**
+ * A JSON response from text that is already encoded.
+ * @param {number} status
+ * @param {string} body JSON text
+ * @param {Record<string, string>} [headers]
+ */
+export function jsonText(status, body, headers = {}) {
+  return new Response(body, {
     status,
     headers: {
       'Content-Type': 'application/json',

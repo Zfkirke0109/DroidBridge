@@ -1,6 +1,7 @@
 // @ts-check
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { RELAY_ANSWER_HEADER } from '../src/mcp.js';
 import {
   CLAUDE_CALLBACK,
   ORIGIN,
@@ -209,6 +210,7 @@ test('an invalid phone status code: HTTP 200 JSON-RPC error for requests, 502 fo
   assert.equal((await respond(t, command, { resp_code: 42 })).status, 200);
   const note = await notePromise;
   assert.equal(note.status, 502);
+  assert.equal(note.headers.get(RELAY_ANSWER_HEADER), '1', 'a deliberate 502 the Worker passes through');
   assert.equal(await note.text(), '');
 });
 
@@ -250,12 +252,21 @@ test('a request reply without a JSON-RPC response for the same id is an invalid 
     { resp_json: { jsonrpc: '2.0', id: 3 } }, // neither result nor error
     { resp_json: { jsonrpc: '2.0', id: 3, result: {}, error: { code: -1, message: 'x' } } }, // both
     { resp_json: { jsonrpc: '2.0', id: 3, error: 'boom' } },
+    { resp_json: { jsonrpc: '2.0', id: 3, error: null } },
+    { resp_json: { jsonrpc: '2.0', id: 3, error: [] } },
     { resp_json: { jsonrpc: '2.0', id: 3, error: { code: 1.5, message: 'x' } } },
     { resp_json: { jsonrpc: '2.0', id: 3, error: { code: -1 } } },
     { resp_code: 204 }, // a valid body in a status that cannot carry one
     { resp_code: 205 },
     { resp_code: 304 },
     { resp_type: 'notify_ack', resp_json: undefined },
+    // An error status changes nothing: the reply still has to be a response to the request.
+    { resp_code: 500, resp_json: undefined },
+    { resp_code: 500, resp_json: null },
+    { resp_code: 502, resp_json: 'Bad Gateway' },
+    { resp_code: 503, resp_json: { jsonrpc: '2.0', id: 4, error: { code: -32000, message: 'Runtime unavailable' } } },
+    { resp_code: 500, resp_json: { jsonrpc: '2.0', id: 3, error: null } },
+    { resp_code: 404, resp_json: { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'x' } } },
   ];
   for (const overrides of invalid) {
     const label = JSON.stringify(overrides);
@@ -295,6 +306,8 @@ test('valid JSON-RPC replies pass through with the phone status, whatever it is'
     const { ack, answer } = await roundTrip(t, token, request, { resp_json: reply, resp_code: status });
     assert.equal(ack.status, 200);
     assert.equal(answer.status, status);
+    // The phone's own status is a deliberate answer, so the Worker passes it through.
+    assert.equal(answer.headers.get(RELAY_ANSWER_HEADER), '1');
     assert.deepEqual(await answer.json(), reply);
   }
   // A notification needs no body: a valid status passes through without one.

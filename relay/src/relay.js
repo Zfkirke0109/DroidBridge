@@ -49,16 +49,25 @@ function parsePublicOrigin(value) {
   }
 }
 
+/**
+ * RESPONSE_TIMEOUT_SECONDS as whole seconds clamped to 10..900. Any number is clamped (rounded
+ * to whole seconds first); only a value that is not a number at all falls back to the default.
+ * @param {unknown} value
+ */
+function parseResponseTimeout(value) {
+  const raw = String(value ?? '').trim();
+  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(raw)) return DEFAULT_RESPONSE_TIMEOUT_SECONDS;
+  return Math.min(900, Math.max(10, Math.round(Number(raw))));
+}
+
 /** @param {Env} env */
 export function readConfig(env) {
   const deviceKeyHash = typeof env.DEVICE_KEY_SHA256 === 'string' ? env.DEVICE_KEY_SHA256.trim() : '';
-  const rawTimeout = String(env.RESPONSE_TIMEOUT_SECONDS ?? '').trim();
-  const timeout = /^\d{1,6}$/.test(rawTimeout) ? Number(rawTimeout) : DEFAULT_RESPONSE_TIMEOUT_SECONDS;
   const hosts = typeof env.CIMD_ALLOWED_HOSTS === 'string' ? env.CIMD_ALLOWED_HOSTS : 'claude.ai,claude.com';
   return {
     deviceKeyHash,
     deviceKeyConfigured: /^[0-9a-f]{64}$/.test(deviceKeyHash),
-    responseTimeoutSeconds: Math.min(900, Math.max(10, timeout)),
+    responseTimeoutSeconds: parseResponseTimeout(env.RESPONSE_TIMEOUT_SECONDS),
     cimdHosts: hosts
       .split(',')
       .map((host) => host.trim().toLowerCase())

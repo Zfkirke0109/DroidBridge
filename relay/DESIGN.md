@@ -45,9 +45,16 @@ has no body to carry an error, so an invalid device reply to one is answered 502
    `data.droidbridge_relay` is `{"state":"offline","delivered":false}`. Nothing is queued.
 2. **Hand-off window.** If the phone is online but between polls, the request waits at most 5 s
    for the next poll. If none comes it is dropped from memory and answered like rule 1
-   (`"state":"unavailable","delivered":false`). It can never be delivered later.
+   (`"state":"unavailable","delivered":false`). It can never be delivered later. The same
+   happens at once when Claude gives up first: a request whose connection is aborted before a
+   poll takes it (even one already aborted when it reaches the hand-off) is never delivered.
 3. **Exactly one delivery.** A command is handed to exactly one poll response, then removed from
-   the hand-off list. A later poll never sees it again.
+   the hand-off list. A later poll never sees it again. A command counts as delivered only
+   together with the poll response body that carries it: each command is encoded when it is
+   accepted, and a poll either takes its commands with every deadline armed, or fails (HTTP 500
+   to the phone) without marking any of them delivered, leaving them in the hand-off list (or
+   the parked poll parked). A phone poll whose connection dropped, or was already gone when it
+   reached the relay, stops counting as a waiting poll and is never handed a command.
 4. **Unknown settlement is final.** If the phone does not post a response before the command's
    deadline (`response_timeout` + 5 s grace), the relay answers HTTP 200 with a JSON-RPC error
    (`code -32002`, `data.droidbridge_relay` = `{"state":"settlement_unknown","delivered":true,
@@ -65,8 +72,9 @@ has no body to carry an error, so an invalid device reply to one is answered 502
      hand-off list is withdrawn first, so it can never be delivered later.
    - `true`: the command had been placed into a poll response. The relay stops waiting for it,
      so a late reply from the phone gets 404.
-   - `null`: the Worker cannot tell, because the Durable Object threw or answered with a 5xx it
-     did not mark as its own.
+   - `null`: the Worker cannot tell, because the Durable Object threw, answered with a 5xx it
+     did not mark as its own, or its answer broke off before the Worker had read all of it (the
+     Worker reads the whole answer before passing it on, so Claude never gets a truncated 200).
 
    The Durable Object marks every POST /mcp answer it makes on purpose with the internal header
    `X-DroidBridge-Relay-Answer`, which the Worker removes before the answer reaches Claude. The
@@ -74,6 +82,11 @@ has no body to carry an error, so an invalid device reply to one is answered 502
    notification's 502 for an invalid device reply, or the phone's own status on a valid reply
    (the phone, not the relay, reports that outcome). Any other 5xx on POST /mcp, and a failed
    call to the object, becomes the `D = null` answer above.
+
+Seeing that Claude or the phone went away relies on `request.signal`. Cloudflare aborts it on a
+client disconnect only with the `enable_request_signal` compatibility flag, which has no
+default-on date, so `wrangler.toml` sets it. The Worker hands the Durable Object the incoming
+request itself, so its signal travels with it.
 
 ### Device protocol (`droidbridge-relay/1`)
 
@@ -91,7 +104,9 @@ Device key format: `dbrk_` followed by 43 base64url characters (32 random bytes)
 | `DELETE /device/v1/pairing` | cancel the pairing code | 204 |
 | `POST /device/v1/revoke` | revoke every Claude grant: tokens, codes, pending consents, registered clients, pairing | 200 `{"revoked_tokens":N}` |
 
-A wrong or missing device key is 401 on every device route. Shard-token mismatches are 404, never
+A device route answers 500 when the relay itself fails; a poll that fails this way has
+delivered none of the commands it would have carried. A wrong or missing device key is 401 on
+every device route. Shard-token mismatches are 404, never
 401/403, because the tunnel client treats 401/403 as "operator action needed" and stops.
 
 Command shape (one element of `commands`):
@@ -137,7 +152,14 @@ forwarded; in particular `Authorization`, cookies and `Mcp-Session-Id` are not.
 ### Claude side: MCP endpoint
 
 `POST /mcp` only (GET/DELETE → 405 with `Allow: POST`). Body ≤ 262 144 bytes (413), JSON object
-(400), `Content-Type: application/json` (415). At most 16 requests in flight (429, not delivered).
+(400), `Content-Type: application/json` (415). The phone's JSON parser must be able to read the
+message as the relay re-encodes it into a poll response, or it would drop that whole response
+with every other command in it, so the relay also refuses, before delivery: nesting of objects
+and arrays deeper than 64 levels (the message object is level 1; the phone stops at 128 for the
+whole poll response) and any string or member name holding an unpaired UTF-16 surrogate, such as
+a cut emoji `"\ud83d"` (400, JSON-RPC `-32600` with the request's `id`, or an empty 400 for a
+notification), and a message larger than 262 144 bytes once re-encoded, which can happen to
+numbers such as `1e20` (413, same shape). At most 16 requests in flight (429, not delivered).
 These pre-delivery answers (401, 405, 413, 415, 400, 429) and the not-delivered 503 of settlement
 rules 1 and 2 keep their status codes; every other failure follows settlement rule 6.
 
@@ -170,7 +192,10 @@ Follows the MCP 2026-07-28 authorization spec.
   policy, at most 20 registrations per hour and 100 stored clients.
 - **Redirect policy** (applies to both): exactly `https://claude.ai/api/mcp/auth_callback`,
   `https://claude.com/api/mcp/auth_callback`, loopback `http://localhost:<port>/callback` or
-  `http://127.0.0.1:<port>/callback` (Claude Code), or an exact URI in `EXTRA_REDIRECT_URIS`.
+  `http://127.0.0.1:<port>/callback` (Claude Code), or an exact URI in `EXTRA_REDIRECT_URIS`
+  (https, or http on `localhost` or `127.0.0.1`, with a host the consent page's CSP can name: a
+  DNS name or IPv4 address, never an IPv6 literal such as `[::1]`, which the CSP grammar cannot
+  express; any other entry is ignored).
   An invalid `client_id` or `redirect_uri` is shown as an error page and never redirected to.
 - **Consent requires the phone.** `GET /authorize` validates `response_type=code`, PKCE `S256`
   (`code_challenge` 43–128 chars), `resource` (if present, must be `<origin>/mcp`) and `scope`
@@ -180,14 +205,17 @@ Follows the MCP 2026-07-28 authorization spec.
   is invalidated after 5 wrong attempts across all consent requests. Each consent request is
   discarded after 3 failed attempts, and at most 10 requests per client (50 in all) wait at once.
   The page answers a wrong code and a missing or expired pairing code identically, so it never
-  reveals whether a pairing is active. Only its SHA-256 (of the normalized uppercase code
-  without the dash) ever reaches the relay. The page sends `Content-Security-Policy` with
+  reveals whether a pairing is active. The phone sends the relay only the code's SHA-256 (of
+  the normalized uppercase code without the dash), and that hash is all the relay stores. The
+  code itself reaches the relay only as typed into the consent form, which the relay hashes to
+  compare and never stores or logs. The page sends `Content-Security-Policy` with
   `frame-ancestors 'none'` and a `form-action` limited to `'self'` and the redirect origin, plus
   `X-Frame-Options: DENY` and `Cache-Control: no-store`.
 - `POST /authorize` with the stored request id and the code: on success the pairing code is
   consumed and the browser is redirected to `redirect_uri` with `code`, `state` and
   `iss=<origin>`. Authorization codes: 256-bit, 60 s, single use; a replayed code revokes every
-  token issued from it.
+  token issued from it, however late it comes: a redeemed code's hash is kept for as long as
+  the grant it started exists (an unredeemed one for 10 minutes after it expires).
 - `POST /token` (form-encoded): `authorization_code` (PKCE S256 check, same `client_id`,
   `redirect_uri` and `resource`) and `refresh_token` (rotation; reusing a rotated refresh token
   revokes its whole family). `Cache-Control: no-store`. Only SHA-256 hashes of tokens and codes

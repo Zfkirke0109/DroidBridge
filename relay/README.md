@@ -90,14 +90,19 @@ yourself by connecting Claude: whoever started the flow receives the access.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `RESPONSE_TIMEOUT_SECONDS` | `240` | How long the phone may take to answer one request (clamped to 10..900). |
+| `RESPONSE_TIMEOUT_SECONDS` | `240` | How long the phone may take to answer one request, in seconds. Any number is rounded and clamped to 10..900; a value that is not a number means 240. |
 | `CIMD_ALLOWED_HOSTS` | `claude.ai,claude.com` | Hosts whose client ID metadata documents the relay will fetch. Empty disables URL client IDs. |
-| `EXTRA_REDIRECT_URIS` | empty | Extra exact OAuth redirect URIs to allow, comma separated (https, or http on a loopback host). |
+| `EXTRA_REDIRECT_URIS` | empty | Extra exact OAuth redirect URIs to allow, comma separated: https, or http on `localhost` or `127.0.0.1`. The host must be a DNS name or IPv4 address, not an IPv6 literal such as `[::1]`, because the consent page's Content-Security-Policy cannot name one. Other entries are ignored. |
 | `PUBLIC_ORIGIN` | empty | The public origin, such as `https://relay.example.com`. Empty means the origin each request arrived on. |
 | `DEVICE_KEY_SHA256` | (secret) | SHA-256 of the device key, 64 lowercase hex. Set with `wrangler secret put`, never in the file. |
 
 Tokens are bound to `<origin>/mcp`. If you add a custom domain, set `PUBLIC_ORIGIN` to it, so the
 relay does not issue tokens for one hostname that the other rejects.
+
+`wrangler.toml` also sets the `enable_request_signal` compatibility flag. Keep it: without it
+Cloudflare never tells the relay that Claude or the phone disconnected, so a request Claude gave
+up on could still reach the phone, and a phone poll whose connection dropped would keep counting
+as online for up to 25 seconds.
 
 ## Security notes
 
@@ -119,7 +124,8 @@ forwarded. Claude never sees the device key.
 (`dbra_…`) last 1 hour and refresh tokens (`dbrr_<grant id>.<secret>`) 30 days. Refresh tokens
 rotate on every use; presenting any rotated refresh token, however old, revokes the whole grant
 (each refresh token names its grant, so this holds even after the relay has deleted the old
-token's record), and so does presenting an authorization code a second time.
+token's record), and so does presenting an authorization code a second time, however late (the
+relay keeps a redeemed code's hash for as long as the grant it started exists).
 Redirects go only to Claude's callbacks, Claude Code's loopback `http://localhost:<port>/callback`
 or `http://127.0.0.1:<port>/callback`, or URIs you list in `EXTRA_REDIRECT_URIS`. An unknown
 client or redirect URI gets an error page and is never redirected to. The consent page sends a
@@ -150,21 +156,27 @@ outcomes:
 
 A request counts as handed to the phone the moment it is placed into a poll response. If the
 phone's connection drops at that moment, the outcome is unknown, never "retried". If the relay
-itself fails while handling a request (a storage error, a bug, the Durable Object being reset),
-Claude also gets HTTP 200 with a JSON-RPC `-32002` error, never a 5xx; a notification gets an
-empty HTTP 200. The error's `delivered` field says what is known: `false` means the request never
-reached the phone (one still waiting for a poll is withdrawn, so it cannot arrive later), `true`
-means it was handed to the phone and may or may not have run, and `null` means the Worker could
-not tell because the Durable Object itself failed. Whether to send the request again is left to
-you or the model.
+fails while building a poll response, none of the requests it would have carried count as handed
+over: they keep waiting for the next poll, or end as unavailable. A request Claude gives up on
+before a poll takes it is dropped and never reaches the phone. If the relay itself fails while
+handling a request (a storage error, a bug, the Durable Object being reset), Claude also gets HTTP
+200 with a JSON-RPC `-32002` error, never a 5xx; a notification gets an empty HTTP 200. The error's
+`delivered` field says what is known: `false` means the request never reached the phone (one still
+waiting for a poll is withdrawn, so it cannot arrive later), `true` means it was handed to the
+phone and may or may not have run, and `null` means the Worker could not tell because the Durable
+Object itself failed (including an answer that broke off while the Worker was reading it). Whether
+to send the request again is left to you or the model.
 
 Requests in flight live only in the Durable Object's memory. If Cloudflare restarts the object,
 those requests fail and are not replayed. OAuth state lives in the object's storage and survives.
 
-**Limits.** MCP request bodies up to 256 KiB, phone responses up to 13,048,576 bytes (the
-phone's 12,000,000-byte MCP response limit plus 1 MiB of envelope; a larger reply is refused and
-Claude gets the invalid-reply error at once), 20 client registrations per hour, 100 registered
-clients, 50 waiting consent requests (10 per client).
+**Limits.** MCP request bodies up to 256 KiB (also once re-encoded for the phone), nested at most
+64 levels deep, with no unpaired UTF-16 surrogate escape (such as a cut emoji `\ud83d`) in any
+string. The phone could not read anything else, and would drop every other request sent in the same
+poll response with it, so the relay refuses it with HTTP 400 or 413 before delivery. Phone
+responses up to 13,048,576 bytes (the phone's 12,000,000-byte MCP response limit plus 1 MiB of
+envelope; a larger reply is refused and Claude gets the invalid-reply error at once), 20 client
+registrations per hour, 100 registered clients, 50 waiting consent requests (10 per client).
 
 ## Costs
 

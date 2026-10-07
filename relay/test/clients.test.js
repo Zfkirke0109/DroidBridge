@@ -3,6 +3,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { cimdUrlProblem, parseExtraRedirectUris, redirectUriAllowed } from '../src/oauth.js';
+import { cspOrigin } from '../src/pages.js';
 import {
   CLAUDE_CALLBACK,
   authorizeGet,
@@ -268,6 +269,36 @@ test('redirect policy: EXTRA_REDIRECT_URIS allows exact extra URIs only', async 
   assert.equal((await register(t, { redirect_uris: ['https://inspector.example/oauth/callback'] })).status, 201);
   assert.equal((await register(t, { redirect_uris: ['https://inspector.example/oauth/callback2'] })).status, 400);
   assert.equal((await register(t, { redirect_uris: ['javascript:alert(1)'] })).status, 400);
+});
+
+test('redirect policy: EXTRA_REDIRECT_URIS keeps only URIs whose origin the consent page CSP can name', async () => {
+  const t = makeRelay({
+    env: {
+      EXTRA_REDIRECT_URIS:
+        'http://[::1]:8080/callback https://[2001:db8::1]/cb https://a_b.example/cb http://192.168.1.5/cb ' +
+        'https://inspector.example:8443/oauth/callback http://127.0.0.1:9000/cb',
+    },
+  });
+  assert.deepEqual(t.relay.config.extraRedirectUris, [
+    'https://inspector.example:8443/oauth/callback',
+    'http://127.0.0.1:9000/cb',
+  ]);
+  // A URI the browser could never be redirected to after the consent form is refused up front.
+  for (const uri of ['http://[::1]:8080/callback', 'https://[2001:db8::1]/cb', 'https://a_b.example/cb']) {
+    const res = await register(t, { redirect_uris: [uri] });
+    assert.equal(res.status, 400, uri);
+    assert.equal((await res.json()).error, 'invalid_redirect_uri', uri);
+  }
+  // Every accepted one gets its origin into form-action.
+  for (const uri of t.relay.config.extraRedirectUris) {
+    const client = await (await register(t, { redirect_uris: [uri] })).json();
+    const page = await authorizeGet(t, cimdParams(client.client_id, uri));
+    assert.equal(page.status, 200, uri);
+    assert.match(page.headers.get('content-security-policy') ?? '', new RegExp(`form-action 'self' ${new URL(uri).origin};`));
+  }
+  assert.equal(cspOrigin('http://[::1]:8080'), null);
+  assert.equal(cspOrigin('https://a.example:8443'), 'https://a.example:8443');
+  assert.equal(cspOrigin(undefined), null);
 });
 
 test('redirect policy unit checks', () => {

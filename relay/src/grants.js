@@ -6,7 +6,8 @@
  * Keys (Durable Object storage):
  *   pairing               { hash, expiresAt, attempts }
  *   pending:<sha256(id)>  pending consent request, 10 min
- *   code:<sha256(code)>   authorization code, 60 s (kept 10 more minutes for reuse detection)
+ *   code:<sha256(code)>   authorization code, 60 s (kept 10 more minutes for reuse detection,
+ *                         and once redeemed for as long as the grant it started exists)
  *   at:<sha256(token)>    access token { family, client_id, resource, scope, expiresAt }
  *   rt:<sha256(token)>    refresh token { family, client_id, used, expiresAt }; the token
  *                         itself is dbrr_<family id>.<secret> so reuse survives trimming
@@ -206,16 +207,24 @@ export class GrantStore {
   /** Deletes every expired record. Bounded by the collection caps above. */
   async sweep() {
     const now = this.now();
-    for (const prefix of EXPIRING_PREFIXES) {
-      for (const [key, record] of await this.storage.list({ prefix })) {
-        const until = record?.purgeAt ?? record?.expiresAt;
-        if (typeof until !== 'number' || until <= now) await this.storage.delete(key);
-      }
-    }
+    // Families first, so the codes of a grant that ends here are purged in the same sweep.
     for (const [key, family] of await this.storage.list({ prefix: 'family:' })) {
       if (family && typeof family.expiresAt === 'number' && family.expiresAt > now) continue;
       if (family?.id) await this.revokeFamily(family.id);
       await this.storage.delete(key);
+    }
+    for (const prefix of EXPIRING_PREFIXES) {
+      for (const [key, record] of await this.storage.list({ prefix })) {
+        const until = record?.purgeAt ?? record?.expiresAt;
+        if (typeof until === 'number' && until > now) continue;
+        // A redeemed code's hash is kept while the grant it started exists, so replaying the
+        // code revokes that grant however late the replay comes. Once the grant is gone there
+        // is nothing left to revoke, and the record goes too.
+        if (prefix === 'code:' && typeof record?.family === 'string' && (await this.storage.get(`family:${record.family}`))) {
+          continue;
+        }
+        await this.storage.delete(key);
+      }
     }
     const pairing = await this.storage.get('pairing');
     if (pairing && pairing.expiresAt <= now) await this.storage.delete('pairing');

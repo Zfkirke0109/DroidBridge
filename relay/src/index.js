@@ -56,7 +56,7 @@ export default {
  * settlement (HTTP 200, JSON-RPC -32002, delivered null) instead of a 5xx an HTTP client might
  * replay. If the object cannot even be addressed, the request provably went nowhere (delivered
  * false). The object's deliberate answers, including its 503 for "not delivered", pass through
- * with the internal marker removed.
+ * with the internal marker removed, once their body has been read in full.
  * @param {WorkerEnv} env
  * @param {Request} request
  */
@@ -69,21 +69,29 @@ async function forwardMcp(env, request) {
     return relayFailure(copy, false);
   }
   let response;
+  /** @type {ArrayBuffer} */
+  let body;
   try {
     response = await stub.fetch(request);
+    if (response.status >= 500 && !response.headers.has(RELAY_ANSWER_HEADER)) {
+      response.body?.cancel().catch(() => {});
+      return relayFailure(copy, null);
+    }
+    // The whole answer is read here, inside the failure handling: a body that breaks off after
+    // the status (the object reset while sending a large phone reply) becomes the final
+    // -32002 answer, never a truncated 200 that is not a JSON-RPC response.
+    body = await response.arrayBuffer();
   } catch {
     return relayFailure(copy, null);
   }
-  const deliberate = response.headers.has(RELAY_ANSWER_HEADER);
-  if (response.status >= 500 && !deliberate) {
-    response.body?.cancel().catch(() => {});
-    return relayFailure(copy, null);
-  }
   copy.body?.cancel().catch(() => {});
-  if (!deliberate) return response;
   const headers = new Headers(response.headers);
   headers.delete(RELAY_ANSWER_HEADER);
-  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  return new Response(body.byteLength > 0 ? body : null, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 /**

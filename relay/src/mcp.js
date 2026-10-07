@@ -21,6 +21,14 @@ import {
 
 export const MCP_BODY_LIMIT_BYTES = 262_144;
 /**
+ * Deepest nesting of objects and arrays accepted in a message, counting the message object
+ * itself as level 1. The phone's JSON parser (serde_json) refuses a poll response nested more
+ * than 128 levels in all, and the poll envelope adds 3, so this keeps a wide margin.
+ */
+export const MCP_MAX_DEPTH = 64;
+/** An unpaired UTF-16 surrogate: in `u` mode a correctly paired one matches as one code point. */
+const LONE_SURROGATE = /\p{Cs}/u;
+/**
  * Set by the Durable Object on every POST /mcp answer it makes on purpose, so the Worker can
  * tell a deliberate status (503 offline, a notification's 502, the phone's own 5xx) from a
  * failure. Internal: the Worker removes it before the answer reaches Claude.
@@ -144,6 +152,14 @@ export async function handleMcp(relay, request, origin, progress = mcpProgress()
   ) {
     return json(400, rpcError(null, -32600, 'Invalid Request: expected a JSON-RPC 2.0 request or notification.'));
   }
+  // The phone must be able to read the message as the relay re-encodes it, or it would drop the
+  // whole poll response carrying it, together with every other command in that response.
+  const unreadable = phoneUnreadableReason(message);
+  if (unreadable) return isRequest ? json(400, rpcError(id, -32600, `Invalid Request: ${unreadable}`)) : empty(400);
+  if (encoder.encode(JSON.stringify(message)).byteLength > MCP_BODY_LIMIT_BYTES) {
+    const tooLarge = `The request is larger than ${MCP_BODY_LIMIT_BYTES} bytes once encoded for the phone.`;
+    return isRequest ? json(413, rpcError(id, -32600, tooLarge)) : empty(413);
+  }
   progress.message = message;
 
   // 3. Forward only the allowlisted headers, in canonical case.
@@ -182,6 +198,39 @@ export async function handleMcp(relay, request, origin, progress = mcpProgress()
     },
   });
   return outcomeResponse(outcome, isRequest, id);
+}
+
+/**
+ * Why the phone could not parse this message once the relay encodes it into a poll response,
+ * or null when it can. JSON.parse accepts both cases, the phone's serde_json refuses them:
+ * nesting deeper than MCP_MAX_DEPTH (serde_json stops at 128 levels for the whole poll
+ * response), and a string or key holding an unpaired UTF-16 surrogate, such as a cut emoji
+ * "\ud83d" (JSON.stringify writes it back as that escape, which serde_json rejects). Walks the
+ * value without recursion, so any depth JSON.parse produced is safe to inspect.
+ * @param {unknown} message
+ * @returns {string | null}
+ */
+export function phoneUnreadableReason(message) {
+  /** @type {[unknown, number][]} */
+  const stack = [[message, 1]];
+  while (stack.length > 0) {
+    const [value, depth] = /** @type {[unknown, number]} */ (stack.pop());
+    if (typeof value === 'string') {
+      if (LONE_SURROGATE.test(value)) return 'a string contains an unpaired UTF-16 surrogate.';
+      continue;
+    }
+    if (typeof value !== 'object' || value === null) continue;
+    if (depth > MCP_MAX_DEPTH) return `the message is nested more than ${MCP_MAX_DEPTH} levels deep.`;
+    if (Array.isArray(value)) {
+      for (const item of value) stack.push([item, depth + 1]);
+      continue;
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (LONE_SURROGATE.test(key)) return 'a member name contains an unpaired UTF-16 surrogate.';
+      stack.push([item, depth + 1]);
+    }
+  }
+  return null;
 }
 
 /**

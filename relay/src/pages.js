@@ -64,10 +64,13 @@ ${body}
 }
 
 /**
- * Only a plain http(s) origin may appear in the CSP form-action list.
+ * The origin as a CSP source expression, or null when CSP cannot name it. Only a plain http(s)
+ * origin whose host is a DNS name or IPv4 address qualifies: the CSP host-source grammar has no
+ * IPv6 literals (such as `[::1]`) or other host characters. The redirect policy accepts only
+ * redirect URIs whose origin qualifies, so the consent form can always reach its redirect.
  * @param {string | undefined} origin
  */
-function cspOrigin(origin) {
+export function cspOrigin(origin) {
   return origin && /^https?:\/\/[A-Za-z0-9.\-]+(?::\d{1,5})?$/.test(origin) ? origin : null;
 }
 

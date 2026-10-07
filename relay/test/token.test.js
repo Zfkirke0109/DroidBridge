@@ -116,6 +116,53 @@ test('code reuse revokes the family issued from it', async () => {
   assert.equal((await refresh.json()).error, 'invalid_grant');
 });
 
+test('a replayed code still revokes its grant long after the code expired, for as long as the grant exists', async () => {
+  const t = makeRelay();
+  const grant = await obtainCode(t);
+  const first = await tokenPost(t, codeExchange(grant));
+  assert.equal(first.status, 200);
+  const tokens = await first.json();
+  // Well past the code's 60 s life and 10 minute retention; every /token call sweeps first.
+  await t.clock.advance(12 * 60 * 1000);
+  await t.clock.advance(20 * 24 * 60 * 60 * 1000);
+  const refreshed = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: grant.clientId });
+  assert.equal(refreshed.status, 200);
+  const current = await refreshed.json();
+  assert.ok(await tokenWorks(t, current.access_token));
+  assert.equal(t.storage.keys('code:').length, 1, 'the redeemed code is kept while its grant exists');
+  const replay = await tokenPost(t, codeExchange(grant));
+  assert.equal(replay.status, 400);
+  const error = await replay.json();
+  assert.equal(error.error, 'invalid_grant');
+  assert.match(error.error_description, /already used\. Tokens issued from it were revoked/);
+  assert.equal(await tokenWorks(t, current.access_token), false, 'the grant is revoked');
+  const refresh = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: current.refresh_token, client_id: grant.clientId });
+  assert.equal(refresh.status, 400);
+  // With the grant gone nothing is left to revoke, and the code record is purged.
+  await t.clock.advance(61_000);
+  await tokenPost(t, { grant_type: 'refresh_token', refresh_token: 'x', client_id: grant.clientId });
+  assert.equal(t.storage.keys('code:').length, 0);
+});
+
+test('a redeemed code is purged once its grant expires; an unredeemed one after its retention', async () => {
+  const t = makeRelay();
+  const redeemed = await obtainCode(t);
+  assert.equal((await tokenPost(t, codeExchange(redeemed))).status, 200);
+  const unused = await obtainCode(t, { pairingCode: 'QQQQ2222' });
+  assert.ok(unused.code);
+  assert.equal(t.storage.keys('code:').length, 2);
+  await t.clock.advance(11 * 60 * 1000);
+  await t.relay.maybeSweep();
+  assert.equal(t.storage.keys('code:').length, 1, 'the unredeemed code is gone after its retention');
+  await t.clock.advance(30 * 24 * 60 * 60 * 1000);
+  await t.relay.maybeSweep();
+  assert.equal(t.storage.keys('family:').length, 0);
+  assert.equal(t.storage.keys('code:').length, 0, 'the redeemed code goes with its grant');
+  const replay = await tokenPost(t, codeExchange(redeemed));
+  assert.equal(replay.status, 400);
+  assert.equal((await replay.json()).error_description, 'The authorization code is not valid.');
+});
+
 test('refresh rotation issues new tokens and retires the old refresh token', async () => {
   const t = makeRelay();
   const tokens = await obtainTokens(t);

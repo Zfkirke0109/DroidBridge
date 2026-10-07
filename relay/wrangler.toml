@@ -1,6 +1,11 @@
 name = "droidbridge-relay"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
+# Required: without it Cloudflare never aborts request.signal when a client disconnects (the flag
+# has no default-on date). The relay relies on that signal to drop a Claude request that gives up
+# while it still waits for a poll (so it can never run after Claude stopped waiting) and to stop
+# counting a phone poll whose connection dropped as a waiting poll (so no request is handed to it).
+compatibility_flags = ["enable_request_signal"]
 
 # One Durable Object instance ("relay") holds the phone's parked poll, the hand-off list and
 # the OAuth state. SQLite-backed Durable Objects are available on the Workers free plan.
@@ -13,11 +18,13 @@ tag = "v1"
 new_sqlite_classes = ["RelayObject"]
 
 [vars]
-# Seconds the phone may take to answer one request (clamped to 10..900).
+# Seconds the phone may take to answer one request (any number is rounded and clamped to
+# 10..900; a value that is not a number means 240).
 RESPONSE_TIMEOUT_SECONDS = "240"
 # Hosts whose client ID metadata documents may be fetched.
 CIMD_ALLOWED_HOSTS = "claude.ai,claude.com"
-# Extra exact redirect URIs to allow, comma separated (https, or http on a loopback host).
+# Extra exact redirect URIs to allow, comma separated (https, or http on localhost or 127.0.0.1;
+# the host must be a DNS name or IPv4 address, not an IPv6 literal such as [::1]).
 EXTRA_REDIRECT_URIS = ""
 # The public origin, e.g. "https://relay.example.com". Empty means the origin of each request.
 PUBLIC_ORIGIN = ""

@@ -4,8 +4,9 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import worker, { RelayObject, isRelayRoute } from '../src/index.js';
-import { RELAY_ANSWER_HEADER } from '../src/mcp.js';
+import { RELAY_ANSWER_HEADER, outcomeResponse } from '../src/mcp.js';
 import { constantTimeEqual, normalizePairingCode, normalizeResource } from '../src/util.js';
 import { MemoryStorage, deviceFetch, mcp, newDeviceKey, obtainTokens, poll, respond, toolsCall, waitFor } from './helpers.js';
 
@@ -380,4 +381,117 @@ test('real RelayObject: failures after delivery answer POST /mcp with HTTP 200 -
   assert.ok(errors.some((error) => error instanceof RangeError), 'the failure is reported');
   assert.equal((await respond(t, command)).status, 404, 'settled: a later reply is 404');
   assert.equal(t.relay.hub.inspect().inFlight, 0);
+});
+
+test('wrangler.toml enables request.signal, which Cloudflare aborts on a client disconnect only with that flag', () => {
+  const toml = readFileSync(fileURLToPath(new URL('../wrangler.toml', import.meta.url)), 'utf8');
+  const line = /^compatibility_flags\s*=\s*\[([^\]]*)\]\s*$/m.exec(toml);
+  assert.ok(line, 'compatibility_flags is set');
+  const flags = line[1].split(',').map((flag) => flag.trim().replace(/^"|"$/g, ''));
+  assert.ok(flags.includes('enable_request_signal'), flags.join(','));
+});
+
+test('the Worker hands the object the request itself, so its abort signal reaches the object', async () => {
+  /** @type {Request[]} */
+  const received = [];
+  const stub = {
+    /** @param {Request} request */
+    fetch: async (request) => {
+      received.push(request);
+      return new Response(null, { status: 204, headers: { [RELAY_ANSWER_HEADER]: '1' } });
+    },
+  };
+  const env = { RELAY: { idFromName: () => ({}), get: () => stub } };
+  const controllers = [new AbortController(), new AbortController()];
+  const mcpRequest = new Request('https://relay.example/mcp', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: '{"jsonrpc":"2.0","method":"notifications/initialized"}',
+    signal: controllers[0].signal,
+  });
+  const pollRequest = new Request('https://relay.example/device/v1/poll', { signal: controllers[1].signal });
+  const passed = await worker.fetch(mcpRequest, env);
+  assert.equal(passed.status, 204, 'a marked 204 passes through');
+  assert.equal(await passed.text(), '');
+  await worker.fetch(pollRequest, env);
+  assert.equal(received.length, 2);
+  for (const request of received) assert.equal(request.signal.aborted, false);
+  for (const controller of controllers) controller.abort();
+  for (const request of received) assert.equal(request.signal.aborted, true);
+});
+
+test('a marked answer whose body breaks off is a final HTTP 200 -32002 delivered:null, never a truncated 200', async () => {
+  const brokenAnswer = () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"jsonrpc":"2.0","id":"x","result":{"text":"aaaa'));
+          controller.error(new Error('Durable Object reset because its code was updated.'));
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json', [RELAY_ANSWER_HEADER]: '1' } },
+    );
+  const env = answeringNamespace(brokenAnswer);
+  const res = await worker.fetch(mcpPost('{"jsonrpc":"2.0","id":"x","method":"tools/call"}'), env);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.id, 'x');
+  assert.equal(body.error.code, -32002);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: null, retried: false });
+  assert.equal(res.headers.get(RELAY_ANSWER_HEADER), null);
+  const note = await worker.fetch(mcpPost('{"jsonrpc":"2.0","method":"notifications/initialized"}'), env);
+  assert.equal(note.status, 200);
+  assert.equal(await note.text(), '');
+  // An unmarked answer that breaks off is treated the same way.
+  const unmarked = answeringNamespace(() => {
+    const response = brokenAnswer();
+    const headers = new Headers(response.headers);
+    headers.delete(RELAY_ANSWER_HEADER);
+    return new Response(response.body, { status: 200, headers });
+  });
+  const plain = await (await worker.fetch(mcpPost('{"jsonrpc":"2.0","id":"y","method":"tools/call"}'), unmarked)).json();
+  assert.equal(plain.id, 'y');
+  assert.equal(plain.error.data.droidbridge_relay.delivered, null);
+});
+
+test('real RelayObject: the phone\'s own 5xx and a notification\'s 502 pass through the Worker as deliberate answers', async () => {
+  const { t } = realDeployment();
+  const { access_token: token } = await obtainTokens(t);
+  /** @param {unknown} message @param {Record<string, unknown>} overrides */
+  const roundTrip = async (message, overrides) => {
+    const pollPromise = poll(t);
+    await waitFor(() => t.relay.hub.inspect().parked);
+    const answer = mcp(t, token, message);
+    const [command] = (await (await pollPromise).json()).commands;
+    assert.equal((await respond(t, command, overrides)).status, 200);
+    return answer;
+  };
+  for (const [id, code, status] of /** @type {[number, number, number][]} */ ([[5, -32603, 500], [6, -32000, 503], [7, -32001, 504]])) {
+    const reply = { jsonrpc: '2.0', id, error: { code, message: 'MCP request failed' } };
+    const res = await roundTrip(toolsCall(id), { resp_json: reply, resp_code: status });
+    assert.equal(res.status, status);
+    assert.deepEqual(await relayData(res), reply, 'the phone\'s answer reaches Claude');
+  }
+  const invalid = await roundTrip({ jsonrpc: '2.0', method: 'notifications/initialized' }, { resp_code: 0 });
+  assert.equal(invalid.status, 502);
+  assert.equal(invalid.headers.get(RELAY_ANSWER_HEADER), null);
+  assert.equal(await invalid.text(), '');
+  const failed = await roundTrip({ jsonrpc: '2.0', method: 'notifications/initialized' }, { resp_code: 503 });
+  assert.equal(failed.status, 503, 'the phone\'s own status for a notification');
+  assert.equal(await failed.text(), '');
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+});
+
+test('real RelayObject: an unexpected hub outcome is HTTP 200 -32002 delivered:false, never a 5xx', async () => {
+  assert.throws(() => outcomeResponse(/** @type {any} */ ({ kind: 'bogus' }), true, 1), /unexpected hub outcome/);
+  const { t, errors } = realDeployment();
+  const { access_token: token } = await obtainTokens(t);
+  t.relay.hub.submit = async () => ({ kind: 'bogus' });
+  const res = await mcp(t, token, toolsCall('x'));
+  assert.equal(res.status, 200);
+  const body = await relayData(res);
+  assert.equal(body.id, 'x');
+  assert.equal(body.error.code, -32002);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: false, retried: false });
+  assert.equal(errors.length, 1);
 });

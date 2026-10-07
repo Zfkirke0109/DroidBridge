@@ -11,6 +11,7 @@ import {
   empty,
   isPlainObject,
   json,
+  jsonText,
   methodNotAllowed,
   parseJson,
   readBody,
@@ -114,8 +115,10 @@ async function poll(relay, request, url) {
   const limit = clampInt(url.searchParams.get('limit'), 1, POLL_LIMIT_MAX, POLL_LIMIT_MAX);
   const cap = relay.timings.pollCapMs;
   const timeout = clampInt(url.searchParams.get('timeout_ms'), 0, cap, Math.min(POLL_DEFAULT_TIMEOUT_MS, cap));
+  // Each command arrives already encoded (it was encoded when Claude's request was accepted),
+  // so the body is only joined text and cannot fail after the commands were marked delivered.
   const commands = await relay.hub.poll(limit, timeout, request.signal);
-  return commands.length > 0 ? json(200, { commands }) : empty(204);
+  return commands.length > 0 ? jsonText(200, `{"commands":[${commands.join(',')}]}`) : empty(204);
 }
 
 /**

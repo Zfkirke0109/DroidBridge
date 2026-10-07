@@ -3,6 +3,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DEVICE_RESPONSE_LIMIT_BYTES } from '../src/device.js';
+import { MCP_BODY_LIMIT_BYTES, MCP_MAX_DEPTH } from '../src/mcp.js';
+import { readConfig } from '../src/relay.js';
 import { makeRelay, mcp, obtainTokens, poll, respond, toolsCall, waitFor } from './helpers.js';
 
 /** @param {ReturnType<typeof makeRelay>} t */
@@ -146,6 +148,29 @@ test('unknown settlement uses RESPONSE_TIMEOUT_SECONDS (clamped) plus the grace'
   assert.equal((await answer).status, 200);
   assert.equal(makeRelay({ env: { RESPONSE_TIMEOUT_SECONDS: '5000' } }).relay.config.responseTimeoutSeconds, 900);
   assert.equal(makeRelay({ env: { RESPONSE_TIMEOUT_SECONDS: 'abc' } }).relay.config.responseTimeoutSeconds, 240);
+  // Every number is clamped, however it is written; only a value that is not a number at all
+  // falls back to the default.
+  /** @type {[string, number][]} */
+  const cases = [
+    ['999999', 900],
+    ['1000000', 900],
+    [`1${'0'.repeat(400)}`, 900],
+    ['-5', 10],
+    ['0', 10],
+    ['300.5', 301],
+    ['300.4', 300],
+    [' 120 ', 120],
+    ['+60', 60],
+    ['1e3', 900],
+    ['', 240],
+    ['12s', 240],
+    ['0x20', 240],
+    ['Infinity', 240],
+  ];
+  for (const [value, expected] of cases) {
+    assert.equal(readConfig({ RESPONSE_TIMEOUT_SECONDS: value }).responseTimeoutSeconds, expected, JSON.stringify(value));
+  }
+  assert.equal(readConfig({}).responseTimeoutSeconds, 240);
 });
 
 test('unknown settlement for a notification is HTTP 200 with no body', async () => {
@@ -434,4 +459,413 @@ test('a relay failure while answering a delivered request is HTTP 200 -32002 del
   assert.equal((await respond(t, command)).status, 404, 'settled: a later reply is 404');
   assert.equal(t.relay.hub.inspect().inFlight, 0);
   assert.equal(t.clock.pendingTimers(), 0);
+});
+
+/**
+ * Makes the `nth` setTimeout call from now on throw once, the way the tests above inject a
+ * timer failure.
+ * @param {ReturnType<typeof makeRelay>} t
+ */
+function failNthTimer(t, nth = 1) {
+  const original = t.clock.api.setTimeout;
+  let calls = 0;
+  t.clock.api.setTimeout = (fn, ms) => {
+    calls += 1;
+    if (calls < nth) return original(fn, ms);
+    t.clock.api.setTimeout = original;
+    throw new Error('timer failure');
+  };
+}
+
+/**
+ * Deepest nesting of objects and arrays in a JSON value (a scalar is 0).
+ * @param {unknown} value
+ * @returns {number}
+ */
+function depthOf(value) {
+  if (typeof value !== 'object' || value === null) return 0;
+  return 1 + Math.max(0, ...Object.values(value).map(depthOf));
+}
+
+/** A tools/call whose arguments nest arrays so that the whole message is `depth` levels deep. */
+function nestedCall(/** @type {string} */ id, /** @type {number} */ depth) {
+  // message (1) > params (2) > arguments (3) > x: arrays from level 4 on
+  const arrays = depth - 3;
+  return `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"method":"tools/call","params":{"name":"command",` +
+    `"arguments":{"x":${'['.repeat(arrays)}${']'.repeat(arrays)}}}}`;
+}
+
+test('a request the phone could not parse is refused with 400 before delivery, and never spoils a poll for others', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204); // online: accepted requests wait in the hand-off list
+  const innocent = mcp(t, token, toolsCall('innocent'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+
+  /** @type {[string, string, RegExp][]} */
+  const refused = [
+    ['cut emoji', '{"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"text":"cut emoji \\ud83d"}}', /unpaired UTF-16 surrogate/],
+    ['lone low surrogate', '{"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"t":["\\ude00x"]}}', /unpaired UTF-16 surrogate/],
+    ['reversed pair', '{"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"t":"\\ude00\\ud83d"}}', /unpaired UTF-16 surrogate/],
+    ['surrogate in a member name', '{"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"\\ud800":1}}', /member name contains an unpaired/],
+    ['surrogate in the method', '{"jsonrpc":"2.0","id":"e","method":"tools/\\udbff"}', /unpaired UTF-16 surrogate/],
+    ['one level too deep', nestedCall('e', MCP_MAX_DEPTH + 1), /nested more than 64 levels/],
+    ['the phone parser limit', nestedCall('e', 124), /nested more than 64 levels/],
+    ['5,000 levels', nestedCall('e', 5000), /nested more than 64 levels/],
+    ['100,000 levels', nestedCall('e', 100_000), /nested more than 64 levels/],
+  ];
+  for (const [label, body, message] of refused) {
+    const res = await mcp(t, token, body);
+    assert.equal(res.status, 400, label);
+    const reply = await res.json();
+    assert.equal(reply.id, 'e', label);
+    assert.equal(reply.error.code, -32600, label);
+    assert.match(reply.error.message, message, label);
+    assert.equal(reply.error.data, undefined, label);
+    // A notification gets the status only.
+    const note = await mcp(t, token, body.replace('"id":"e",', ''));
+    assert.equal(note.status, 400, `${label} (notification)`);
+    assert.equal(await note.text(), '');
+  }
+  assert.deepEqual(t.relay.hub.inspect().handoff, 1, 'nothing refused was handed off');
+
+  // At the limit, and a correctly paired emoji, are accepted. The poll response the phone gets
+  // stays well inside serde_json's 128-level limit and carries no lone surrogate escape.
+  const deepest = mcp(t, token, nestedCall('deepest', MCP_MAX_DEPTH));
+  const emoji = mcp(t, token, '{"jsonrpc":"2.0","id":"emoji","method":"tools/call","params":{"text":"\\ud83d\\ude00 ok"}}');
+  await waitFor(() => t.relay.hub.inspect().handoff === 3);
+  const pollRes = await poll(t, 0);
+  assert.equal(pollRes.status, 200);
+  const text = await pollRes.text();
+  assert.doesNotMatch(text, /\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f])/i, 'no unpaired high surrogate escape');
+  const { commands } = JSON.parse(text);
+  assert.deepEqual(commands.map((command) => command.jsonrpc.id), ['innocent', 'deepest', 'emoji']);
+  assert.equal(depthOf(commands[1].jsonrpc), MCP_MAX_DEPTH);
+  assert.equal(depthOf(JSON.parse(text)), MCP_MAX_DEPTH + 3);
+  assert.equal(commands[2].jsonrpc.params.text, '\u{1F600} ok');
+  for (const command of commands) assert.equal((await respond(t, command)).status, 200);
+  for (const answer of [innocent, deepest, emoji]) assert.equal((await answer).status, 200);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+});
+
+test('a request larger than the limit once encoded for the phone is refused with 413 before delivery', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204);
+  // "1e20" (4 bytes) is encoded as 100000000000000000000 (21 bytes): under the body limit as
+  // sent, more than four times over it once encoded.
+  const count = Math.floor((MCP_BODY_LIMIT_BYTES - 200) / 5);
+  const body = `{"jsonrpc":"2.0","id":"big","method":"tools/call","params":{"n":[${Array(count).fill('1e20').join(',')}]}}`;
+  assert.ok(new TextEncoder().encode(body).byteLength <= MCP_BODY_LIMIT_BYTES);
+  const res = await mcp(t, token, body);
+  assert.equal(res.status, 413);
+  const reply = await res.json();
+  assert.equal(reply.id, 'big');
+  assert.equal(reply.error.code, -32600);
+  assert.match(reply.error.message, /larger than 262144 bytes once encoded/);
+  const note = await mcp(t, token, body.replace('"id":"big",', ''));
+  assert.equal(note.status, 413);
+  assert.equal(await note.text(), '');
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal((await poll(t, 0)).status, 204, 'nothing was handed off');
+});
+
+test('the hub encodes a command when it is submitted: one that cannot be encoded changes nothing', async () => {
+  const t = makeRelay();
+  const parked = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const options = { configured: true, settleWithinMs: 1000 };
+  assert.throws(() => t.relay.hub.submit({ request_id: 'r', shard_token: 's', jsonrpc: { n: 1n } }, options), TypeError);
+  assert.deepEqual(t.relay.hub.inspect(), { parked: true, handoff: 0, delivered: 0, inFlight: 0, lastPollEndedAt: null });
+  // The poll stays parked and still gets the next command.
+  const outcome = t.relay.hub.submit({ request_id: 'ok', shard_token: 's', jsonrpc: { jsonrpc: '2.0', method: 'x' } }, options);
+  const res = await parked;
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).commands[0].request_id, 'ok');
+  await t.clock.advance(1000);
+  assert.deepEqual(await outcome, { kind: 'unknown' });
+});
+
+test('a timer failure while handing a command to a parked poll delivers nothing and leaves the poll parked', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const parked = poll(t, 15000);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  failNthTimer(t); // the deadline of the command about to be delivered
+  const res = await mcp(t, token, toolsCall('p'));
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.id, 'p');
+  assert.equal(body.error.code, -32002);
+  assert.match(body.error.message, /not delivered/);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: false, retried: false });
+  assert.equal(t.errors.length, 1, 'the failure is reported');
+  assert.deepEqual(t.relay.hub.inspect().parked, true, 'the poll is still parked');
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+
+  // The same poll carries the next request, and ends on its own when nothing comes.
+  const answer = mcp(t, token, toolsCall('next'));
+  const pollRes = await parked;
+  assert.equal(pollRes.status, 200);
+  const { commands } = await pollRes.json();
+  assert.deepEqual(commands.map((command) => command.jsonrpc.id), ['next']);
+  assert.equal((await respond(t, commands[0])).status, 200);
+  assert.equal((await answer).status, 200);
+
+  const idle = poll(t, 15000);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  await t.clock.advance(15_000);
+  assert.equal((await idle).status, 204);
+  assert.equal(t.clock.pendingTimers(), 0);
+});
+
+test('a timer failure while a poll takes the hand-off batch delivers none of it; the next poll gets every command', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204);
+  const answers = [mcp(t, token, toolsCall('b1')), mcp(t, token, toolsCall('b2')), mcp(t, token, toolsCall('b3'))];
+  await waitFor(() => t.relay.hub.inspect().handoff === 3);
+  failNthTimer(t, 2); // the second deadline of the batch
+  const failed = await poll(t, 0);
+  assert.equal(failed.status, 500);
+  assert.deepEqual(await failed.json(), { error: 'server_error' });
+  assert.equal(t.errors.length, 1);
+  const state = t.relay.hub.inspect();
+  assert.equal(state.handoff, 3, 'every command still waits');
+  assert.equal(state.delivered, 0, 'none was marked delivered');
+  assert.equal(state.inFlight, 3);
+
+  const pollRes = await poll(t, 0);
+  assert.equal(pollRes.status, 200);
+  const { commands } = await pollRes.json();
+  assert.deepEqual(commands.map((command) => command.jsonrpc.id), ['b1', 'b2', 'b3']);
+  for (const command of commands) assert.equal((await respond(t, command)).status, 200);
+  for (const answer of answers) assert.equal((await answer).status, 200);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal(t.clock.pendingTimers(), 0);
+});
+
+test('a timer failure on a poll with no later poll ends every waiting request as not delivered', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204);
+  const answers = [mcp(t, token, toolsCall('c1')), mcp(t, token, toolsCall('c2'))];
+  await waitFor(() => t.relay.hub.inspect().handoff === 2);
+  failNthTimer(t, 1);
+  assert.equal((await poll(t, 0)).status, 500);
+  await t.clock.advance(5000);
+  for (const answer of answers) {
+    const res = await answer;
+    assert.equal(res.status, 503);
+    assert.deepEqual((await res.json()).error.data.droidbridge_relay, { state: 'unavailable', delivered: false });
+  }
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal(t.clock.pendingTimers(), 0);
+});
+
+/**
+ * A POST /mcp with its own abort signal.
+ * @param {string} token
+ * @param {unknown} message
+ * @param {AbortSignal} signal
+ */
+function mcpWithSignal(/** @type {ReturnType<typeof makeRelay>} */ t, token, message, signal) {
+  return t.relay.fetch(
+    new Request('https://relay.example/mcp', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify(message),
+      signal,
+    }),
+  );
+}
+
+/** A device poll with its own abort signal. */
+function pollWithSignal(/** @type {ReturnType<typeof makeRelay>} */ t, /** @type {AbortSignal} */ signal, timeoutMs = 15000) {
+  return t.relay.fetch(
+    new Request(`https://relay.example/device/v1/poll?limit=8&timeout_ms=${timeoutMs}`, {
+      headers: { authorization: `Bearer ${t.device.key}` },
+      signal,
+    }),
+  );
+}
+
+test('a Claude request that is already aborted is never offered to the phone, whether a poll waits or not', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const gone = new AbortController();
+  gone.abort();
+
+  // A poll waits: it is not handed the abandoned request and stays parked.
+  const parked = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const res = await mcpWithSignal(t, token, toolsCall('gone'), gone.signal);
+  assert.equal(res.status, 503);
+  assert.deepEqual((await res.json()).error.data.droidbridge_relay, { state: 'unavailable', delivered: false });
+  assert.equal(t.relay.hub.inspect().parked, true);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  await t.clock.advance(15_000);
+  assert.equal((await parked).status, 204);
+
+  // Between polls: it does not join the hand-off list.
+  const between = await mcpWithSignal(t, token, toolsCall('gone'), gone.signal);
+  assert.equal(between.status, 503);
+  assert.equal((await poll(t, 0)).status, 204);
+  assert.equal(t.clock.pendingTimers(), 0);
+});
+
+test('a Claude request aborted while it is being authenticated is never delivered', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204);
+  // Hold the access-token lookup until the request has been aborted.
+  /** @type {() => void} */
+  let release = () => {};
+  const gate = new Promise((resolve) => {
+    release = () => resolve(undefined);
+  });
+  let reached = false;
+  const lookup = t.relay.grants.lookupAccess.bind(t.relay.grants);
+  t.relay.grants.lookupAccess = async (/** @type {string} */ value) => {
+    reached = true;
+    await gate;
+    return lookup(value);
+  };
+  const controller = new AbortController();
+  const answer = mcpWithSignal(t, token, toolsCall('abandoned'), controller.signal);
+  await waitFor(() => reached);
+  controller.abort();
+  release();
+  const res = await answer;
+  assert.equal(res.status, 503);
+  assert.deepEqual((await res.json()).error.data.droidbridge_relay, { state: 'unavailable', delivered: false });
+  assert.equal((await poll(t, 0)).status, 204, 'the next poll gets nothing');
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+});
+
+test('a phone poll that is already aborted takes no command, is never parked and does not make the phone online', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const gone = new AbortController();
+  gone.abort();
+
+  // Offline phone: a dead poll does not bring it online.
+  assert.equal((await pollWithSignal(t, gone.signal)).status, 204);
+  assert.equal(t.relay.hub.inspect().parked, false);
+  const offline = await mcp(t, token, toolsCall('o'));
+  assert.equal(offline.status, 503);
+  assert.equal((await offline.json()).error.data.droidbridge_relay.state, 'offline');
+
+  // A command waiting in the hand-off list stays there for a live poll.
+  assert.equal((await poll(t, 0)).status, 204);
+  const answer = mcp(t, token, toolsCall('w'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+  assert.equal((await pollWithSignal(t, gone.signal)).status, 204);
+  assert.deepEqual(t.relay.hub.inspect().handoff, 1);
+  assert.equal(t.relay.hub.inspect().delivered, 0);
+  const live = await poll(t, 0);
+  assert.equal(live.status, 200);
+  const [command] = (await live.json()).commands;
+  assert.equal(command.jsonrpc.id, 'w');
+  assert.equal((await respond(t, command)).status, 200);
+  assert.equal((await answer).status, 200);
+});
+
+test('a parked phone poll whose connection drops stops counting as waiting', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const controller = new AbortController();
+  const parked = pollWithSignal(t, controller.signal);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  controller.abort();
+  assert.equal((await parked).status, 204);
+  assert.equal(t.relay.hub.inspect().parked, false);
+  // Within the online grace a request waits for the next poll instead of being lost in the
+  // dead one; with no poll it ends as not delivered.
+  const answer = mcp(t, token, toolsCall('after-drop'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+  await t.clock.advance(5000);
+  const res = await answer;
+  assert.equal(res.status, 503);
+  assert.deepEqual((await res.json()).error.data.droidbridge_relay, { state: 'unavailable', delivered: false });
+});
+
+test('withdraw: a delivered request ends as unknown and a late reply is 404; a waiting one is never delivered', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const { answer, command } = await deliverOne(t, token, toolsCall('wd'));
+  assert.equal(t.relay.hub.withdraw(command.request_id), true);
+  const res = await answer;
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.error.code, -32002);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: true, retried: false });
+  assert.equal((await respond(t, command)).status, 404, 'withdrawn: a late reply is 404');
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal(t.relay.hub.withdraw(command.request_id), null, 'no longer held');
+
+  assert.equal((await poll(t, 0)).status, 204);
+  const waiting = mcp(t, token, toolsCall('ww'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+  const [entry] = t.relay.hub.entries.values();
+  assert.equal(t.relay.hub.withdraw(entry.id), false);
+  assert.equal((await waiting).status, 503);
+  assert.equal((await poll(t, 0)).status, 204, 'never delivered later');
+  assert.equal(t.clock.pendingTimers(), 0);
+});
+
+test('a device reply whose upload fails partway settles nothing, so the phone can post it again', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const { answer, command } = await deliverOne(t, token, toolsCall('m'));
+  const broken = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(`{"request_id":${JSON.stringify(command.request_id)},"resp_json":`));
+      controller.error(new Error('connection reset'));
+    },
+  });
+  const res = await t.relay.fetch(
+    new Request('https://relay.example/device/v1/response', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${t.device.key}`,
+        'content-type': 'application/json',
+        'x-tunnel-shard-token': command.shard_token,
+      },
+      body: broken,
+      // @ts-ignore Node needs duplex for a stream body
+      duplex: 'half',
+    }),
+  );
+  assert.equal(res.status, 500);
+  assert.equal(t.relay.hub.inspect().delivered, 1, 'still waiting for the reply');
+  assert.equal((await respond(t, command)).status, 200, 'the retried reply settles it');
+  const ok = await answer;
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { jsonrpc: '2.0', id: 'm', result: { ok: true } });
+});
+
+test('when reporting a relay failure fails too, POST /mcp still gets HTTP 200 -32002 delivered:false', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  t.relay.onError = () => {
+    throw new Error('logger down');
+  };
+  t.relay.grants.lookupAccess = async () => {
+    throw new Error('storage');
+  };
+  const res = await mcp(t, token, toolsCall('e'));
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.id, 'e');
+  assert.equal(body.error.code, -32002);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: false, retried: false });
+  // Other routes still answer 500.
+  t.relay.grants.liveClientIds = async () => {
+    throw new Error('storage');
+  };
+  const status = await t.relay.fetch(
+    new Request('https://relay.example/device/v1/status', { headers: { authorization: `Bearer ${t.device.key}` } }),
+  );
+  assert.equal(status.status, 500);
 });
