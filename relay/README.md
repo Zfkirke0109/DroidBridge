@@ -101,8 +101,9 @@ relay does not issue tokens for one hostname that the other rejects.
 
 `wrangler.toml` also sets the `enable_request_signal` compatibility flag. Keep it: without it
 Cloudflare never tells the relay that Claude or the phone disconnected, so a request Claude gave
-up on could still reach the phone, and a phone poll whose connection dropped would keep counting
-as online for up to 25 seconds.
+up on could still reach the phone, and a phone poll whose connection dropped would still be
+handed requests until it timed out (up to 25 seconds; those requests end as outcome unknown),
+and the phone would count as online for 5 seconds after that, up to 30 seconds in all.
 
 ## Security notes
 
@@ -111,12 +112,19 @@ content of every MCP request and response passing through it (tool calls and the
 they are in flight. It does not store them and does not log them. It never sees the Local MCP
 token or any OpenAI key. It passes each message on as the exact text it received, never
 re-encoded, so nothing in it changes: 64-bit integers such as inode numbers, nanosecond
-timestamps or large ids arrive digit for digit.
+timestamps or large ids arrive digit for digit. The one exception is a leading UTF-8 byte order
+mark on Claude's request, which the relay removes (DroidBridge could not read it); every byte
+after it is forwarded unchanged. That exactness ends at the relay: DroidBridge on the phone
+parses each request and encodes it again before running it, which can rewrite how some numbers
+and escapes are written (`1e15` becomes `1000000000000000.0`) and make the request longer.
 
 **What it stores.** Only SHA-256 hashes of access tokens, refresh tokens, authorization codes,
 consent request IDs, the pairing code and the device key. It also stores registered client
-metadata, cached client ID metadata documents (at most 1 hour), and pending consent requests
-(at most 10 minutes).
+metadata, cached client ID metadata documents (used for at most 1 hour), and pending consent
+requests (usable for 10 minutes). Expired records are deleted by a sweep that runs at most once a
+minute, when Claude connects or refreshes its token and when DroidBridge polls, so while
+DroidBridge is connected they are gone within about a minute and a half of expiring. With no
+traffic at all they stay until the next request.
 
 **What it forwards.** Claude's `Authorization` header, cookies and `Mcp-Session-Id` never reach the
 phone. Only `Content-Type`, `Accept`, `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` are
@@ -127,8 +135,9 @@ forwarded. Claude never sees the device key.
 rotate on every use; presenting any rotated refresh token, however old, revokes the whole grant
 while that grant is live (each refresh token names its grant, so this holds even after the relay
 has deleted the old token's record; once a grant has expired none of its tokens works anyway),
-and so does presenting an authorization code a second time, however late (the relay keeps a
-redeemed code's hash for as long as the grant it started exists).
+and so does presenting an authorization code a second time, however late and whatever client
+ID, redirect URI or code verifier comes with it (the relay keeps a redeemed code's hash for as
+long as the grant it started exists).
 Redirects go only to Claude's callbacks, Claude Code's loopback `http://localhost:<port>/callback`
 or `http://127.0.0.1:<port>/callback`, or URIs you list in `EXTRA_REDIRECT_URIS`. An unknown
 client or redirect URI gets an error page and is never redirected to. The consent page sends a
@@ -144,12 +153,17 @@ outcomes:
 - **Busy**: 16 requests are already in flight. Claude gets HTTP 429, and the request was not
   delivered.
 - **Answered**: the phone posted its result in time, and Claude gets it with the phone's status
-  code.
-- **Invalid reply**: the phone's reply cannot be passed on: its status code is not 200 to 599,
-  or, for a request, it is not a JSON-RPC response carrying the request's id (missing, not a JSON
-  object, another id, not exactly one of `result` and `error`, or a status such as 204 that
-  cannot carry a body). A request gets HTTP 200 with a JSON-RPC error (code `-32603`) saying it
-  may or may not have run and was not retried; a notification gets HTTP 502. A reply the relay
+  code, except that 401, 407, 408, 413, 421, 425, 429 and every 5xx become HTTP 200: the phone
+  has the request and may have run it, so Claude never gets a status after which an HTTP client
+  might send it again on its own (an MCP client answers a 401 by refreshing its token and
+  resending), or the 413 that means "refused before delivery". A request still gets the phone's
+  JSON-RPC response as the body; a notification gets an empty 200. (The phone answers 413 when
+  its own re-encoding made a request longer than 256 KiB.)
+- **Invalid reply**: the phone's reply cannot be passed on: its status code is not an integer from 200 to 599, or,
+  for a request, it is not a JSON-RPC response carrying the request's id (missing, not a JSON
+  object, another id, not exactly one of `result` and `error`, or a status such as 204 that cannot
+  carry a body). A request gets HTTP 200 with a JSON-RPC error (code `-32603`) saying it may or
+  may not have run and was not retried; a notification gets an empty HTTP 200. A reply the relay
   cannot read at all (too large, not JSON, no `request_id`) ends its request this way at once,
   found by its shard token.
 - **Outcome unknown**: the request was handed to the phone, but no result arrived within
@@ -158,31 +172,37 @@ outcomes:
   HTTP-level clients from retrying it. A late result from the phone is discarded.
 
 A request counts as handed to the phone the moment it is placed into a poll response. If the
-phone's connection drops at that moment, the outcome is unknown, never "retried". If the relay
-fails while building a poll response, none of the requests it would have carried count as handed
-over: they keep waiting for the next poll, or end as unavailable. A request Claude gives up on
-before a poll takes it is dropped and never reaches the phone. If the relay itself fails while
-handling a request (a storage error, a bug, the Durable Object being reset), Claude also gets HTTP
-200 with a JSON-RPC `-32002` error, never a 5xx; a notification gets an empty HTTP 200. The error's
-`delivered` field says what is known: `false` means the request never reached the phone (one still
-waiting for a poll is withdrawn, so it cannot arrive later), `true` means it was handed to the
-phone and may or may not have run, and `null` means the Worker could not tell because the Durable
-Object itself failed (including an answer that broke off while the Worker was reading it). Whether
-to send the request again is left to you or the model.
+phone's connection drops at that moment, the outcome is unknown, never "retried". A request Claude
+gives up on before a poll takes it is dropped and never reaches the phone. If the relay itself
+fails while handling a request (a storage error, a bug, the Durable Object being reset), Claude
+also gets HTTP 200 with a JSON-RPC `-32002` error, never a 5xx; a notification gets an empty HTTP
+200. The error's `delivered` field says what is known: `false` means the request never reached
+the phone (one still waiting for a poll is withdrawn, so it cannot arrive later), `true` means it
+was handed to the phone and may or may not have run, and `null` means the Worker could not tell
+because the Durable Object itself failed (including an answer that broke off while the Worker was
+reading it). Whether to send the request again is left to you or the model.
+
+If the relay fails while building a poll response, none of the requests it would have carried
+count as handed over. Requests that were waiting for a poll keep waiting for the next one, or end
+as unavailable. A request that was about to go straight to a poll already waiting gets the
+relay-failure answer with `delivered: false`, and that poll keeps waiting.
 
 Requests in flight live only in the Durable Object's memory. If Cloudflare restarts the object,
 those requests fail and are not replayed. OAuth state lives in the object's storage and survives.
 
 **Limits.** MCP request bodies up to 256 KiB, nested at most 64 levels deep, with no unpaired
-UTF-16 surrogate escape (such as a cut emoji `\ud83d`) in any string and no number beyond the
-double range (a magnitude above 1.79 × 10^308, such as `1e400`). The phone could not read
-anything else, and would drop every other request sent in the same poll response with it, so the
-relay refuses it with HTTP 400 or 413 before delivery. A request's `id` is a string or an integer
-from -2^63 to 2^64 - 1 written without fraction or exponent, as the phone requires (400
-otherwise). Phone responses up to 13,048,576 bytes (the phone's 12,000,000-byte MCP response
-limit plus 1 MiB of envelope; a larger reply is refused and Claude gets the invalid-reply error at
-once), 20 client registrations per hour, 100 registered clients, 50 waiting consent requests (10
-per client).
+UTF-16 surrogate escape (such as a cut emoji `\ud83d`) in any string and no number that JavaScript
+reads, rounded to the nearest double, as a magnitude above 1.79 × 10^308 or as infinity (such as
+`1e400` or `1.795e308`; the phone refuses a number beyond the double range and can overflow on one
+just below the largest double, about 1.7977 × 10^308). The phone could not read anything else, and
+would drop every other request sent in the same poll response with it, so the relay refuses it
+with HTTP 400 or 413 before delivery. A request's `id` is a string or an integer from -2^63 to
+2^64 - 1 written without fraction or exponent, as the phone requires (400 otherwise), and a
+message with a `result` or `error` member besides its `method` is refused with 400 too
+(DroidBridge would refuse it without running it). Phone
+responses up to 13,048,576 bytes (the phone's 12,000,000-byte MCP response limit plus 1 MiB of
+envelope; a larger reply is refused and Claude gets the invalid-reply error at once), 20 client
+registrations per hour, 100 registered clients, 50 waiting consent requests (10 per client).
 
 ## Costs
 

@@ -129,6 +129,182 @@ test('an id above 2^53 is accepted, forwarded, matched on its digits and echoed 
   assert.match(await res.text(), /^\{"jsonrpc":"2\.0","id":9007199254740993,"error":/);
 });
 
+test('a string id is matched on its value and type: a reply for another id is an invalid device reply', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  /** @type {[string, string, boolean][]} request id, phone reply id (JSON text), passes through */
+  const cases = [
+    ['"a"', '"b"', false],
+    ['"3"', '3', false],
+    ['"a"', '["a"]', false],
+    ['"a"', 'null', false],
+    ['""', '0', false],
+    ['"a"', '"a"', true],
+    // The same string written with other escapes is the same id.
+    ['"A\\/b"', '"A/b"', true],
+    ['"a\\u0062"', '"ab"', true],
+  ];
+  for (const [id, replyId, passes] of cases) {
+    const label = `request id ${id}, reply id ${replyId}`;
+    const { command, answer } = await deliver(t, token, `{"jsonrpc":"2.0","id":${id},"method":"tools/call"}`);
+    const reply = `{"jsonrpc":"2.0","id":${replyId},"result":{"ok":true}}`;
+    assert.equal((await replyRaw(t, command, reply)).status, 200, label);
+    const res = await answer;
+    assert.equal(res.status, 200, label);
+    const text = await res.text();
+    if (passes) {
+      assert.equal(text, reply, label);
+      continue;
+    }
+    // The relay's own error echoes the request's id as Claude wrote it.
+    assert.ok(text.startsWith(`{"jsonrpc":"2.0","id":${id},"error":{"code":-32603,`), `${label}: ${text}`);
+    assert.deepEqual(JSON.parse(text).error.data.droidbridge_relay, {
+      state: 'invalid_device_reply',
+      delivered: true,
+      retried: false,
+    });
+  }
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+});
+
+test('the relay\'s own answers echo a string id exactly as Claude wrote it, escapes included', async () => {
+  const id = '"A\\/b"';
+  const request = `{"jsonrpc":"2.0","id":${id},"method":"tools/list"}`;
+  const prefix = `{"jsonrpc":"2.0","id":${id},"error":`;
+
+  // Offline (no poll waiting): 503, not delivered.
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  let res = await mcp(t, token, request);
+  assert.equal(res.status, 503);
+  let text = await res.text();
+  assert.ok(text.startsWith(prefix), text);
+  assert.equal(JSON.parse(text).error.data.droidbridge_relay.state, 'offline');
+
+  // Online but no poll within 5 s: 503 unavailable.
+  assert.equal((await poll(t, 0)).status, 204);
+  const pending = mcp(t, token, request);
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+  await t.clock.advance(5000);
+  res = await pending;
+  assert.equal(res.status, 503);
+  text = await res.text();
+  assert.ok(text.startsWith(prefix), text);
+  assert.equal(JSON.parse(text).error.data.droidbridge_relay.state, 'unavailable');
+
+  // Delivered, no reply before the deadline: HTTP 200 -32002.
+  const { answer } = await deliver(t, token, request);
+  await t.clock.advance(245_000);
+  res = await answer;
+  assert.equal(res.status, 200);
+  text = await res.text();
+  assert.ok(text.startsWith(`${prefix}{"code":-32002,`), text);
+  assert.equal(JSON.parse(text).error.data.droidbridge_relay.state, 'settlement_unknown');
+
+  // A relay failure: HTTP 200 -32002.
+  t.relay.grants.lookupAccess = async () => {
+    throw new Error('storage');
+  };
+  res = await mcp(t, token, request);
+  assert.equal(res.status, 200);
+  text = await res.text();
+  assert.ok(text.startsWith(`${prefix}{"code":-32002,`), text);
+
+  // A message the phone could not read: 400 before delivery.
+  const u = makeRelay();
+  const { access_token: uToken } = await obtainTokens(u);
+  res = await mcp(u, uToken, `{"jsonrpc":"2.0","id":${id},"method":"x","params":{"n":1e400}}`);
+  assert.equal(res.status, 400);
+  text = await res.text();
+  assert.ok(text.startsWith(`${prefix}{"code":-32600,`), text);
+});
+
+test('JSON whitespace of every kind (space, tab, CR, LF) between tokens is read and forwarded as is', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  // Pretty-printed requests, with newlines, tabs and CRLF on both sides of the id member, and a
+  // number id that is the last member, ended by LF, CRLF or CR alone.
+  const requests = [
+    '{\n  "jsonrpc": "2.0",\n  "id": 7,\n  "method": "tools/call",\n  "params": {\n    "name": "command",\n    "arguments": [1, 2]\n  }\n}\n',
+    '{\r\n\t"jsonrpc":\t"2.0",\r\n\t"id"\t:\t"seven",\r\n\t"method":\t"tools/call",\r\n\t"params":\t{\r\n\t\t"n":\t[\r\n\t\t\t9007199254740993\r\n\t\t]\r\n\t}\r\n}\r\n',
+    '\r\n\t {"method"\r:\r"tools/call"\t,\n"id"\r\n:\r\n18446744073709551615\t\r\n,\n"jsonrpc"\t:"2.0"}\t\r\n',
+    '{\n  "jsonrpc": "2.0",\n  "method": "tools/list",\n  "id": 8\n}',
+    '{\r\n  "jsonrpc": "2.0",\r\n  "method": "tools/list",\r\n  "id": -9223372036854775808\r\n}\r\n',
+    '{"jsonrpc":"2.0","method":"tools/list","id":10\r}',
+    '{\n\t"jsonrpc" :\r\n "2.0",\r\n "method":"notifications/initialized"\r\n}',
+  ];
+  // The phone's replies: tabs and CRLF between tokens, and the id as the last member, ended by
+  // LF, CRLF or CR alone.
+  const replies = [
+    (/** @type {string} */ id) =>
+      `{\r\n\t"jsonrpc":\t"2.0",\r\n\t"id":\t${id},\r\n\t"result":\t{\r\n\t\t"ok":\ttrue\r\n\t}\r\n}`,
+    (/** @type {string} */ id) => `{"jsonrpc":"2.0","result":{"ok":true},"id":${id}\n}`,
+    (/** @type {string} */ id) => `{\r\n  "jsonrpc": "2.0",\r\n  "result": {},\r\n  "id": ${id}\r\n}`,
+    (/** @type {string} */ id) => `{"jsonrpc":"2.0","error":{"code":-32000,"message":"x"},"id":${id}\r}`,
+  ];
+  let round = 0;
+  for (const request of requests) {
+    const label = JSON.stringify(request).slice(0, 50);
+    const { text, command, answer } = await deliver(t, token, request);
+    assert.ok(text.includes(`"jsonrpc":${request}}`), `${label}: forwarded byte for byte`);
+    if (command.jsonrpc.id === undefined) {
+      assert.equal((await deviceFetch(t, '/device/v1/response', {
+        method: 'POST',
+        body: `{\r\n\t"request_id":\t${JSON.stringify(command.request_id)},\r\n\t"resp_code":\t202\r\n}`,
+        headers: { 'x-tunnel-shard-token': command.shard_token },
+      })).status, 200);
+      const res = await answer;
+      assert.equal(res.status, 202, label);
+      assert.equal(await res.text(), '');
+      continue;
+    }
+    const id = /** @type {string} */ (memberSource(request, 'id'));
+    const reply = replies[round++ % replies.length](id);
+    // The phone's envelope uses tabs and CRLF too.
+    const envelope =
+      `{\r\n\t"request_id":\t${JSON.stringify(command.request_id)},\r\n\t"channel"\t:\r\n"main",\r\n` +
+      `\t"resp_json":\r\n\t${reply}\t,\r\n\t"resp_code":\t200,\r\n\t"resp_type":\t"jsonrpc_response"\r\n}\r\n`;
+    const ack = await deviceFetch(t, '/device/v1/response', {
+      method: 'POST',
+      body: envelope,
+      headers: { 'x-tunnel-shard-token': command.shard_token },
+    });
+    assert.equal(ack.status, 200, label);
+    const res = await answer;
+    assert.equal(res.status, 200, label);
+    assert.equal(await res.text(), reply, `${label}: the phone's reply, unchanged`);
+  }
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal(t.errors.length, 0);
+});
+
+test('a leading UTF-8 BOM on Claude\'s body is removed; the rest reaches the phone byte for byte', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const message = '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"s":"caf\\u00e9 é"}}';
+  const encoded = new TextEncoder().encode(message);
+  const body = new Uint8Array(3 + encoded.byteLength);
+  body.set([0xef, 0xbb, 0xbf]);
+  body.set(encoded, 3);
+  const parked = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const answer = t.relay.fetch(
+    new Request('https://relay.example/mcp', {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body,
+    }),
+  );
+  // A refused body is answered while the poll stays parked: fail here instead of waiting.
+  const first = await Promise.race([parked.then(() => 'poll'), answer.then((res) => `answer ${res.status}`)]);
+  assert.equal(first, 'poll', 'the request was handed to the phone');
+  const text = await (await parked).text();
+  assert.ok(text.includes(`"jsonrpc":${message}}`), text);
+  assert.ok(!text.includes('\ufeff'));
+  await t.clock.advance(245_000);
+  assert.equal((await answer).status, 200);
+});
+
 test('an id the phone would not answer is refused before delivery with id null', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
@@ -168,6 +344,9 @@ test('a number the phone cannot read is refused before delivery, also inside a r
     '1e99999999999',
     // Below the largest double, so JSON.parse reads it, but serde_json 1.0.151 overflows on it.
     '1797693134862315668.0835e290',
+    // The double just above 1.79e308, and a literal between it and the largest double.
+    '1.7900000000000002e308',
+    '1.795e308',
   ];
   assert.ok(Number.isFinite(Number(numbers.at(-1))));
   for (const number of numbers) {
@@ -192,6 +371,17 @@ test('phoneUnreadableReason reads the text itself', () => {
   assert.equal(phoneUnreadableReason(`{"n":${PHONE_NUMBER_MAX}}`), null);
   assert.equal(phoneUnreadableReason(`{"n":-${PHONE_NUMBER_MAX}}`), null);
   assert.match(String(phoneUnreadableReason('{"n":1.791e308}')), /beyond the range/);
+  // The bound applies to the number as JavaScript reads it, rounded to the nearest double: the
+  // double just above 1.79e308 is refused, a longer literal that rounds to 1.79e308 is not, and
+  // anything read as infinity is refused.
+  assert.equal(Number('1.7900000000000002e308') > PHONE_NUMBER_MAX, true);
+  assert.match(String(phoneUnreadableReason('{"n":1.7900000000000002e308}')), /beyond the range/);
+  assert.match(String(phoneUnreadableReason('{"n":-1.7900000000000002e308}')), /beyond the range/);
+  assert.match(String(phoneUnreadableReason('{"n":1e309}')), /beyond the range/);
+  assert.equal(Number('1.79000000000000001e308'), PHONE_NUMBER_MAX);
+  assert.equal(phoneUnreadableReason('{"n":1.79000000000000001e308}'), null);
+  assert.equal(phoneUnreadableReason(`{"n":179${'0'.repeat(306)}}`), null);
+  assert.equal(phoneUnreadableReason('{"n":1.7899999999999998e308}'), null);
   assert.match(String(phoneUnreadableReason('{"a":"\\ud83d","a":"ok"}')), /a string contains/);
   assert.match(String(phoneUnreadableReason('{"\\udc00" : 1}')), /a member name contains/);
   assert.match(String(phoneUnreadableReason(`{"a":${'{"b":'.repeat(64)}0${'}'.repeat(64)}}`)), /nested more than 64/);
@@ -203,7 +393,10 @@ test('phoneUnreadableReason reads the text itself', () => {
 test('requestIdText gives the id as Claude wrote it, or null when the phone would not answer it', () => {
   /** @param {string} text */
   const idOf = (text) => requestIdText(text, JSON.parse(text));
-  assert.equal(idOf('{"id":"a\\u0062"}'), '"ab"');
+  // A string id keeps its escapes: the relay's own answers echo it as Claude wrote it.
+  assert.equal(idOf('{"id":"a\\u0062"}'), '"a\\u0062"');
+  assert.equal(idOf('{"id"\t:\r\n"A\\/b" }'), '"A\\/b"');
+  assert.equal(idOf('{"id":"x","id":"y"}'), '"y"', 'the last of repeated members, as JSON.parse reads it');
   assert.equal(idOf('{"id": 9007199254740993 }'), '9007199254740993');
   assert.equal(idOf('{"id":1,"id":18446744073709551615}'), '18446744073709551615');
   assert.equal(idOf('{"id":-9223372036854775808}'), '-9223372036854775808');

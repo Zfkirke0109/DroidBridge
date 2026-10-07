@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MAX_IN_FLIGHT } from '../src/relay.js';
-import { ORIGIN, makeRelay, mcp, obtainTokens, poll, toolsCall, waitFor } from './helpers.js';
+import { ORIGIN, makeRelay, mcp, obtainTokens, poll, promptly, toolsCall, waitFor } from './helpers.js';
 
 const CHALLENGE = `Bearer resource_metadata="${ORIGIN}/.well-known/oauth-protected-resource", scope="droidbridge"`;
 
@@ -88,29 +88,40 @@ test('body over 262144 bytes is 413', async () => {
   assert.equal((await mcp(t, token, padded)).status, 503, 'exactly the limit is accepted');
 });
 
-test('invalid JSON and non-request bodies are 400 JSON-RPC errors with id null', async () => {
+test('invalid JSON and non-request bodies are 400 JSON-RPC errors, with the id when the phone would answer it', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204); // online: a delivered message would wait
+  // [body, JSON-RPC code, the id member of the answer as JSON text]
   const cases = [
-    ['{not json', -32700],
-    ['[{"jsonrpc":"2.0","id":1,"method":"ping"}]', -32600],
-    ['"text"', -32600],
-    ['{"jsonrpc":"1.0","id":1,"method":"ping"}', -32600],
-    ['{"jsonrpc":"2.0","id":1}', -32600],
-    ['{"jsonrpc":"2.0","id":1,"result":{}}', -32600],
-    ['{"jsonrpc":"2.0","id":null,"method":"ping"}', -32600],
-    ['{"jsonrpc":"2.0","id":1.5,"method":"ping"}', -32600],
-    ['{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}', -32600],
+    ['{not json', -32700, 'null'],
+    ['[{"jsonrpc":"2.0","id":1,"method":"ping"}]', -32600, 'null'],
+    ['"text"', -32600, 'null'],
+    ['{"jsonrpc":"1.0","id":1,"method":"ping"}', -32600, '1'],
+    ['{"jsonrpc":"1.0","id":"A\\/b","method":"ping"}', -32600, '"A\\/b"'],
+    ['{"jsonrpc":"1.0","id":9007199254740993,"method":"ping"}', -32600, '9007199254740993'],
+    ['{"jsonrpc":"2.0","id":77,"method":5}', -32600, '77'],
+    ['{"jsonrpc":"2.0","id":1}', -32600, '1'],
+    ['{"jsonrpc":"2.0","id":1,"result":{}}', -32600, '1'],
+    ['{"jsonrpc":"2.0","id":null,"method":"ping"}', -32600, 'null'],
+    ['{"jsonrpc":"2.0","id":1.5,"method":"ping"}', -32600, 'null'],
+    ['{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}', -32600, 'null'],
+    ['{"jsonrpc":"1.0","id":1.5,"method":"ping"}', -32600, 'null'],
+    ['{"jsonrpc":"1.0","method":"notifications/initialized"}', -32600, 'null'],
+    // The phone refuses a message that carries result or error besides its method before it
+    // runs anything, so the relay refuses it before delivery.
+    ['{"jsonrpc":"2.0","id":9,"method":"tools/list","result":{}}', -32600, '9'],
+    ['{"jsonrpc":"2.0","id":"e","method":"tools/list","error":{"code":1,"message":"x"}}', -32600, '"e"'],
+    ['{"jsonrpc":"2.0","method":"notifications/initialized","result":null}', -32600, 'null'],
   ];
-  for (const [body, code] of cases) {
-    const res = await mcp(t, token, body);
+  for (const [body, code, idText] of cases) {
+    const res = await promptly(mcp(t, token, body), String(body));
     assert.equal(res.status, 400, String(body));
-    const error = await res.json();
-    assert.equal(error.jsonrpc, '2.0');
-    assert.equal(error.id, null);
-    assert.equal(error.error.code, code, String(body));
-    assert.equal(typeof error.error.message, 'string');
+    const text = await res.text();
+    assert.ok(text.startsWith(`{"jsonrpc":"2.0","id":${idText},"error":{"code":${code},`), text);
+    assert.equal(typeof JSON.parse(text).error.message, 'string');
   }
+  assert.equal(t.relay.hub.inspect().inFlight, 0, 'nothing was offered to the phone');
   const bad = new Uint8Array([0x7b, 0xff, 0x7d]);
   const res = await t.relay.fetch(
     new Request(`${ORIGIN}/mcp`, {

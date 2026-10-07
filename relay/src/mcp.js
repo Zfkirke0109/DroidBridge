@@ -34,10 +34,12 @@ export const MCP_BODY_LIMIT_BYTES = 262_144;
  */
 export const MCP_MAX_DEPTH = 64;
 /**
- * Largest magnitude of a number the phone is sure to read. serde_json refuses a number beyond
- * the double range (1e400 is an error, not infinity), and it computes a number as its digits
- * times a power of ten, which can overflow within a few units in the last place of the largest
- * double (about 1.7977e308). This bound keeps clear of that.
+ * Largest magnitude of a number the phone is sure to read. A number literal is refused when
+ * Number() reads it (rounding to the nearest double) as a magnitude above this, or as Infinity;
+ * a longer literal that rounds to exactly this double is accepted. serde_json refuses a number
+ * beyond the double range (1e400 is an error, not infinity), and it computes a number as its
+ * digits times a power of ten, which can overflow within a few units in the last place of the
+ * largest double (about 1.7977e308). This bound keeps clear of that.
  */
 export const PHONE_NUMBER_MAX = 1.79e308;
 /** An unpaired UTF-16 surrogate: in `u` mode a correctly paired one matches as one code point. */
@@ -50,7 +52,7 @@ const U64_MAX = 2n ** 64n - 1n;
 const BETWEEN_TOKENS = /[ \t\n\r,:]*/y;
 /**
  * Set by the Durable Object on every POST /mcp answer it makes on purpose, so the Worker can
- * tell a deliberate status (503 offline, a notification's 502, the phone's own 5xx) from a
+ * tell a deliberate 5xx (only ever the 503 for a request that was not delivered) from a
  * failure. Internal: the Worker removes it before the answer reaches Claude.
  */
 export const RELAY_ANSWER_HEADER = 'X-DroidBridge-Relay-Answer';
@@ -123,10 +125,12 @@ function rpcErrorResponse(status, idText, code, message, relayData, headers = {}
  */
 export function requestIdText(text, message) {
   const id = message.id;
-  if (typeof id === 'string') return JSON.stringify(id);
-  if (typeof id !== 'number') return null;
+  if (typeof id !== 'string' && typeof id !== 'number') return null;
+  // The source text, not JSON.stringify(id): a string keeps its escapes ("A\/b" stays "A\/b").
   const source = memberSource(text, 'id');
-  if (source === undefined || !INTEGER_ID.test(source)) return null;
+  if (source === undefined) return null;
+  if (typeof id === 'string') return source;
+  if (!INTEGER_ID.test(source)) return null;
   const value = BigInt(source);
   return value >= I64_MIN && value <= U64_MAX ? source : null;
 }
@@ -200,11 +204,20 @@ export async function handleMcp(relay, request, origin, progress = mcpProgress()
     return rpcErrorResponse(400, null, -32600, 'Invalid Request: the body must be a single JSON-RPC object.');
   }
   // The phone only answers JSON-RPC 2.0 requests and notifications with a string or integer id;
-  // anything else would never be answered, so it is refused here instead of waiting it out.
+  // anything else would never be answered, so it is refused here instead of waiting it out. It
+  // also refuses, before running anything, a message that carries `result` or `error` besides
+  // its method; refused here, Claude learns it was not delivered rather than "may have run".
+  // The answer echoes the id whenever it is one the phone would answer, else null.
   const isRequest = hasOwn(message, 'id');
   const idText = isRequest ? requestIdText(text, message) : null;
-  if (message.jsonrpc !== '2.0' || typeof message.method !== 'string' || (isRequest && idText === null)) {
-    return rpcErrorResponse(400, null, -32600, 'Invalid Request: expected a JSON-RPC 2.0 request or notification.');
+  if (
+    message.jsonrpc !== '2.0' ||
+    typeof message.method !== 'string' ||
+    hasOwn(message, 'result') ||
+    hasOwn(message, 'error') ||
+    (isRequest && idText === null)
+  ) {
+    return rpcErrorResponse(400, idText, -32600, 'Invalid Request: expected a JSON-RPC 2.0 request or notification.');
   }
   // The phone must be able to read the message text, or it would drop the whole poll response
   // carrying it, together with every other command in that response.
@@ -321,6 +334,27 @@ export function isResponseFor(reply, replyText, idText) {
 }
 
 /**
+ * Statuses below 500 after which an HTTP client may send the same request again on its own:
+ * 401 and 407 (RFC 9110 lets it repeat the request with new credentials, and MCP clients do:
+ * they refresh the token and resend the message), 408, 421 (retried even for a non-idempotent
+ * POST), 425 and 429. Each could run a delivered message a second time. 413 is here too, because
+ * it is kept for a body the relay refused before delivery.
+ */
+const UNSAFE_AFTER_DELIVERY = new Set([401, 407, 408, 413, 421, 425, 429]);
+
+/**
+ * Whether Claude must not get this status for a message already handed to the phone: one an
+ * HTTP client may retry on its own (see UNSAFE_AFTER_DELIVERY, and every 5xx), which could run
+ * the message a second time, or 413. The phone can really answer 413: its tunnel client
+ * re-encodes the message before the facade checks its 262 144-byte limit, and re-encoding can
+ * make it longer.
+ * @param {number} status
+ */
+export function unsafeAfterDelivery(status) {
+  return UNSAFE_AFTER_DELIVERY.has(status) || status >= 500;
+}
+
+/**
  * @param {Outcome} outcome
  * @param {boolean} isRequest
  * @param {string | null} idText the request's id as JSON text (see requestIdText)
@@ -338,7 +372,7 @@ export function outcomeResponse(outcome, isRequest, idText) {
 
   // The phone's reply was delivered but cannot be passed on. A request gets HTTP 200 (no
   // HTTP-layer replay of something that may have run) with a JSON-RPC error; a notification has
-  // no body to carry that, so it gets 502.
+  // no body to carry that, so it gets an empty HTTP 200, like a relay failure after delivery.
   const invalidReply = () =>
     isRequest
       ? rpcErrorResponse(200, idText, -32603, MESSAGES.invalid, {
@@ -346,7 +380,7 @@ export function outcomeResponse(outcome, isRequest, idText) {
           delivered: true,
           retried: false,
         })
-      : empty(502);
+      : empty(200);
 
   switch (outcome.kind) {
     case 'offline':
@@ -369,7 +403,10 @@ export function outcomeResponse(outcome, isRequest, idText) {
       const status = payload.resp_code;
       // 100..199 cannot be sent as a final response, so they count as invalid like 600+.
       if (!Number.isInteger(status) || status < 200 || status > 599) return invalidReply();
-      if (!isRequest) return empty(status);
+      // The phone got the message and may have run it, so a status a client could replay (or
+      // 413) goes out as HTTP 200; for a request the phone's JSON-RPC body says what happened.
+      const answerStatus = unsafeAfterDelivery(status) ? 200 : status;
+      if (!isRequest) return empty(answerStatus);
       // A request needs a JSON-RPC response for its own id, in a status that can carry a body;
       // anything else would leave Claude with an empty or wrong answer.
       const bodyless = status === 204 || status === 205 || status === 304;
@@ -377,7 +414,7 @@ export function outcomeResponse(outcome, isRequest, idText) {
       // Claude gets resp_json as the phone wrote it, not re-encoded.
       const replyText = memberSource(source, 'resp_json');
       if (replyText === undefined || !isResponseFor(payload.resp_json, replyText, idText)) return invalidReply();
-      return jsonText(status, replyText);
+      return jsonText(answerStatus, replyText);
     }
     default:
       // Unreachable; the caller's failure path answers with what is known about delivery.

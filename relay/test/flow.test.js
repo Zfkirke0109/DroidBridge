@@ -1,7 +1,7 @@
 // @ts-check
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { RELAY_ANSWER_HEADER } from '../src/mcp.js';
+import { RELAY_ANSWER_HEADER, outcomeResponse } from '../src/mcp.js';
 import {
   CLAUDE_CALLBACK,
   ORIGIN,
@@ -186,10 +186,11 @@ test('notification round trip: phone notify_ack status reaches Claude with no bo
   assert.equal(await answer.text(), '');
 });
 
-test('an invalid phone status code: HTTP 200 JSON-RPC error for requests, 502 for notifications', async () => {
+test('an invalid phone status code: HTTP 200 JSON-RPC error for requests, an empty HTTP 200 for notifications', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
-  for (const bad of [700, 99, 150, 'x']) {
+  // Not an integer from 200 to 599: just past either end, far past it, or a fraction.
+  for (const bad of [700, 600, 699, 199, 99, 150, 0, -1, 200.5, 404.5, 'x', '200', null, true]) {
     const pollPromise = poll(t);
     await waitFor(() => t.relay.hub.inspect().parked);
     const answerPromise = mcp(t, token, { jsonrpc: '2.0', id: 3, method: 'tools/list' });
@@ -203,15 +204,20 @@ test('an invalid phone status code: HTTP 200 JSON-RPC error for requests, 502 fo
     assert.deepEqual(body.error.data.droidbridge_relay, { state: 'invalid_device_reply', delivered: true, retried: false });
     assert.match(body.error.message, /not retried/);
   }
-  const pollPromise = poll(t);
-  await waitFor(() => t.relay.hub.inspect().parked);
-  const notePromise = mcp(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' });
-  const [command] = (await (await pollPromise).json()).commands;
-  assert.equal((await respond(t, command, { resp_code: 42 })).status, 200);
-  const note = await notePromise;
-  assert.equal(note.status, 502);
-  assert.equal(note.headers.get(RELAY_ANSWER_HEADER), '1', 'a deliberate 502 the Worker passes through');
-  assert.equal(await note.text(), '');
+  // A notification has no body to carry the error: it gets an empty 200, never a 5xx a client
+  // could replay after delivery.
+  for (const bad of [42, 700, 600, 99, 150, 200.5, 'x']) {
+    const pollPromise = poll(t);
+    await waitFor(() => t.relay.hub.inspect().parked);
+    const notePromise = mcp(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' });
+    const [command] = (await (await pollPromise).json()).commands;
+    assert.equal((await respond(t, command, { resp_code: bad })).status, 200);
+    const note = await notePromise;
+    assert.equal(note.status, 200, `resp_code ${bad}`);
+    assert.equal(note.headers.get(RELAY_ANSWER_HEADER), '1', 'a deliberate answer');
+    assert.equal(await note.text(), '');
+  }
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
 });
 
 /**
@@ -267,6 +273,8 @@ test('a request reply without a JSON-RPC response for the same id is an invalid 
     { resp_code: 503, resp_json: { jsonrpc: '2.0', id: 4, error: { code: -32000, message: 'Runtime unavailable' } } },
     { resp_code: 500, resp_json: { jsonrpc: '2.0', id: 3, error: null } },
     { resp_code: 404, resp_json: { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'x' } } },
+    { resp_code: 413, resp_json: undefined },
+    { resp_code: 429, resp_json: { jsonrpc: '2.0', id: '3', error: { code: -32000, message: 'x' } } },
   ];
   for (const overrides of invalid) {
     const label = JSON.stringify(overrides);
@@ -284,7 +292,7 @@ test('a request reply without a JSON-RPC response for the same id is an invalid 
   assert.equal(t.clock.pendingTimers(), 0);
 });
 
-test('valid JSON-RPC replies pass through with the phone status, whatever it is', async () => {
+test('valid JSON-RPC replies pass through with the phone status when no client would replay it', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
   /** @type {[Record<string, unknown>, Record<string, unknown>, number][]} */
@@ -293,27 +301,112 @@ test('valid JSON-RPC replies pass through with the phone status, whatever it is'
     [{ jsonrpc: '2.0', id: 0, method: 'ping' }, { jsonrpc: '2.0', id: 0, result: {} }, 200],
     [
       { jsonrpc: '2.0', id: 5, method: 'tools/call' },
-      { jsonrpc: '2.0', id: 5, error: { code: -32603, message: 'MCP request failed', data: { x: 1 } } },
-      500,
+      { jsonrpc: '2.0', id: 5, error: { code: -32601, message: 'Method not found' } },
+      404,
     ],
     [
       { jsonrpc: '2.0', id: 6, method: 'tools/call' },
-      { jsonrpc: '2.0', id: 6, error: { code: -32000, message: 'Runtime unavailable' } },
-      503,
+      { jsonrpc: '2.0', id: 6, error: { code: -32602, message: 'Invalid params' } },
+      400,
     ],
+    // Neighbours of the statuses that become HTTP 200 still pass through: an MCP client resends
+    // after a 403 only when its WWW-Authenticate asks for more scope, and the relay never
+    // forwards the phone's headers.
+    ...[400, 402, 403, 406, 409, 412, 414, 415, 420, 422, 424, 426, 428, 430, 499].map(
+      (status) => /** @type {[Record<string, unknown>, Record<string, unknown>, number]} */ ([
+        { jsonrpc: '2.0', id: status, method: 'tools/call' },
+        { jsonrpc: '2.0', id: status, error: { code: -32000, message: `phone ${status}` } },
+        status,
+      ]),
+    ),
   ];
   for (const [request, reply, status] of cases) {
     const { ack, answer } = await roundTrip(t, token, request, { resp_json: reply, resp_code: status });
     assert.equal(ack.status, 200);
     assert.equal(answer.status, status);
-    // The phone's own status is a deliberate answer, so the Worker passes it through.
     assert.equal(answer.headers.get(RELAY_ANSWER_HEADER), '1');
     assert.deepEqual(await answer.json(), reply);
   }
   // A notification needs no body: a valid status passes through without one.
-  const note = await roundTrip(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' }, { resp_code: 202 });
-  assert.equal(note.answer.status, 202);
-  assert.equal(await note.answer.text(), '');
+  for (const status of [202, 400, 404]) {
+    const note = await roundTrip(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' }, { resp_code: status });
+    assert.equal(note.answer.status, status);
+    assert.equal(await note.answer.text(), '');
+  }
+});
+
+test('after delivery a phone status a client could replay, or 413, reaches Claude as HTTP 200', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  // The phone's facade answers 413 when its tunnel client's re-encoding made the message longer
+  // than 262 144 bytes; a 5xx, 429, 408, 425 or 421 could make an HTTP client run it a second
+  // time, and so could 401 or 407, after which an MCP client gets new credentials and resends.
+  for (const status of [413, 500, 503, 429, 408, 425, 401, 407, 421, 502, 504, 599]) {
+    const reply = { jsonrpc: '2.0', id: status, error: { code: -32603, message: 'MCP request failed' } };
+    const { ack, answer } = await roundTrip(t, token, { jsonrpc: '2.0', id: status, method: 'tools/call' }, {
+      resp_json: reply,
+      resp_code: status,
+    });
+    assert.equal(ack.status, 200);
+    assert.equal(answer.status, 200, `phone status ${status}`);
+    assert.equal(answer.headers.get('content-type'), 'application/json');
+    assert.equal(answer.headers.get(RELAY_ANSWER_HEADER), '1');
+    assert.deepEqual(await answer.json(), reply, 'the phone\'s JSON-RPC error, unchanged');
+  }
+  // The reply is still checked: a 413 carrying another request's id is an invalid device reply.
+  const other = await roundTrip(t, token, { jsonrpc: '2.0', id: 'big', method: 'tools/call' }, {
+    resp_json: { jsonrpc: '2.0', id: 'other', error: { code: -32603, message: 'MCP request failed' } },
+    resp_code: 413,
+  });
+  assert.equal(other.answer.status, 200);
+  const invalid = await other.answer.json();
+  assert.equal(invalid.id, 'big');
+  assert.equal(invalid.error.code, -32603);
+  assert.deepEqual(invalid.error.data.droidbridge_relay, { state: 'invalid_device_reply', delivered: true, retried: false });
+  // A notification gets an empty 200.
+  for (const status of [413, 429, 500, 408, 425, 401, 407, 421, 503, 599]) {
+    const note = await roundTrip(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' }, { resp_code: status });
+    assert.equal(note.ack.status, 200);
+    assert.equal(note.answer.status, 200, `phone status ${status}`);
+    assert.equal(await note.answer.text(), '');
+  }
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal(t.clock.pendingTimers(), 0);
+});
+
+test('outcomeResponse: every phone status from 200 to 599, for a request and a notification', async () => {
+  // Statuses an HTTP client may retry on its own, and 413, which is kept for "not delivered".
+  const replayable = (/** @type {number} */ status) =>
+    [401, 407, 408, 413, 421, 425, 429].includes(status) || status >= 500;
+  const reply = '{"jsonrpc":"2.0","id":1,"result":{}}';
+  for (let status = 200; status <= 599; status += 1) {
+    const bodyless = status === 204 || status === 205 || status === 304;
+    const source = `{"request_id":"r","resp_json":${reply},"resp_code":${status}}`;
+    const outcome = /** @type {const} */ ({ kind: 'settled', payload: JSON.parse(source), source });
+    const expected = replayable(status) ? 200 : status;
+    const res = outcomeResponse(outcome, true, '1');
+    assert.equal(res.status, bodyless ? 200 : expected, `request, phone status ${status}`);
+    const text = await res.text();
+    if (bodyless) assert.equal(JSON.parse(text).error.code, -32603, `request, phone status ${status}`);
+    else assert.equal(text, reply, `request, phone status ${status}`);
+    const note = outcomeResponse(outcome, false, null);
+    assert.equal(note.status, expected, `notification, phone status ${status}`);
+    assert.equal(await note.text(), '');
+  }
+  // Nothing but an integer from 200 to 599 is a valid status. A request's reply with any other
+  // is invalid even with a valid body (HTTP 200, -32603); a notification's is an empty 200.
+  for (const status of [199, 600, 601, 699, 0, -1, 200.5, 404.5, 599.5]) {
+    const source = `{"request_id":"r","resp_json":${reply},"resp_code":${status}}`;
+    const outcome = /** @type {const} */ ({ kind: 'settled', payload: JSON.parse(source), source });
+    const res = outcomeResponse(outcome, true, '1');
+    assert.equal(res.status, 200, `request, phone status ${status}`);
+    const body = await res.json();
+    assert.equal(body.error.code, -32603, `request, phone status ${status}`);
+    assert.equal(body.error.data.droidbridge_relay.state, 'invalid_device_reply');
+    const note = outcomeResponse(outcome, false, null);
+    assert.equal(note.status, 200, `notification, phone status ${status}`);
+  }
+  assert.equal(outcomeResponse({ kind: 'invalid' }, false, null).status, 200);
 });
 
 test('metadata endpoints follow the design', async () => {

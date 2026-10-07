@@ -117,6 +117,9 @@ async function poll(relay, request, url) {
   const limit = clampInt(url.searchParams.get('limit'), 1, POLL_LIMIT_MAX, POLL_LIMIT_MAX);
   const cap = relay.timings.pollCapMs;
   const timeout = clampInt(url.searchParams.get('timeout_ms'), 0, cap, Math.min(POLL_DEFAULT_TIMEOUT_MS, cap));
+  // The phone polls around the clock, so its polls also keep expired OAuth records from
+  // lingering in storage; the poll does not wait for that.
+  relay.sweepInBackground();
   // Each command arrives already encoded (it was encoded when Claude's request was accepted),
   // so the body is only joined text and cannot fail after the commands were marked delivered.
   const commands = await relay.hub.poll(limit, timeout, request.signal);

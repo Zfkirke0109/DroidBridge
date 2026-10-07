@@ -282,12 +282,15 @@ test('an unreadable device reply with the request\'s shard token is 400 and sett
   }
   assert.equal(t.clock.pendingTimers(), 0);
 
-  // A notification: 502 with no body, also at once.
+  // A notification: an empty 200 (never a 5xx a client could replay), also at once.
   const note = await deliverOne(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' });
+  const noteStartedAt = t.clock.now();
   assert.equal((await sendRaw(t, '{oops', note.command.shard_token)).status, 400);
   const noteRes = await note.answer;
-  assert.equal(noteRes.status, 502);
+  assert.equal(t.clock.now(), noteStartedAt, 'no waiting for the deadline');
+  assert.equal(noteRes.status, 200);
   assert.equal(await noteRes.text(), '');
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
 });
 
 test('an oversized device reply is 413 and settles its request at once as invalid_device_reply', async () => {
@@ -314,11 +317,11 @@ test('an oversized device reply is 413 and settles its request at once as invali
   assert.equal((await respond(t, command)).status, 404, 'settled: a later reply is 404');
   assert.equal(t.clock.pendingTimers(), 0);
 
-  // A notification: 502 with no body.
+  // A notification: an empty 200.
   const note = await deliverOne(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' });
   assert.equal((await send(note.command.shard_token)).status, 413);
   const noteRes = await note.answer;
-  assert.equal(noteRes.status, 502);
+  assert.equal(noteRes.status, 200);
   assert.equal(await noteRes.text(), '');
 });
 
@@ -361,8 +364,9 @@ test('poll limit caps the batch; the remainder waits for the next poll', async (
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
   assert.equal((await poll(t, 0)).status, 204);
-  const answers = [mcp(t, token, toolsCall(1)), mcp(t, token, toolsCall(2)), mcp(t, token, toolsCall(3))];
-  await waitFor(() => t.relay.hub.inspect().handoff === 3);
+  // One at a time: each request reaches the hand-off list only after its token is checked
+  // (a WebCrypto digest off the main thread), so concurrent ones could arrive in any order.
+  const answers = await submitInOrder(t, token, [1, 2, 3]);
   const first = await (await poll(t, 15000, 2)).json();
   assert.deepEqual(first.commands.map((command) => command.jsonrpc.id), [1, 2]);
   const second = await (await poll(t, 15000, 2)).json();
@@ -725,8 +729,7 @@ test('a timer failure while a poll takes the hand-off batch delivers none of it;
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
   assert.equal((await poll(t, 0)).status, 204);
-  const answers = [mcp(t, token, toolsCall('b1')), mcp(t, token, toolsCall('b2')), mcp(t, token, toolsCall('b3'))];
-  await waitFor(() => t.relay.hub.inspect().handoff === 3);
+  const answers = await submitInOrder(t, token, ['b1', 'b2', 'b3']);
   failNthTimer(t, 2); // the second deadline of the batch
   const failed = await poll(t, 0);
   assert.equal(failed.status, 500);
@@ -751,8 +754,7 @@ test('a timer failure on a poll with no later poll ends every waiting request as
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
   assert.equal((await poll(t, 0)).status, 204);
-  const answers = [mcp(t, token, toolsCall('c1')), mcp(t, token, toolsCall('c2'))];
-  await waitFor(() => t.relay.hub.inspect().handoff === 2);
+  const answers = await submitInOrder(t, token, ['c1', 'c2']);
   failNthTimer(t, 1);
   assert.equal((await poll(t, 0)).status, 500);
   await t.clock.advance(5000);
@@ -764,6 +766,22 @@ test('a timer failure on a poll with no later poll ends every waiting request as
   assert.equal(t.relay.hub.inspect().inFlight, 0);
   assert.equal(t.clock.pendingTimers(), 0);
 });
+
+/**
+ * Sends one tools/call per id, each only after the previous one waits in the hand-off list, so
+ * the list holds them in this order. Returns Claude's pending answers.
+ * @param {ReturnType<typeof makeRelay>} t
+ * @param {string} token
+ * @param {(string | number)[]} ids
+ */
+async function submitInOrder(t, token, ids) {
+  const answers = [];
+  for (const id of ids) {
+    answers.push(mcp(t, token, toolsCall(id)));
+    await waitFor(() => t.relay.hub.inspect().handoff === answers.length);
+  }
+  return answers;
+}
 
 /**
  * Makes the next clearTimeout call throw once.
@@ -1006,6 +1024,35 @@ test('a parked phone poll whose connection drops stops counting as waiting', asy
   const res = await answer;
   assert.equal(res.status, 503);
   assert.deepEqual((await res.json()).error.data.droidbridge_relay, { state: 'unavailable', delivered: false });
+});
+
+test('without a disconnect signal a dead poll is handed requests until it times out, and counts as online 5 s more', async () => {
+  // What enable_request_signal prevents: the relay cannot tell this poll's connection is gone.
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const dead = poll(t, 25_000);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  await t.clock.advance(24_000);
+  const lost = mcp(t, token, toolsCall('lost'));
+  assert.equal((await dead).status, 200, 'handed to the dead poll');
+  await t.clock.advance(1000);
+  assert.equal(t.relay.hub.isOnline(), true);
+  const idle = poll(t, 25_000);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  await t.clock.advance(25_000);
+  assert.equal((await idle).status, 204);
+  await t.clock.advance(5000);
+  assert.equal(t.relay.hub.isOnline(), true, '30 s after that poll started');
+  await t.clock.advance(1);
+  assert.equal(t.relay.hub.isOnline(), false);
+  await t.clock.advance(245_000);
+  const res = await lost;
+  assert.equal(res.status, 200);
+  assert.deepEqual((await res.json()).error.data.droidbridge_relay, {
+    state: 'settlement_unknown',
+    delivered: true,
+    retried: false,
+  });
 });
 
 test('withdraw: a delivered request ends as unknown and a late reply is 404; a waiting one is never delivered', async () => {

@@ -116,6 +116,45 @@ test('code reuse revokes the family issued from it', async () => {
   assert.equal((await refresh.json()).error, 'invalid_grant');
 });
 
+test('a replayed code revokes its grant whatever client_id, redirect_uri or code_verifier comes with it', async () => {
+  // Each of these alone would be refused before the code is looked at (401 invalid_client or
+  // 400 invalid_request); a replay must still revoke, as a replayed refresh token does.
+  /** @type {Record<string, string>[]} */
+  const variants = [
+    { client_id: 'nobody-here' },
+    { client_id: '' },
+    { code_verifier: 'x'.repeat(10) },
+    { code_verifier: '' },
+    { redirect_uri: '' },
+    { redirect_uri: 'https://claude.com/api/mcp/auth_callback' },
+    { resource: 'https://other.example/mcp' },
+  ];
+  for (const overrides of variants) {
+    const label = JSON.stringify(overrides);
+    const t = makeRelay();
+    const grant = await obtainCode(t);
+    const first = await tokenPost(t, codeExchange(grant));
+    assert.equal(first.status, 200);
+    const tokens = await first.json();
+    assert.ok(await tokenWorks(t, tokens.access_token), label);
+    const replay = await tokenPost(t, codeExchange(grant, overrides));
+    assert.equal(replay.status, 400, label);
+    const error = await replay.json();
+    assert.equal(error.error, 'invalid_grant', label);
+    assert.match(error.error_description, /already used\. Tokens issued from it were revoked/, label);
+    assert.equal(await tokenWorks(t, tokens.access_token), false, `${label}: the grant is revoked`);
+    const refresh = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: grant.clientId });
+    assert.equal(refresh.status, 400, label);
+    assert.equal(t.storage.keys('family:').length, 0, label);
+  }
+  // A code that was never redeemed is not consumed by a request refused for those reasons.
+  const t = makeRelay();
+  const grant = await obtainCode(t);
+  assert.equal((await tokenPost(t, codeExchange(grant, { client_id: 'nobody-here' }))).status, 401);
+  assert.equal((await tokenPost(t, codeExchange(grant, { code_verifier: 'x' }))).status, 400);
+  assert.equal((await tokenPost(t, codeExchange(grant))).status, 200);
+});
+
 test('a replayed code still revokes its grant long after the code expired, for as long as the grant exists', async () => {
   const t = makeRelay();
   const grant = await obtainCode(t);

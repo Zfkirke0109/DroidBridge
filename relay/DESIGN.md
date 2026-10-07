@@ -30,20 +30,32 @@ the phone encrypted under its own Android Keystore alias.
 
 The relay is transport-only. It authenticates both sides, moves JSON-RPC bodies, and never
 interprets, caches, queues for later, or retries an MCP request. It moves each message as the
-text it received: Claude's request body goes into the poll response exactly as Claude sent it,
-and the phone's `resp_json` reaches Claude exactly as the phone wrote it. The relay parses them
-only to check them and never re-encodes them, so no value changes on the way: an integer above
-2^53 (a 64-bit inode, a nanosecond timestamp, a 64-bit id), `-0` and every other number keep
-their digits, and escapes, whitespace and member order stay as written.
+text it received: Claude's request body goes into the poll response exactly as Claude sent it
+(except that a leading UTF-8 byte order mark is removed when the body is decoded; every byte
+after it is forwarded unchanged), and the phone's `resp_json` reaches Claude exactly as the phone
+wrote it. The relay parses them only to check them and never re-encodes them, so no value
+changes inside the relay: an integer above 2^53 (a 64-bit inode, a nanosecond timestamp, a
+64-bit id), `-0` and every other number keep their digits, and escapes, whitespace and member
+order stay as written.
+
+Byte-exactness ends at the relay. The phone's tunnel client parses each command into a
+serde_json `Value` and encodes it again before the MCP facade sees it, so on the phone a number
+written with an exponent (`1e15` becomes `1000000000000000.0`) or with more digits than a double
+holds, an integer outside the i64/u64 range, `-0` (which becomes `-0.0`) and string escapes may be
+rewritten, and the message can grow. A re-encoded message over the facade's 262 144-byte limit is
+refused by the phone with 413, which reaches Claude as HTTP 200 carrying the phone's JSON-RPC
+error (settlement rule 7).
 
 ### Execution settlement rules
 
 A JSON-RPC request (a message with an `id`) whose execution outcome is unknown is never answered
 with a retryable 5xx. The relay's own 4xx and 5xx statuses are kept for answers that provably did
 not deliver the request: the pre-delivery answers under "Claude side: MCP endpoint" and rules 1
-and 2 below. Every POST /mcp ends in exactly one of these outcomes, or in a valid reply from the
-phone, which passes through with the phone's own status (see "Device protocol"). A notification
-has no body to carry an error, so an invalid device reply to one is answered 502.
+and 2 below. Once a message has been delivered to the phone, Claude never gets a status after
+which an HTTP client may send the request again on its own (401, 407, 408, 421, 425, 429 or any
+5xx), nor 413, which is kept for a body refused before delivery, whoever chose it (rule 7). Every
+POST /mcp ends in exactly one of these outcomes, or in a valid reply from the phone (see "Device
+protocol").
 
 1. **Offline means not delivered.** A request that arrives while no phone poll is waiting (and no
    poll ended in the last 5 s) is answered at once with HTTP 503 and a JSON-RPC error whose
@@ -84,10 +96,23 @@ has no body to carry an error, so an invalid device reply to one is answered 502
 
    The Durable Object marks every POST /mcp answer it makes on purpose with the internal header
    `X-DroidBridge-Relay-Answer`, which the Worker removes before the answer reaches Claude. The
-   Worker passes a 5xx through only when it carries that mark: the 503 of rules 1 and 2, a
-   notification's 502 for an invalid device reply, or the phone's own status on a valid reply
-   (the phone, not the relay, reports that outcome). Any other 5xx on POST /mcp, and a failed
-   call to the object, becomes the `D = null` answer above.
+   Worker passes a 5xx through only when it carries that mark, and the only 5xx the object
+   answers on purpose is the not-delivered 503 of rules 1 and 2 (rule 7 turns a phone 5xx into
+   HTTP 200). Any other 5xx on POST /mcp, and a failed call to the object, becomes the
+   `D = null` answer above.
+7. **After delivery, no replayable status.** A valid reply from the phone passes through with
+   the phone's own status (the phone, not the relay, reports that outcome), except 401, 407,
+   408, 413, 421, 425, 429 and 500 to 599. A request whose valid reply carries one of these is
+   answered HTTP 200 with the phone's `resp_json` text unchanged; the reply is still checked as
+   under "Device protocol", and an invalid one gets the HTTP 200 `-32603` answer. A
+   notification whose reply carries one of these, or whose reply is invalid, gets an empty HTTP
+   200, as in rule 6. The phone has the message and may have run it, so a status after which an
+   HTTP client might send it again on its own could run it twice: 401 and 407 invite a repeat
+   with new credentials (an MCP client refreshes its token and resends the message), 421 may be
+   retried even for a POST, and 408, 425, 429 and a 5xx may be retried too. 413 would claim the
+   message was refused before delivery. The phone's facade answers only 200, 400, 404, 405, 406,
+   413 and 415, and its 413 is real: the tunnel client re-encodes the message before the facade
+   checks its 262 144-byte limit, and re-encoding can make it longer (see "Decision").
 
 Seeing that Claude or the phone went away relies on `request.signal`. Cloudflare aborts it on a
 client disconnect only with the `enable_request_signal` compatibility flag, which has no
@@ -106,7 +131,7 @@ Device key format: `dbrk_` followed by 43 base64url characters (32 random bytes)
 | `GET /device/v1/status` | credential check for the app | 200 `{"schema_version":1,"protocol":"droidbridge-relay/1","authorized_clients":N,"pairing_active":bool}` |
 | `GET /device/v1/poll?limit=L&timeout_ms=T` | long-poll for commands (`L` capped at 8, `T` capped at 25 000, however many digits either has; a value that is not a non-negative integer means `L` = 8, `T` = 15 000) | 200 `{"commands":[…]}` or 204 on timeout |
 | `POST /device/v1/response` | result of one command; header `x-tunnel-shard-token` | 200 accepted; 400 unreadable body; 413 body too large; 404 unknown, settled, expired or token mismatch |
-| `POST /device/v1/pairing` | body `{"code_sha256":"<64 hex>","ttl_seconds":≤600}`; replaces any earlier code | 200 `{"expires_at":"<RFC 3339>"}` |
+| `POST /device/v1/pairing` | body `{"code_sha256":"<64 lowercase hex>","ttl_seconds":≤600}`; replaces any earlier code | 200 `{"expires_at":"<RFC 3339>"}` |
 | `DELETE /device/v1/pairing` | cancel the pairing code | 204 |
 | `POST /device/v1/revoke` | revoke every Claude grant: tokens, codes, pending consents, registered clients, pairing | 200 `{"revoked_tokens":N}` |
 
@@ -122,20 +147,23 @@ Command shape (one element of `commands`):
  "channel":"main","created_at":"<RFC 3339>","response_timeout":"240s",
  "headers":{"Content-Type":["application/json"],"Accept":["application/json, text/event-stream"],
             "MCP-Protocol-Version":["2026-07-28"],"Mcp-Method":["tools/call"],"Mcp-Name":["command"]},
- "jsonrpc":{…the request body, exactly as Claude sent it…}}
+ "jsonrpc":{…the request body, exactly as Claude sent it (less a leading byte order mark)…}}
 ```
 
 Response body posted by the phone: `{"request_id","channel","resp_json"?,"resp_headers"?,
 "resp_code","resp_type":"jsonrpc_response"|"notify_ack"}`. `resp_headers` and `resp_type` are
 neither forwarded nor interpreted. For a notification the relay answers Claude with `resp_code`
 and no body. For a request it answers with `resp_code` and the `resp_json` text exactly as the
-phone sent it, as `application/json`, provided `resp_json` is a JSON-RPC 2.0 response to that
-request: a JSON object with `"jsonrpc":"2.0"`, the request's `id` (same value and type: a string
-id the same string, a number id a number of exactly the same value, compared on its digits
-rather than as a double, so an id above 2^53 matches only itself), and exactly one of `result`
-and `error` (an object with an integer `code` and a string `message`), sent with a status that
-can carry a body (not 204, 205 or 304). The response body may be up to 13 048 576 bytes (the
-phone's 12 000 000-byte MCP response limit plus 1 MiB of envelope).
+phone sent it, as `application/json`. In both cases a `resp_code` of 401, 407, 408, 413, 421,
+425, 429 or 500 to 599 is answered as HTTP 200 instead (settlement rule 7), and every other valid
+one (200 to 400, 402 to 406, 409 to 412, 414 to 420, 422 to 424, 426 to 428, 430 to 499) passes
+through unchanged. A request's reply is valid only when `resp_json` is a JSON-RPC 2.0 response to
+that request: a JSON object with `"jsonrpc":"2.0"`, the request's `id` (same value and type: a
+string id the same string, a number id a number of exactly the same value, compared on its digits
+rather than as a double, so an id above 2^53 matches only itself), and exactly one of `result` and
+`error` (an object with an integer `code` and a string `message`), sent with a status that can
+carry a body (not 204, 205 or 304). The response body may be up to 13 048 576 bytes (the phone's 12 000 000-byte MCP response
+limit plus 1 MiB of envelope).
 
 **Invalid device replies.** A reply is invalid when:
 
@@ -151,7 +179,8 @@ phone's 12 000 000-byte MCP response limit plus 1 MiB of envelope).
 In the first two cases the phone gets 200 (its reply was accepted and settled the request). A
 request with an invalid reply gets HTTP 200 with a JSON-RPC error (`code -32603`,
 `data.droidbridge_relay` = `{"state":"invalid_device_reply","delivered":true,"retried":false}`)
-saying it may or may not have run and was not retried, and a notification gets HTTP 502.
+saying it may or may not have run and was not retried, and a notification gets an empty HTTP
+200, as after any other reply once a notification was delivered (settlement rules 6 and 7).
 
 Forwarded header allowlist (case-insensitive in, canonical case out, each value ≤ 4096 bytes):
 `Content-Type`, `Accept`, `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`. Nothing else is
@@ -160,23 +189,31 @@ forwarded; in particular `Authorization`, cookies and `Mcp-Session-Id` are not.
 ### Claude side: MCP endpoint
 
 `POST /mcp` only (GET/DELETE → 405 with `Allow: POST`). Body ≤ 262 144 bytes (413), JSON object
-(400), `Content-Type: application/json` (415). A request's `id` must be one the phone answers: a
-string, or an integer written without fraction or exponent, from -2^63 to 2^64 - 1 (the phone
-reads any other number, such as `1.0`, `1e0` or `-0`, as a float and ignores the request);
-anything else is 400 with `id` null. The relay's own JSON-RPC answers echo the request's `id`
-exactly as Claude wrote it.
+(400), `Content-Type: application/json` (415). It must be a JSON-RPC 2.0 request or
+notification: `"jsonrpc":"2.0"`, a string `method`, and no `result` or `error` member (the phone
+refuses such a message before running anything); anything else is 400, JSON-RPC `-32600`. A
+request's `id` must be one the phone answers: a string, or an integer written without fraction or
+exponent, from -2^63 to 2^64 - 1 (the phone reads any other number, such as `1.0`, `1e0` or
+`-0`, as a float and ignores the request); anything else is 400 with `id` null. The relay's own
+JSON-RPC answers echo the request's `id` exactly as Claude wrote it, a number with its digits and
+a string with its escapes (`"A\/b"` stays `"A\/b"`), whenever the body has an `id` the phone
+would answer, including in the `-32600` answer; otherwise their `id` is null.
 
-The phone gets the body text exactly as Claude sent it, never re-encoded, so a message is at
-most 262 144 bytes in the poll response too. The phone's JSON parser must be able to read that
-text, or it would drop the whole poll response with every other command in it, so the relay
-refuses, before delivery, anything in it that the phone cannot parse: nesting of objects and
-arrays deeper than 64 levels (the message object is level 1; the phone stops at 128 for the
-whole poll response), any string or member name holding an unpaired UTF-16 surrogate escape,
-such as a cut emoji `"\ud83d"`, and any number whose magnitude is above 1.79 × 10^308 (the
-phone's parser refuses a number beyond the double range, such as `1e400`, and can overflow just
-below the largest double). The check covers the whole text, including a member that JSON
-parsing would drop because a later member repeats its name. Such a message is answered 400,
-JSON-RPC `-32600` with the request's `id`, or an empty 400 for a notification.
+The phone gets the body text exactly as Claude sent it, never re-encoded, so a message is at most
+262 144 bytes in the poll response too. The one exception is a leading UTF-8 byte order mark,
+which decoding removes (the phone's parser would refuse it); every byte after it is forwarded
+unchanged. The phone's JSON parser must be able to read that text, or it would drop the whole poll
+response with every other command in it, so the relay refuses, before delivery, anything in it
+that the phone cannot parse: nesting of objects and arrays deeper than 64 levels (the message
+object is level 1; the phone stops at 128 for the whole poll response), any string or member name
+holding an unpaired UTF-16 surrogate escape, such as a cut emoji `"\ud83d"`, and any number
+literal that JavaScript reads (rounding it to the nearest double) as a magnitude above
+1.79 × 10^308, or as infinity, such as `1e400` or `1.795e308`. The phone's parser refuses a number
+beyond the double range and can overflow on one just below the largest double (about
+1.7977 × 10^308), so the bound keeps clear of both. A literal that rounds to 1.79 × 10^308 itself,
+such as `1.79000000000000001e308`, is accepted. The check covers the whole text, including a
+member that JSON parsing would drop because a later member repeats its name. Such a message is
+answered 400, JSON-RPC `-32600` with the request's `id`, or an empty 400 for a notification.
 
 At most 16 requests in flight (429, not delivered). These pre-delivery answers (401, 405, 413,
 415, 400, 429) and the not-delivered 503 of settlement rules 1 and 2 keep their status codes;
@@ -218,7 +255,7 @@ Follows the MCP 2026-07-28 authorization spec.
   An invalid `client_id` or `redirect_uri` is shown as an error page and never redirected to.
 - **Consent requires the phone.** `GET /authorize` validates `response_type=code`, PKCE `S256`
   (`code_challenge` 43–128 chars), `resource` (if present, must be `<origin>/mcp`) and `scope`
-  (only `droidbridge`), stores the request for 10 minutes and shows a page naming the client and
+  (only `droidbridge`), keeps the request usable for 10 minutes and shows a page naming the client and
   its redirect host, asking for the pairing code shown in DroidBridge. The code is 8 characters
   of Crockford base32 (shown `XXXX-XXXX`, 40 bits), lives at most 10 minutes, is single-use, and
   is invalidated after 5 wrong attempts across all consent requests. Each consent request is
@@ -233,8 +270,10 @@ Follows the MCP 2026-07-28 authorization spec.
 - `POST /authorize` with the stored request id and the code: on success the pairing code is
   consumed and the browser is redirected to `redirect_uri` with `code`, `state` and
   `iss=<origin>`. Authorization codes: 256-bit, 60 s, single use; a replayed code revokes every
-  token issued from it, however late it comes: a redeemed code's hash is kept for as long as
-  the grant it started exists (an unredeemed one for 10 minutes after it expires).
+  token issued from it, however late it comes and whatever `client_id`, `redirect_uri` or
+  `code_verifier` comes with it (the replay check runs before every other check at `/token`): a
+  redeemed code's hash is kept for as long as the grant it started exists (an unredeemed one for
+  10 minutes after it expires).
 - `POST /token` (form-encoded): `authorization_code` (PKCE S256 check, same `client_id`,
   `redirect_uri` and `resource`) and `refresh_token` (rotation; reusing a rotated refresh token
   revokes its whole family). `Cache-Control: no-store`. Only SHA-256 hashes of tokens and codes
@@ -256,6 +295,13 @@ Follows the MCP 2026-07-28 authorization spec.
   used.
 - Compatibility: refresh tokens in the earlier `dbrr_<secret>` format carry no family id; the
   relay was never deployed with that format, so no such tokens exist.
+- **Expired records are deleted by a sweep**, which runs at most once a minute. `GET /authorize`,
+  `POST /token` and `POST /register` run it first, and every phone poll starts it without
+  waiting for it. So while the phone keeps polling, an expired consent request or cached client
+  document, like every other record past its lifetime, is deleted within about a minute and a
+  half (up to a minute until a sweep is due, plus up to 25 s until the next poll arrives). When
+  neither OAuth requests nor polls arrive, expired records stay in storage until one does; a
+  consent request or cached document is never used after it expires.
 
 ## Consequences
 

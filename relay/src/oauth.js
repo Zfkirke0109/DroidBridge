@@ -608,7 +608,17 @@ export class OAuthServer {
     const clientId = param(form, 'client_id');
     const verifier = param(form, 'code_verifier');
     const resource = param(form, 'resource');
-    if (!code || !redirectUri || !clientId || !verifier) {
+    const key = code ? `code:${await sha256Hex(code)}` : null;
+    const record = key ? await this.storage.get(key) : undefined;
+    if (key && record?.usedAt) {
+      // RFC 6749 section 4.1.2: a replayed code revokes every token issued from it. This runs
+      // before every other check, so a replay revokes whatever client_id, redirect_uri or
+      // code_verifier comes with it, like a replayed refresh token.
+      await this.relay.grants.revokeFamily(record.family);
+      await this.storage.put(key, { ...record, family: null });
+      return tokenError(400, 'invalid_grant', 'The authorization code was already used. Tokens issued from it were revoked.');
+    }
+    if (!key || !redirectUri || !clientId || !verifier) {
       return tokenError(400, 'invalid_request', 'code, redirect_uri, client_id and code_verifier are required.');
     }
     if (!PKCE_VALUE.test(verifier)) {
@@ -617,16 +627,8 @@ export class OAuthServer {
     if (!(await this.#clientKnown(clientId))) {
       return tokenError(401, 'invalid_client', 'The client is not known to this relay.');
     }
-    const key = `code:${await sha256Hex(code)}`;
-    const record = await this.storage.get(key);
     if (!record) return tokenError(400, 'invalid_grant', 'The authorization code is not valid.');
     const now = this.relay.now();
-    if (record.usedAt) {
-      // RFC 6749 section 4.1.2: a replayed code revokes every token issued from it.
-      await this.relay.grants.revokeFamily(record.family);
-      await this.storage.put(key, { ...record, family: null });
-      return tokenError(400, 'invalid_grant', 'The authorization code was already used. Tokens issued from it were revoked.');
-    }
     if (record.expiresAt <= now) return tokenError(400, 'invalid_grant', 'The authorization code has expired.');
     // Consumed from here on, whether or not the checks below pass.
     record.usedAt = now;

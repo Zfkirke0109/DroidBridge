@@ -13,6 +13,7 @@ import {
   obtainTokens,
   pair,
   pkcePair,
+  promptly,
   register,
   requestIdFrom,
   sha256HexSync,
@@ -381,4 +382,53 @@ test('poll: limit of any size is capped at 8', async () => {
   }
   assert.equal(clampInt('123456789012345678901234567890', 0, 25_000, 15_000), 25_000);
   assert.equal(clampInt(null, 0, 25_000, 15_000), 15_000);
+});
+
+test('the phone\'s polls delete expired consent requests from storage, without waiting for the sweep', async () => {
+  const t = makeRelay();
+  const client = await (await register(t)).json();
+  const { challenge } = pkcePair();
+  const page = await authorizeGet(t, {
+    response_type: 'code',
+    client_id: client.client_id,
+    redirect_uri: CLAUDE_CALLBACK,
+    code_challenge: challenge,
+    code_challenge_method: 'S256',
+    state: 'secret-state',
+  });
+  assert.equal(page.status, 200);
+  assert.equal(t.storage.keys('pending:').length, 1);
+  const quickPoll = () => deviceFetch(t, '/device/v1/poll?limit=8&timeout_ms=0');
+
+  // From here on only the phone talks to the relay. A sweep before the request expires keeps it.
+  await t.clock.advance(9 * 60 * 1000);
+  assert.equal((await quickPoll()).status, 204);
+  await t.relay.lock.run(() => {}); // the sweep that poll started has run
+  assert.equal(t.relay.lastSweepAt, t.clock.now(), 'a sweep ran');
+  assert.equal(t.storage.keys('pending:').length, 1, 'still usable');
+
+  // The next sweep a poll starts after it expired deletes it, state and all.
+  await t.clock.advance(61_000);
+  assert.equal((await quickPoll()).status, 204);
+  await waitFor(() => t.storage.keys('pending:').length === 0);
+  assert.equal(t.errors.length, 0);
+
+  // A poll never waits for the sweep: here the sweep is stuck behind the lock.
+  /** @type {() => void} */
+  let release = () => {};
+  const held = t.relay.lock.run(() => new Promise((resolve) => (release = () => resolve(undefined))));
+  await t.clock.advance(61_000);
+  assert.equal((await promptly(quickPoll(), 'the poll did not wait for the sweep')).status, 204);
+  release();
+  await held;
+  await t.relay.lock.run(() => {}); // the sweep that waited has run
+  assert.equal(t.errors.length, 0);
+
+  // And a failing sweep is only reported; the poll is answered as usual.
+  t.relay.grants.sweep = async () => {
+    throw new Error('storage');
+  };
+  await t.clock.advance(61_000);
+  assert.equal((await quickPoll()).status, 204);
+  await waitFor(() => t.errors.length === 1);
 });

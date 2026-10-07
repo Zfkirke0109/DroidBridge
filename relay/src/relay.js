@@ -160,6 +160,23 @@ export class Relay {
   }
 
   /**
+   * Starts maybeSweep without waiting for it. The phone's polls call this, so expired records
+   * (consent requests, cached client documents, codes) are deleted while the phone is connected
+   * even when no OAuth request comes; a poll never waits for the lock, and a failure is only
+   * reported.
+   */
+  sweepInBackground() {
+    const report = (/** @type {unknown} */ error) => {
+      try {
+        this.onError(error);
+      } catch {
+        // Reporting must never fail the caller.
+      }
+    };
+    this.maybeSweep().catch(report);
+  }
+
+  /**
    * @param {Request} request
    * @param {URL} url
    * @param {import('./mcp.js').McpProgress | null} progress set for POST /mcp

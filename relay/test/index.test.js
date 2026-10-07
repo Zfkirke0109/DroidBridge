@@ -209,9 +209,11 @@ test('the Worker turns an unmarked 5xx from the object on POST /mcp into -32002 
   const offline = '{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"offline","data":{"droidbridge_relay":{"state":"offline","delivered":false}}}}';
   for (const [status, body] of /** @type {[number, string][]} */ ([
     [503, offline],
-    [502, ''],
-    [500, '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"from the phone"}}'],
+    [503, ''],
     [429, ''],
+    [413, '{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"too large"}}'],
+    [404, '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"from the phone"}}'],
+    [202, ''],
     [200, '{"jsonrpc":"2.0","id":1,"result":{}}'],
   ])) {
     const env = answeringNamespace(
@@ -518,7 +520,7 @@ test('a marked answer whose body breaks off is a final HTTP 200 -32002 delivered
   assert.equal(plain.error.data.droidbridge_relay.delivered, null);
 });
 
-test('real RelayObject: the phone\'s own 5xx and a notification\'s 502 pass through the Worker as deliberate answers', async () => {
+test('real RelayObject: after delivery a phone 5xx or 413, and an invalid reply to a notification, reach Claude as HTTP 200', async () => {
   const { t } = realDeployment();
   const { access_token: token } = await obtainTokens(t);
   /** @param {unknown} message @param {Record<string, unknown>} overrides */
@@ -530,19 +532,30 @@ test('real RelayObject: the phone\'s own 5xx and a notification\'s 502 pass thro
     assert.equal((await respond(t, command, overrides)).status, 200);
     return answer;
   };
-  for (const [id, code, status] of /** @type {[number, number, number][]} */ ([[5, -32603, 500], [6, -32000, 503], [7, -32001, 504]])) {
+  for (const [id, code, status] of /** @type {[number, number, number][]} */ ([
+    [5, -32603, 500],
+    [6, -32000, 503],
+    [7, -32001, 504],
+    [8, -32603, 413],
+    [9, -32603, 429],
+  ])) {
     const reply = { jsonrpc: '2.0', id, error: { code, message: 'MCP request failed' } };
     const res = await roundTrip(toolsCall(id), { resp_json: reply, resp_code: status });
-    assert.equal(res.status, status);
+    assert.equal(res.status, 200, `phone status ${status}`);
     assert.deepEqual(await relayData(res), reply, 'the phone\'s answer reaches Claude');
   }
-  const invalid = await roundTrip({ jsonrpc: '2.0', method: 'notifications/initialized' }, { resp_code: 0 });
-  assert.equal(invalid.status, 502);
-  assert.equal(invalid.headers.get(RELAY_ANSWER_HEADER), null);
-  assert.equal(await invalid.text(), '');
-  const failed = await roundTrip({ jsonrpc: '2.0', method: 'notifications/initialized' }, { resp_code: 503 });
-  assert.equal(failed.status, 503, 'the phone\'s own status for a notification');
-  assert.equal(await failed.text(), '');
+  // A status no client replays passes through.
+  const missing = { jsonrpc: '2.0', id: 10, error: { code: -32601, message: 'Method not found' } };
+  const notFound = await roundTrip(toolsCall(10), { resp_json: missing, resp_code: 404 });
+  assert.equal(notFound.status, 404);
+  assert.deepEqual(await relayData(notFound), missing);
+  // A notification: an invalid reply, or a phone status a client could replay, is an empty 200.
+  for (const resp_code of [0, 503, 413]) {
+    const note = await roundTrip({ jsonrpc: '2.0', method: 'notifications/initialized' }, { resp_code });
+    assert.equal(note.status, 200, `phone status ${resp_code}`);
+    assert.equal(note.headers.get(RELAY_ANSWER_HEADER), null);
+    assert.equal(await note.text(), '');
+  }
   assert.equal(t.relay.hub.inspect().inFlight, 0);
 });
 
