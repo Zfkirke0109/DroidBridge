@@ -15,6 +15,7 @@
   <img alt="arm64-v8a" src="https://img.shields.io/badge/ABI-arm64--v8a-lightgrey">
   <img alt="MCP 2026-07-28" src="https://img.shields.io/badge/MCP-2026--07--28-8A2BE2">
   <a href="https://github.com/zephyr7030/DroidBridge/releases/latest"><img alt="最新版本" src="https://img.shields.io/github/v/release/zephyr7030/DroidBridge"></a>
+  <a href="https://ko-fi.com/zephyr7030"><img alt="在 Ko-fi 上支持" src="https://img.shields.io/badge/Ko--fi-%E6%94%AF%E6%8C%81-FF5E5B?logo=kofi&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -93,7 +94,7 @@
 
 **Root 版**
 
-1. 在 [Releases](https://github.com/zephyr7030/DroidBridge/releases) 页面的 `magisk-v<版本>` 版本中下载 `droidbridge-magisk-<版本>.zip`。
+1. 在最新的 [`magisk-v` 版本](https://github.com/zephyr7030/DroidBridge/releases?q=magisk-v&expanded=true)中下载 `droidbridge-magisk-<版本>.zip`。
 2. 在 Magisk、KernelSU 或 APatch 中安装模块，安装时会一并安装 DroidBridge Root App。
 3. 重启手机，然后打开 DroidBridge Root。
 
@@ -145,6 +146,10 @@
 ```
 
 `pwsh tools/check-toolchain.ps1` 可检查工具链。详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+## 支持项目
+
+卓爱桥由作者利用业余时间开发和维护。如果它对你有帮助，可以在 [Ko-fi](https://ko-fi.com/zephyr7030) 上支持。提交问题和设备报告同样很有帮助。
 
 ## 许可证
 

@@ -15,6 +15,7 @@
   <img alt="arm64-v8a" src="https://img.shields.io/badge/ABI-arm64--v8a-lightgrey">
   <img alt="MCP 2026-07-28" src="https://img.shields.io/badge/MCP-2026--07--28-8A2BE2">
   <a href="https://github.com/zephyr7030/DroidBridge/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/zephyr7030/DroidBridge"></a>
+  <a href="https://ko-fi.com/zephyr7030"><img alt="Support on Ko-fi" src="https://img.shields.io/badge/Ko--fi-support-FF5E5B?logo=kofi&logoColor=white"></a>
 </p>
 
 <p align="center">
@@ -103,8 +104,8 @@ the signature to verify its own updates.
 
 **Root edition**
 
-1. Download `droidbridge-magisk-<version>.zip` from the `magisk-v<version>` release on the
-   [Releases](https://github.com/zephyr7030/DroidBridge/releases) page.
+1. Download `droidbridge-magisk-<version>.zip` from the newest
+   [`magisk-v` release](https://github.com/zephyr7030/DroidBridge/releases?q=magisk-v&expanded=true).
 2. Install it in Magisk, KernelSU or APatch. Installing it also installs the DroidBridge Root app.
 3. Reboot, then open DroidBridge Root.
 
@@ -165,6 +166,11 @@ The build is pinned and currently scripted for Windows with PowerShell 7:
 ```
 
 `pwsh tools/check-toolchain.ps1` verifies the toolchain. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Support the project
+
+DroidBridge is built and maintained in spare time. If it is useful to you, you can support it on
+[Ko-fi](https://ko-fi.com/zephyr7030). Bug reports and device reports help just as much.
 
 ## License
 
