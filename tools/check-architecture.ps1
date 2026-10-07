@@ -28,14 +28,19 @@ function Require-Pattern([string]$Text, [string]$Pattern, [string]$Message) {
     if ($Text -notmatch $Pattern) { Fail $Message }
 }
 
-# Kotlin dependency direction. Missing stage-owned packages are valid before their owning node starts.
-$sourceRoots = @('app/src/main/java', 'app/src/main/kotlin') | Where-Object { Test-Path -LiteralPath (Join-Path $root $_) }
+# Kotlin dependency direction. The shared UI library knows neither edition, and inside the
+# standalone App the UI never reaches the Runtime host or its executors directly.
+$standalone = 'standalone/src/main/java/com/droidbridge/standalone'
+$sourceRoots = @('ui-common/src/main/java', 'standalone/src/main/java', 'root-frontend/src/main/java') | Where-Object { Test-Path -LiteralPath (Join-Path $root $_) }
+$standaloneSources = '\standalone\src\main\java\com\droidbridge\standalone'
+$sharedScreens = @('automation', 'common', 'diagnostics', 'home', 'maintenance', 'mcp', 'settings', 'tasks', 'theme') | ForEach-Object { "com.droidbridge.ui.$_." }
 $rules = @(
-    @{ Path='\ui\'; Forbidden=@('com.droidbridge.android.runtimehost', 'com.droidbridge.android.execution', 'rikka.shizuku') },
-    @{ Path='\ui\state\'; Forbidden=@('com.droidbridge.android.runtimehost', 'com.droidbridge.android.execution', 'rikka.shizuku') },
-    @{ Path='\product\'; Forbidden=@('com.droidbridge.android.runtimehost', 'com.droidbridge.android.execution', 'rikka.shizuku') },
-    @{ Path='\runtimehost\'; Forbidden=@('androidx.compose', 'com.droidbridge.android.ui', 'com.droidbridge.android.product.update') },
-    @{ Path='\execution\'; Forbidden=@('androidx.compose', 'com.droidbridge.android.ui', 'com.droidbridge.android.product.update') }
+    @{ Path='\ui-common\'; Forbidden=@('com.droidbridge.standalone', 'com.droidbridge.root', 'rikka.shizuku') },
+    @{ Path='\root-frontend\'; Forbidden=@('com.droidbridge.standalone', 'rikka.shizuku') },
+    @{ Path="$standaloneSources\ui\"; Forbidden=@('com.droidbridge.standalone.runtimehost', 'com.droidbridge.standalone.execution', 'rikka.shizuku') },
+    @{ Path="$standaloneSources\product\"; Forbidden=@('com.droidbridge.standalone.runtimehost', 'com.droidbridge.standalone.execution', 'rikka.shizuku') },
+    @{ Path="$standaloneSources\runtimehost\"; Forbidden=@('androidx.compose', 'com.droidbridge.standalone.ui', 'com.droidbridge.standalone.product.update') + $sharedScreens },
+    @{ Path="$standaloneSources\execution\"; Forbidden=@('androidx.compose', 'com.droidbridge.standalone.ui', 'com.droidbridge.standalone.product.update') + $sharedScreens }
 )
 foreach ($base in $sourceRoots) {
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root $base) -Recurse -File -Filter '*.kt') {
@@ -124,16 +129,16 @@ if (-not [string]::IsNullOrWhiteSpace($Through)) {
         }
         $appGuard = Read-Source 'rust/crates/app_native/src/app_guard_recovery.rs'
         Require-Pattern $appGuard '\bGuardRecoveryPlan\b' 'App guard adapter does not consume shared recovery'
-        $hostController = Read-Source 'app/src/main/java/com/droidbridge/android/runtimehost/RuntimeHostController.kt'
+        $hostController = Read-Source "$standalone/runtimehost/RuntimeHostController.kt"
         Require-Pattern $hostController '\bdata\s+class\s+RuntimeSessionState\b' 'coherent Kotlin RuntimeSessionState is missing'
         Require-Pattern $hostController '\b(?:runtimeSession|sessionState)\s*=\s*AtomicReference\b' 'Kotlin session snapshot is not atomically published'
         Reject-Pattern $hostController '(?m)^\s*private\s+val\s+(?:started|host|activeFence|startFailure)\s*=\s*Atomic' 'Kotlin host session authority is split across atomics'
     }
 
     if (Includes 'I6') {
-        $shizuku = Read-Source 'app/src/main/java/com/droidbridge/android/execution/shizuku/ShizukuController.kt'
+        $shizuku = Read-Source "$standalone/execution/shizuku/ShizukuController.kt"
         Reject-Pattern $shizuku '\bfun\s+(?:executeProcess|executeGuarded|executePackage|executeFs|packageList|packageInspect|packageForceStop|packageInventory|prepareProof|settleProof|createGuardIo|readBounded)\b' 'ShizukuController owns a tool or guard primitive'
-        [void](Require-File 'app/src/main/java/com/droidbridge/android/execution/shizuku/ShizukuGuardExecutor.kt')
+        [void](Require-File "$standalone/execution/shizuku/ShizukuGuardExecutor.kt")
     }
 
     if (Includes 'I7') {
@@ -145,13 +150,6 @@ if (-not [string]::IsNullOrWhiteSpace($Through)) {
         }
         $magiskGuard = Read-Source 'rust/crates/daemon/src/magisk_guard_recovery.rs'
         Require-Pattern $magiskGuard '\bGuardRecoveryPlan\b' 'Magisk guard adapter does not consume shared recovery'
-
-        $daemonProtocol = Read-Source 'app/src/main/java/com/droidbridge/android/runtimehost/DaemonProtocol.kt'
-        Require-Pattern $daemonProtocol '\benum\s+class\s+DaemonMessageKind\b' 'Kotlin daemon message-kind catalog is missing'
-        Require-Pattern $daemonProtocol '\benum\s+class\s+DaemonOperationToken\b' 'Kotlin daemon operation catalog is missing'
-        $companion = Read-Source 'app/src/main/java/com/droidbridge/android/runtimehost/MagiskCompanionServer.kt'
-        Reject-Pattern $companion '"(?:protocol_version|message_id|reply_to|runtime_epoch|host_generation|runtime_instance_id|operation|payload|fd_roles)"' 'Kotlin daemon wire field is outside DaemonProtocol codec'
-        Reject-Pattern $companion '"(?:HostActivate|HostStatus|HostPrepareTransition|HostRelease|HostAbortTransition|RuntimeSubmit|RuntimeCancel|DiagnosticsSnapshot|MaintenanceStatus|MaintenanceInstallApk|MaintenanceInstallModule)"' 'Kotlin daemon operation token is outside DaemonProtocol catalog'
     }
 
     if (Includes 'I8-FS') {
@@ -168,7 +166,7 @@ if (-not [string]::IsNullOrWhiteSpace($Through)) {
 
     if (Includes 'I8-CMD') {
         # One shared Command semantic handler owns the public result and error semantics,
-        # and exactly the two host surfaces implement it (S-AUTH-CMD-001).
+        # and exactly the two host surfaces implement it, one per edition (S-AUTH-CMD-001).
         $commandPath = 'rust/crates/runtime/src/command.rs'
         $command = Read-Source $commandPath
         Require-Pattern $command '\btrait\s+CommandProcessPort\b' 'shared Command process port is missing from Runtime'
@@ -204,23 +202,23 @@ if (-not [string]::IsNullOrWhiteSpace($Through)) {
         Require-Pattern $appCommand '\bErrorCode::RunAsUnavailable\b' 'the APK surface does not reject an identity it does not own'
         Reject-Pattern $appCommand '\b(?:setuid|setgid|setresuid)\b' 'the APK surface impersonates an identity it does not own'
 
+        # The root edition owns only the root identity and has no App to forward to.
         $daemonCommand = Read-Source 'rust/crates/daemon/src/command.rs'
-        Require-Pattern $daemonCommand '\bguard_path\(module_root' 'the Magisk surface does not bind its own root guard'
-        Require-Pattern $daemonCommand '\bandroid_command_failure\b' 'the Magisk surface does not use the shared Command failure classifier'
-        Require-Pattern $daemonCommand '\bAndroidCommandSettlement::decode\b' 'the Magisk surface does not decode the shared Command settlement'
+        Require-Pattern $daemonCommand '\bvalidate_command_process_request\(\s*&request,\s*RunAs::Root\s*\)' 'the Magisk surface admits an identity other than root'
+        Require-Pattern (Read-Source 'rust/crates/daemon/src/magisk_host.rs') '\bguard_path\(module_root\)' 'the Magisk surface does not bind its own root guard'
         foreach ($primitive in @('AppProcessStart', 'AppProcessCancel', 'ShizukuProcessStart', 'ShizukuProcessCancel')) {
-            Require-Pattern $daemonCommand $primitive "the Magisk surface does not forward the $primitive primitive"
+            Reject-Pattern $daemonCommand $primitive "the Magisk surface forwards the $primitive primitive"
         }
-        Reject-Pattern $daemonCommand '\b(?:setuid|setgid|setresuid)\b' 'the Magisk surface impersonates a forwarded identity'
+        Reject-Pattern $daemonCommand '\b(?:setuid|setgid|setresuid)\b' 'the Magisk surface impersonates another identity'
 
         # Shizuku stays a primitive provider: no third Command implementation exists in
         # the Shizuku package, and the App surface routes its primitives through the
         # registration the live host generation owns.
-        $shizukuRoot = Join-Path $root 'app/src/main/java/com/droidbridge/android/execution/shizuku'
+        $shizukuRoot = Join-Path $root "$standalone/execution/shizuku"
         foreach ($file in Get-ChildItem -LiteralPath $shizukuRoot -Recurse -File -Filter '*.kt') {
             Reject-Pattern (Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8) '\bCommand(?:Process\w*|Result|Settlement)\b' 'the Shizuku package owns a Command implementation'
         }
-        $graph = Read-Source 'app/src/main/java/com/droidbridge/android/runtimehost/RuntimeProcessGraph.kt'
+        $graph = Read-Source "$standalone/runtimehost/RuntimeProcessGraph.kt"
         foreach ($primitive in @('AppProcessStart', 'AppProcessCancel', 'ShizukuProcessStart', 'ShizukuProcessCancel')) {
             Require-Pattern $graph $primitive "the App surface does not route the $primitive primitive"
         }

@@ -9,6 +9,10 @@ license.workspace = true
 contract = { path = "../contract" }
 domain = { path = "../domain" }
 tokio.workspace = true
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,3 +32,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 rustix.workspace = true
+schemars.workspace = true

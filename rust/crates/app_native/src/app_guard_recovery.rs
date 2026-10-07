@@ -3,25 +3,13 @@ use chrono::{SecondsFormat, Utc};
 use contract::ErrorCode;
 use domain::DomainError;
 use persistence::{
-    CleanGuardRecord, GuardFinalizationDisposition, GuardRecoveryPlan, LifetimeLease,
-    PendingDeadOwnerTakeover, ProcessFacts, StateStore,
+    CleanGuardRecord, GuardFinalizationDisposition, GuardRecoveryPlan, LifetimeLease, StateStore,
 };
 use runtime::ApkRuntimeVertical;
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path};
 
 pub(super) struct AppCleanupVerification {
     _private: (),
-}
-
-impl AppCleanupVerification {
-    pub(super) fn complete_takeover(
-        &self,
-        store: &StateStore,
-        pending: PendingDeadOwnerTakeover,
-        process_facts: &dyn ProcessFacts,
-    ) -> Result<Arc<LifetimeLease>, DomainError> {
-        store.complete_dead_owner_takeover(pending, process_facts)
-    }
 }
 
 pub(super) fn reconcile_app_recovery(
@@ -131,6 +119,7 @@ mod tests {
         CanonicalState, GuardCleanupRequirement, GuardRecovery, GuardSettlementDisposition,
         RuntimeLive, RuntimeOwner,
     };
+    use std::sync::Arc;
 
     fn id(index: u64) -> UuidV4 {
         UuidV4::parse(format!("00000000-0000-4000-8000-{index:012x}")).unwrap()

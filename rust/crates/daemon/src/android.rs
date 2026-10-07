@@ -3,7 +3,6 @@
 use crate::{
     HelperFamily,
     command::{PackageRootPrimitive, RootCommandGuard},
-    companion::CompanionPort,
     unix_transport::{receive_json, send_json},
 };
 use contract::{AndroidIntentInput, AndroidLaunchInput, ErrorCode};
@@ -179,6 +178,35 @@ impl HelperPort {
         result
     }
 
+    /// The default display's geometry, read from the framework instead of the App process.
+    pub(crate) fn display_snapshot(&self) -> Result<Value, DomainError> {
+        self.published()?
+            .connection
+            .request(&serde_json::json!({"operation": "display_snapshot"}))
+    }
+
+    /// The default network's DNS servers as `{"dns":[{"server":...}]}`.
+    pub(crate) fn network_dns(&self) -> Result<Value, DomainError> {
+        self.published()?
+            .connection
+            .request(&serde_json::json!({"operation": "network_dns"}))
+    }
+
+    /// Encodes the image at [source] as the bounded JPEG at [output], cropped to [region].
+    pub(crate) fn image_transform(
+        &self,
+        source: &Path,
+        output: &Path,
+        region: Option<&contract::Region>,
+    ) -> Result<Value, DomainError> {
+        self.published()?.connection.request(&serde_json::json!({
+            "operation": "image_transform",
+            "source": source.to_string_lossy(),
+            "output": output.to_string_lossy(),
+            "region": region,
+        }))
+    }
+
     fn observe_denial(&self, family: HelperFamily, result: &Result<Value, DomainError>) {
         if matches!(result, Err(error) if error.code == ErrorCode::PermissionDenied) {
             self.denied[family.index()].store(true, Ordering::Release);
@@ -286,21 +314,12 @@ fn child_failure() -> DomainError {
 #[derive(Clone)]
 pub(crate) struct MagiskAndroidPort {
     root: Arc<RootCommandGuard>,
-    companion: CompanionPort,
     helper: HelperPort,
 }
 
 impl MagiskAndroidPort {
-    pub(crate) fn new(
-        root: Arc<RootCommandGuard>,
-        companion: CompanionPort,
-        helper: HelperPort,
-    ) -> Self {
-        Self {
-            root,
-            companion,
-            helper,
-        }
+    pub(crate) fn new(root: Arc<RootCommandGuard>, helper: HelperPort) -> Self {
+        Self { root, helper }
     }
 }
 
@@ -415,9 +434,6 @@ impl AndroidPrimitivePort for MagiskAndroidPort {
                     .and_then(require_completed)
                     .map_err(clean)
             }
-            ProviderToken::AppFramework => {
-                runtime::bridge_launch(&self.companion, execution, input).map_err(clean)
-            }
             _ => Err(stale()),
         }
     }
@@ -447,9 +463,6 @@ impl AndroidPrimitivePort for MagiskAndroidPort {
                     .and_then(require_completed)
                     .map_err(clean)
             }
-            ProviderToken::AppFramework => {
-                runtime::bridge_start_intent(&self.companion, execution, input).map_err(clean)
-            }
             _ => Err(stale()),
         }
     }
@@ -470,9 +483,6 @@ impl AndroidPrimitivePort for MagiskAndroidPort {
                     )
                 })
                 .map_err(clean),
-            ProviderToken::AppFramework => {
-                runtime::bridge_clipboard_read(&self.companion, execution).map_err(clean)
-            }
             _ => Err(stale()),
         }
     }
@@ -490,9 +500,6 @@ impl AndroidPrimitivePort for MagiskAndroidPort {
                 .clipboard("write", &json!({"text": text}), claim)
                 .and_then(require_completed)
                 .map_err(clean),
-            ProviderToken::AppFramework => {
-                runtime::bridge_clipboard_write(&self.companion, execution, text).map_err(clean)
-            }
             _ => Err(stale()),
         }
     }
@@ -509,9 +516,6 @@ impl AndroidPrimitivePort for MagiskAndroidPort {
                 .clipboard("clear", &json!({}), claim)
                 .and_then(require_completed)
                 .map_err(clean),
-            ProviderToken::AppFramework => {
-                runtime::bridge_clipboard_clear(&self.companion, execution).map_err(clean)
-            }
             _ => Err(stale()),
         }
     }
@@ -535,9 +539,6 @@ impl AndroidPrimitivePort for MagiskAndroidPort {
                     )
                 })
                 .map_err(clean),
-            ProviderToken::NotificationListener => {
-                runtime::bridge_notification_snapshot(&self.companion, execution).map_err(clean)
-            }
             _ => Err(stale()),
         }
     }
@@ -562,10 +563,6 @@ impl AndroidPrimitivePort for MagiskAndroidPort {
                 )
                 .and_then(require_completed)
                 .map_err(clean),
-            ProviderToken::NotificationListener => {
-                runtime::bridge_notification_dismiss(&self.companion, execution, identity)
-                    .map_err(clean)
-            }
             _ => Err(stale()),
         }
     }
@@ -592,13 +589,6 @@ impl AndroidPrimitivePort for MagiskAndroidPort {
                 )
                 .and_then(require_completed)
                 .map_err(clean),
-            ProviderToken::NotificationListener => runtime::bridge_notification_invoke(
-                &self.companion,
-                execution,
-                identity,
-                action_index,
-            )
-            .map_err(clean),
             _ => Err(stale()),
         }
     }

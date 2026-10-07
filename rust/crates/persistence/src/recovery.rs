@@ -629,14 +629,14 @@ pub fn guard_cleanup_verified(
     current_boot_id: &UuidV4,
     process_facts: &dyn ProcessFacts,
 ) -> Result<bool, DomainError> {
-    transition_guard_cleanup_verified(
+    proofs_cleanup_verified(
         current_boot_id,
         &GuardProofDirectory::new(canonical_base),
         process_facts,
     )
 }
 
-pub(crate) fn transition_guard_cleanup_verified(
+pub(crate) fn proofs_cleanup_verified(
     current_boot_id: &UuidV4,
     proofs: &dyn GuardProofReader,
     process_facts: &dyn ProcessFacts,
@@ -708,54 +708,6 @@ fn proof_identity(bytes: &[u8]) -> Option<GuardIdentity> {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuntimeTransitionIntent {
-    pub schema_version: u32,
-    pub transition_id: UuidV4,
-    pub runtime_epoch: UuidV4,
-    pub from_host: contract::RuntimeHost,
-    pub from_generation: u64,
-    pub from_instance_id: UuidV4,
-    pub target_host: contract::RuntimeHost,
-    pub target_generation: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TransitionRecovery {
-    RemoveUncommittedIntent,
-    ActivateCommittedTarget,
-}
-
-pub fn classify_transition(
-    intent: &RuntimeTransitionIntent,
-    owner: &crate::RuntimeOwner,
-) -> Result<TransitionRecovery, DomainError> {
-    if intent.schema_version != 1
-        || intent.target_generation
-            != intent.from_generation.checked_add(1).ok_or_else(|| {
-                DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-            })?
-        || intent.from_host == intent.target_host
-        || owner.runtime_epoch != intent.runtime_epoch
-    {
-        return Err(DomainError::new(
-            ErrorCode::IoError,
-            "transition intent is corrupt",
-        ));
-    }
-    if owner.host == intent.target_host && owner.host_generation == intent.target_generation {
-        return Ok(TransitionRecovery::ActivateCommittedTarget);
-    }
-    if owner.host == intent.from_host && owner.host_generation == intent.from_generation {
-        return Ok(TransitionRecovery::RemoveUncommittedIntent);
-    }
-    Err(DomainError::new(
-        ErrorCode::IoError,
-        "owner and transition intent disagree",
-    ))
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RuntimeResetIntent {
     pub schema_version: u32,
     pub reset_id: UuidV4,
@@ -776,7 +728,6 @@ pub fn validate_reset_owner(
     owner: &crate::RuntimeOwner,
 ) -> Result<ResetOwnerState, DomainError> {
     if intent.schema_version != 1
-        || intent.target_host != contract::RuntimeHost::ApkRuntime
         || intent.target_host_generation
             != intent
                 .source_host_generation
@@ -791,7 +742,7 @@ pub fn validate_reset_owner(
             "reset intent is corrupt",
         ));
     }
-    if owner.host_generation == intent.source_host_generation {
+    if owner.host_generation == intent.source_host_generation && owner.host == intent.target_host {
         return Ok(ResetOwnerState::Source);
     }
     if owner.host == intent.target_host && owner.host_generation == intent.target_host_generation {

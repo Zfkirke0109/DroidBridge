@@ -659,9 +659,11 @@
               "default": false
             },
             "command": {
+              "description": "The shell command, at most 32768 bytes of UTF-8.",
               "type": "string"
             },
             "cwd": {
+              "description": "An absolute working directory, at most 4096 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"
@@ -678,6 +680,7 @@
               "$ref": "#/$defs/RunAs"
             },
             "stdin": {
+              "description": "Text written to the command's standard input, at most 65536 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"
@@ -1268,521 +1271,6 @@
               ]
             }
           ]
-        }
-      }
-    },
-    "daemon_operation": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "DaemonOperation",
-      "oneOf": [
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "HostStatus"
-            },
-            "payload": {
-              "$ref": "#/$defs/Empty"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "HostPrepareTransition"
-            },
-            "payload": {
-              "$ref": "#/$defs/HostPrepareTransition"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "HostAbortTransition"
-            },
-            "payload": {
-              "$ref": "#/$defs/TransitionId"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "HostRelease"
-            },
-            "payload": {
-              "$ref": "#/$defs/TransitionId"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "HostActivate"
-            },
-            "payload": {
-              "$ref": "#/$defs/HostActivate"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "RuntimeForward"
-            },
-            "payload": true
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "RuntimeCancel"
-            },
-            "payload": {
-              "$ref": "#/$defs/CancelExecution"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "CompanionExecute"
-            },
-            "payload": true
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "CompanionCancel"
-            },
-            "payload": {
-              "$ref": "#/$defs/CancelExecution"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "CapabilitySnapshot"
-            },
-            "payload": {
-              "$ref": "#/$defs/Empty"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "DiagnosticsSnapshot"
-            },
-            "payload": {
-              "$ref": "#/$defs/Empty"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "MaintenanceStatus"
-            },
-            "payload": {
-              "$ref": "#/$defs/MaintenanceStatus"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "MaintenanceInstallApk"
-            },
-            "payload": {
-              "$ref": "#/$defs/MaintenanceInstallApk"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "operation": {
-              "type": "string",
-              "const": "MaintenanceInstallModule"
-            },
-            "payload": {
-              "$ref": "#/$defs/MaintenanceInstallModule"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "operation",
-            "payload"
-          ]
-        }
-      ],
-      "$defs": {
-        "CancelExecution": {
-          "type": "object",
-          "properties": {
-            "execution_id": {
-              "$ref": "#/$defs/UuidV4"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "execution_id"
-          ]
-        },
-        "Empty": {
-          "type": "object",
-          "additionalProperties": false
-        },
-        "HostActivate": {
-          "type": "object",
-          "properties": {
-            "host_generation": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "runtime_epoch": {
-              "$ref": "#/$defs/UuidV4"
-            },
-            "target_host": {
-              "$ref": "#/$defs/RuntimeHost"
-            },
-            "transition_id": {
-              "$ref": "#/$defs/UuidV4"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "transition_id",
-            "runtime_epoch",
-            "host_generation",
-            "target_host"
-          ]
-        },
-        "HostPrepareTransition": {
-          "type": "object",
-          "properties": {
-            "from_generation": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "from_host": {
-              "$ref": "#/$defs/RuntimeHost"
-            },
-            "from_instance_id": {
-              "$ref": "#/$defs/UuidV4"
-            },
-            "runtime_epoch": {
-              "$ref": "#/$defs/UuidV4"
-            },
-            "target_host": {
-              "$ref": "#/$defs/RuntimeHost"
-            },
-            "transition_id": {
-              "$ref": "#/$defs/UuidV4"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "transition_id",
-            "runtime_epoch",
-            "from_host",
-            "from_generation",
-            "from_instance_id",
-            "target_host"
-          ]
-        },
-        "MaintenanceInstallApk": {
-          "type": "object",
-          "properties": {
-            "execution_id": {
-              "$ref": "#/$defs/UuidV4"
-            },
-            "package": {
-              "type": "string"
-            },
-            "sha256": {
-              "type": "string"
-            },
-            "signer_sha256": {
-              "type": "string"
-            },
-            "size": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "update_id": {
-              "$ref": "#/$defs/UuidV4"
-            },
-            "version_code": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "update_id",
-            "execution_id",
-            "package",
-            "version_code",
-            "sha256",
-            "signer_sha256",
-            "size"
-          ]
-        },
-        "MaintenanceInstallModule": {
-          "type": "object",
-          "properties": {
-            "execution_id": {
-              "$ref": "#/$defs/UuidV4"
-            },
-            "module_id": {
-              "type": "string"
-            },
-            "sha256": {
-              "type": "string"
-            },
-            "size": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            },
-            "update_id": {
-              "$ref": "#/$defs/UuidV4"
-            },
-            "version_code": {
-              "type": "integer",
-              "format": "uint64",
-              "minimum": 0
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "update_id",
-            "execution_id",
-            "module_id",
-            "version_code",
-            "sha256",
-            "size"
-          ]
-        },
-        "MaintenanceStatus": {
-          "type": "object",
-          "properties": {
-            "update_id": {
-              "$ref": "#/$defs/UuidV4"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "update_id"
-          ]
-        },
-        "RuntimeHost": {
-          "type": "string",
-          "enum": [
-            "apk_runtime",
-            "magisk_backend"
-          ]
-        },
-        "TransitionId": {
-          "type": "object",
-          "properties": {
-            "transition_id": {
-              "$ref": "#/$defs/UuidV4"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "transition_id"
-          ]
-        },
-        "UuidV4": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-        }
-      }
-    },
-    "daemon_result.maintenance_install": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "MaintenanceInstallResult",
-      "type": "object",
-      "properties": {
-        "cleanup": {
-          "$ref": "#/$defs/MaintenanceClean"
-        },
-        "execution_id": {
-          "$ref": "#/$defs/UuidV4"
-        },
-        "process_exit_code": {
-          "type": "integer",
-          "format": "int32"
-        },
-        "update_id": {
-          "$ref": "#/$defs/UuidV4"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "update_id",
-        "execution_id",
-        "process_exit_code",
-        "cleanup"
-      ],
-      "$defs": {
-        "MaintenanceClean": {
-          "type": "string",
-          "enum": [
-            "clean"
-          ]
-        },
-        "UuidV4": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-        }
-      }
-    },
-    "daemon_result.maintenance_status": {
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "title": "MaintenanceStatusResult",
-      "type": "object",
-      "properties": {
-        "cleanup": {
-          "$ref": "#/$defs/CleanupState"
-        },
-        "execution_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/UuidV4"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "install_active": {
-          "type": "boolean"
-        },
-        "update_id": {
-          "$ref": "#/$defs/UuidV4"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "update_id",
-        "install_active",
-        "cleanup"
-      ],
-      "$defs": {
-        "CleanupState": {
-          "type": "string",
-          "enum": [
-            "none",
-            "running",
-            "clean",
-            "unverified"
-          ]
-        },
-        "UuidV4": {
-          "type": "string",
-          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
         }
       }
     },
@@ -2988,9 +2476,11 @@
               "default": false
             },
             "command": {
+              "description": "The shell command, at most 32768 bytes of UTF-8.",
               "type": "string"
             },
             "cwd": {
+              "description": "An absolute working directory, at most 4096 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"
@@ -3007,6 +2497,7 @@
               "$ref": "#/$defs/RunAs"
             },
             "stdin": {
+              "description": "Text written to the command's standard input, at most 65536 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"
@@ -6625,9 +6116,11 @@
               "default": false
             },
             "command": {
+              "description": "The shell command, at most 32768 bytes of UTF-8.",
               "type": "string"
             },
             "cwd": {
+              "description": "An absolute working directory, at most 4096 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"
@@ -6644,6 +6137,7 @@
               "$ref": "#/$defs/RunAs"
             },
             "stdin": {
+              "description": "Text written to the command's standard input, at most 65536 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"
@@ -8040,9 +7534,11 @@
               "default": false
             },
             "command": {
+              "description": "The shell command, at most 32768 bytes of UTF-8.",
               "type": "string"
             },
             "cwd": {
+              "description": "An absolute working directory, at most 4096 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"
@@ -8059,6 +7555,7 @@
               "$ref": "#/$defs/RunAs"
             },
             "stdin": {
+              "description": "Text written to the command's standard input, at most 65536 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"
@@ -9310,9 +8807,11 @@
               "default": false
             },
             "command": {
+              "description": "The shell command, at most 32768 bytes of UTF-8.",
               "type": "string"
             },
             "cwd": {
+              "description": "An absolute working directory, at most 4096 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"
@@ -9329,6 +8828,7 @@
               "$ref": "#/$defs/RunAs"
             },
             "stdin": {
+              "description": "Text written to the command's standard input, at most 65536 bytes of UTF-8.",
               "type": [
                 "string",
                 "null"

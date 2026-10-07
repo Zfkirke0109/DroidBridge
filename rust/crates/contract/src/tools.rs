@@ -567,10 +567,13 @@ pub enum CommandCall {
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandRunInput {
+    /// The shell command, at most 32768 bytes of UTF-8.
     pub command: String,
     pub run_as: RunAs,
+    /// An absolute working directory, at most 4096 bytes of UTF-8.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Text written to the command's standard input, at most 65536 bytes of UTF-8.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
     #[serde(default = "d30s")]

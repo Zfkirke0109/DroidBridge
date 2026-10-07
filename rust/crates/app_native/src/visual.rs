@@ -214,6 +214,7 @@ where
                     duration_ms,
                     display,
                     proof,
+                    target,
                 },
             ) => {
                 let proof = runtime::accessibility_proof(&proof)
@@ -229,6 +230,7 @@ where
                         "display":display.display,
                         "display_generation":display.display_generation,
                         "proof":proof,
+                        "target":target,
                     }),
                     execution,
                 )
@@ -389,29 +391,30 @@ where
                 duration_ms,
                 display,
                 proof,
+                target,
             } => {
                 let current_display = self.display(
                     &self.codec_execution(execution).map_err(clean_failure)?,
                     claim,
                 )?;
                 if current_display != display {
-                    return Err(clean_failure(DomainError::new(
-                        ErrorCode::StaleReference,
-                        "privileged visual display changed",
-                    )));
+                    return Err(clean_failure(runtime::visual_stale(runtime::STALE_DISPLAY)));
                 }
                 let current_scene = parse_privileged_hierarchy(
                     &self.dump_shizuku_hierarchy(execution, claim)?,
-                    1,
+                    target.as_ref().map_or(1, |target| target.max_nodes),
                     display.clone(),
                 )
                 .map_err(clean_failure)?;
-                if current_scene.proof != proof {
-                    return Err(clean_failure(DomainError::new(
-                        ErrorCode::StaleReference,
-                        "privileged visual scene changed",
-                    )));
-                }
+                runtime::verify_coordinate_scene(
+                    &current_scene,
+                    &proof,
+                    &operation,
+                    from_x,
+                    from_y,
+                    target.as_ref(),
+                )
+                .map_err(clean_failure)?;
                 match operation.as_str() {
                     "tap" => ("input_tap", serde_json::json!({"x":from_x,"y":from_y})),
                     "long_press" => (
@@ -590,6 +593,7 @@ where
                         target_type: FileTargetType::ContentUri,
                         value,
                     },
+                    claim,
                 )
                 .map(|source| source.file),
             VisualTransformSource::Path {

@@ -9,7 +9,7 @@ use std::{
     fs, io,
     io::Write,
     os::fd::{AsRawFd, FromRawFd},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -180,7 +180,6 @@ fn run_guard_probe(
     let mut proof = proof_options.open(&proof_path).map_err(|error| {
         DomainError::os(ErrorCode::IoError, "cannot create root guard proof", &error)
     })?;
-    copy_canonical_metadata(&canonical_base.join("runtime-state.json"), &proof, 0o600)?;
     let identity = GuardIdentity {
         runtime_epoch: live.runtime_epoch.clone(),
         runtime_instance_id: live.runtime_instance_id.clone(),
@@ -352,111 +351,20 @@ pub(crate) fn guard_proof_capacity_available(base: &Path) -> bool {
 
 pub(crate) fn create_guard_directory(base: &Path, directory: &Path) -> Result<(), DomainError> {
     let root = base.join("execution-guards");
-    if !root.exists() {
-        fs::create_dir(&root).map_err(|error| {
-            DomainError::os(ErrorCode::IoError, "cannot create guard proof root", &error)
-        })?;
-        let file = fs::File::open(&root).map_err(|error| {
-            DomainError::os(ErrorCode::IoError, "cannot open guard proof root", &error)
-        })?;
-        copy_canonical_metadata(base, &file, 0o700)?;
-        sync_directory(base)?;
-    }
-    if !directory.exists() {
-        fs::create_dir(directory).map_err(|error| {
-            DomainError::os(
-                ErrorCode::IoError,
-                "cannot create guard boot directory",
-                &error,
-            )
-        })?;
-        let file = fs::File::open(directory).map_err(|error| {
-            DomainError::os(
-                ErrorCode::IoError,
-                "cannot open guard boot directory",
-                &error,
-            )
-        })?;
-        copy_canonical_metadata(&root, &file, 0o700)?;
-        sync_directory(&root)?;
+    for (parent, path) in [(base, root.as_path()), (root.as_path(), directory)] {
+        match fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => sync_directory(parent)?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(DomainError::os(
+                    ErrorCode::IoError,
+                    "cannot create guard proof directory",
+                    &error,
+                ));
+            }
+        }
     }
     sync_directory(directory)
-}
-
-pub(crate) fn copy_canonical_metadata(
-    source: &Path,
-    target: &fs::File,
-    mode: u32,
-) -> Result<(), DomainError> {
-    let metadata = fs::metadata(source).map_err(|error| {
-        DomainError::os(
-            ErrorCode::IoError,
-            "cannot inspect canonical metadata",
-            &error,
-        )
-    })?;
-    if unsafe { libc::fchown(target.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0
-        || unsafe { libc::fchmod(target.as_raw_fd(), mode) } != 0
-    {
-        return Err(DomainError::os(
-            ErrorCode::IoError,
-            "cannot apply canonical owner or mode",
-            &io::Error::last_os_error(),
-        ));
-    }
-    #[cfg(target_os = "android")]
-    copy_selinux_label(source, target)?;
-    let actual = target.metadata().map_err(|error| {
-        DomainError::os(
-            ErrorCode::IoError,
-            "cannot verify canonical metadata",
-            &error,
-        )
-    })?;
-    if actual.uid() != metadata.uid()
-        || actual.gid() != metadata.gid()
-        || actual.mode() & 0o777 != mode
-    {
-        return Err(io_error("canonical metadata verification failed"));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "android")]
-fn copy_selinux_label(source: &Path, target: &fs::File) -> Result<(), DomainError> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| io_error("canonical path is invalid"))?;
-    let name = c"security.selinux";
-    let length = unsafe { libc::getxattr(source.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
-    if length <= 0 {
-        return Err(io_error("cannot read canonical SELinux label"));
-    }
-    let mut label = vec![0_u8; length as usize];
-    let actual = unsafe {
-        libc::getxattr(
-            source.as_ptr(),
-            name.as_ptr(),
-            label.as_mut_ptr().cast(),
-            label.len(),
-        )
-    };
-    if actual != length
-        || unsafe {
-            libc::fsetxattr(
-                target.as_raw_fd(),
-                name.as_ptr(),
-                label.as_ptr().cast(),
-                label.len(),
-                0,
-            )
-        } != 0
-    {
-        return Err(io_error("cannot copy canonical SELinux label"));
-    }
-    Ok(())
 }
 
 pub(crate) fn make_inheritable(fd: i32) -> Result<(), DomainError> {

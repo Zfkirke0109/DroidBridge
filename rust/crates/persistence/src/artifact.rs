@@ -264,16 +264,15 @@ impl ArtifactStore {
         let target = directory.join(publish.id.as_str());
         let temporary = directory.join(format!(".{}.tmp", publish.id.as_str()));
         let publication = (|| {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(io_error)?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary).map_err(io_error)?;
             file.write_all(&publish.bytes).map_err(io_error)?;
-            crate::atomic::preserve_magisk_file_metadata(
-                &self.base.join("runtime-state.json"),
-                &file,
-            )?;
             file.sync_all().map_err(io_error)?;
             drop(file);
             crate::atomic::replace_file_exclusive(&temporary, &target)?;

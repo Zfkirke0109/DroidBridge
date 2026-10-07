@@ -249,7 +249,7 @@ where
                     .persistence
                     .load()
                     .map_err(|error| domain_error(&error, &admission.operation))?;
-                prune_synchronous_history(&mut state, admission.now_ms);
+                prune_expired_requests(&mut state, admission.now_ms);
                 match state
                     .dedup
                     .decide_and_reserve(
@@ -465,6 +465,7 @@ where
     ) -> Result<TaskAdmissionResult, DomainError> {
         let _guard = self.mutation.lock().await;
         let mut state = self.persistence.load()?;
+        prune_expired_requests(&mut state, admission.now_ms);
         match state.dedup.decide_and_reserve(
             admission.request_id.clone(),
             admission.payload_sha256,
@@ -1348,8 +1349,7 @@ where
     ) -> Result<serde_json::Value, DomainError> {
         let _guard = self.mutation.lock().await;
         let mut state = self.persistence.load()?;
-        prune_synchronous_history(&mut state, now_ms);
-        prune_retained_mutations(&mut state, now_ms);
+        prune_expired_requests(&mut state, now_ms);
         match state
             .dedup
             .decide_and_reserve(request_id.clone(), payload_sha256, now_ms, false)?
@@ -1412,7 +1412,13 @@ where
             DomainError::new(ErrorCode::ResourceLimit, "store revision exhausted")
         })?;
         let canonical_revision = state.revision;
-        self.persistence.compare_and_commit(expected, state)?;
+        if let Err(error) = self.persistence.compare_and_commit(expected, state) {
+            // A conflict or a stale lease is another writer's turn; an I/O failure is this store's.
+            if error.code == ErrorCode::IoError {
+                self.host_control.store_write_failed(&error);
+            }
+            return Err(error);
+        }
         self.host_control
             .task_activity_changed(active_tasks, canonical_revision);
         self.canonical_changes.notify_one();
@@ -1507,6 +1513,14 @@ fn task_is_pinned(state: &RuntimeState, task: &TaskRecord, now_ms: u64) -> bool 
         task.request_id() == Some(&entry.request_id)
             && entry.expires_at_ms.is_none_or(|expiry| expiry > now_ms)
     })
+}
+
+/// Removes every record an expired request owns. Reserving a request drops expired entries from
+/// the dedup table, and a synchronous result or retained mutation left without its entry makes the
+/// store unwritable, so every admission path runs this first with the same clock.
+fn prune_expired_requests(state: &mut RuntimeState, now_ms: u64) {
+    prune_synchronous_history(state, now_ms);
+    prune_retained_mutations(state, now_ms);
 }
 
 fn prune_synchronous_history(state: &mut RuntimeState, now_ms: u64) {
@@ -1730,10 +1744,15 @@ fn log_failure(operation: &str, failure: &crate::ExecutionFailure) {
     );
 }
 
+/// A stale reference is the one failure DroidBridge knows a fresh observation resolves.
 fn domain_error(error: &DomainError, operation: &str) -> PublicError {
     PublicError {
         details: Some(failure_details(error)),
-        ..public_error(error.code, operation, false)
+        ..public_error(
+            error.code,
+            operation,
+            error.code == ErrorCode::StaleReference,
+        )
     }
 }
 

@@ -40,6 +40,8 @@ pub mod process {
     };
 
     pub fn main() -> ExitCode {
+        // Magisk starts services with umask 0; the log and fault files are root's alone.
+        unsafe { libc::umask(0o077) };
         match run() {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::from(1),
@@ -62,9 +64,8 @@ pub mod process {
                 "supervisor executable is outside its module root",
             ));
         }
-        let package = match module_root.file_name().and_then(|value| value.to_str()) {
-            Some("droidbridge") => "com.droidbridge.android",
-            Some("droidbridge_debug") => "com.droidbridge.android.debug",
+        let module_id = match module_root.file_name().and_then(|value| value.to_str()) {
+            Some(id @ ("droidbridge" | "droidbridge_debug")) => id,
             _ => {
                 return Err(DomainError::new(
                     ErrorCode::PermissionDenied,
@@ -80,15 +81,13 @@ pub mod process {
                 "daemon executable escapes its module root",
             ));
         }
-        let canonical_base = PathBuf::from("/data/user_de/0")
-            .join(package)
-            .join("files/droidbridge");
+        let canonical_base = PathBuf::from("/data/adb/droidbridge").join(module_id);
         let mut backoff = RestartBackoff::default();
         loop {
             // The daemon's stderr outlives the process that wrote it: it is the only record of a
-            // panic, which the fault store reports as an exit code alone. The log lives in the App's
-            // canonical base, which the App alone creates, so stderr is kept once that base exists,
-            // checked again for every start because the App may create it after boot.
+            // panic, which the fault store reports as an exit code alone. The log lives in the
+            // daemon's state base, which the daemon creates on its first start, so stderr is kept
+            // once that base exists.
             let log_directory = canonical_base.is_dir().then(|| canonical_base.join("logs"));
             let started = Instant::now();
             let mut command = Command::new(&daemon);

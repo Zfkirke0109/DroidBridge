@@ -6,11 +6,10 @@ use contract::{
 };
 use domain::{
     AdmissionDecision, AdmissionFence, AndroidRoute, AutomationSlot, CapabilityContext,
-    DedupDecision, DedupIndex, DeleteDisposition, ExecutorRequest, FilesystemRoute, HostEvent,
-    HostState, OutstandingWork, PackageInspectFact, Preflight, Provider, ProviderGenerations,
-    ResolverFacts, RuntimeIdentity, RuntimeOwner, SettlementDisposition, TaskEvent, TaskLifecycle,
-    VisualRoute, all_required, any_sufficient, derive_capabilities, evaluate_condition,
-    resolve_executor, validate_automation,
+    DedupDecision, DedupIndex, DeleteDisposition, ExecutorRequest, FilesystemRoute,
+    PackageInspectFact, Preflight, Provider, ProviderGenerations, ResolverFacts,
+    SettlementDisposition, TaskEvent, TaskLifecycle, VisualRoute, all_required, any_sufficient,
+    derive_capabilities, evaluate_condition, resolve_executor, validate_automation,
 };
 use std::collections::BTreeMap;
 
@@ -162,49 +161,6 @@ fn i2_g01_domain_reducers_and_resolver_preserve_authority() {
     )
     .unwrap_err();
     assert_eq!(root_error.code, ErrorCode::RunAsUnavailable);
-
-    let identity = RuntimeIdentity {
-        owner: RuntimeOwner {
-            runtime_epoch: uuid("30000000-0000-4000-8000-000000000001"),
-            host: RuntimeHost::ApkRuntime,
-            host_generation: 7,
-        },
-        runtime_instance_id: uuid("30000000-0000-4000-8000-000000000002"),
-    };
-    let state = HostState::Active(identity.clone());
-    let busy = state.clone().apply(HostEvent::BeginTransition {
-        transition_id: uuid("30000000-0000-4000-8000-000000000003"),
-        target_host: RuntimeHost::MagiskBackend,
-        outstanding: OutstandingWork {
-            tasks: 1,
-            ..OutstandingWork::default()
-        },
-    });
-    assert_eq!(busy.unwrap_err().code, ErrorCode::HostTransitionPending);
-    let state = state
-        .apply(HostEvent::BeginTransition {
-            transition_id: uuid("30000000-0000-4000-8000-000000000003"),
-            target_host: RuntimeHost::MagiskBackend,
-            outstanding: OutstandingWork::default(),
-        })
-        .unwrap()
-        .apply(HostEvent::ReleaseSource)
-        .unwrap()
-        .apply(HostEvent::CommitOwner)
-        .unwrap()
-        .apply(HostEvent::ActivateTarget {
-            runtime_instance_id: uuid("30000000-0000-4000-8000-000000000004"),
-        })
-        .unwrap();
-    assert!(state.validate_fence(&identity).is_err());
-    assert!(state.validate_admission_fence(admitted.fence()).is_err());
-    match state {
-        HostState::Active(current) => {
-            assert_eq!(current.owner.host, RuntimeHost::MagiskBackend);
-            assert_eq!(current.owner.host_generation, 8);
-        }
-        _ => panic!("target must be active"),
-    }
 
     let mut task = TaskLifecycle::new();
     assert_eq!(task.apply(TaskEvent::Queue).unwrap(), TaskState::Queued);

@@ -11,11 +11,13 @@ use crate::{
 };
 use contract::{
     DisplayGeometry, ErrorCode, FileTarget, FileTargetType, FilesystemCall, FilesystemInspectInput,
-    ForegroundFact, ImageFormat, InteractionTarget, PointTarget, Region, RequestId, True, UuidV4,
-    VisualCall, VisualInteractFact, VisualInteractInput, VisualInteractResult, VisualNode,
-    VisualObserveInput, VisualObserveResult, VisualSource, VisualViewInput, VisualViewResult,
+    ForegroundFact, ImageFormat, InteractionTarget, NodeBounds, PointTarget, Region, RequestId,
+    True, UuidV4, VisualCall, VisualInteractFact, VisualInteractInput, VisualInteractResult,
+    VisualNode, VisualObserveInput, VisualObserveResult, VisualSource, VisualViewInput,
+    VisualViewResult,
 };
 use domain::{DomainError, ExecutorRequest, VisualRoute};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -105,6 +107,109 @@ pub enum VisualSceneProof {
     },
 }
 
+/// The identity of the node a coordinate input reaches: the last node, in the provider's own
+/// reported order, whose bounds contain the point. Each provider reports in one fixed order, so
+/// the observation and the check before input use the same rule.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct VisualTargetIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_name: Option<String>,
+    pub bounds: NodeBounds,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clickable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl VisualTargetIdentity {
+    pub fn of(node: &VisualNode) -> Self {
+        Self {
+            text: node.text.clone(),
+            content_description: node.content_description.clone(),
+            resource_id: node.resource_id.clone(),
+            class_name: node.class_name.clone(),
+            package_name: node.package_name.clone(),
+            bounds: node.bounds.clone(),
+            clickable: node.clickable,
+            enabled: node.enabled,
+        }
+    }
+}
+
+/// What a coordinate input was aimed at in the observation the caller used. `max_nodes` is how
+/// many leading nodes that observation kept, so the check before input looks at the same ones.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct VisualTarget {
+    pub max_nodes: u32,
+    pub package: Option<String>,
+    /// The node under the point; absent for a swipe, which aims at no single node.
+    pub node: Option<VisualTargetIdentity>,
+}
+
+pub const STALE_DISPLAY: &str = "visual display changed";
+pub const STALE_WINDOW: &str = "visual window changed";
+pub const STALE_TARGET: &str = "visual target changed";
+pub const STALE_SCENE: &str = "visual scene changed";
+pub const STALE_EXPIRED: &str = "visual reference expired";
+
+pub fn visual_stale(reason: &'static str) -> DomainError {
+    DomainError::new(ErrorCode::StaleReference, reason)
+}
+
+pub fn target_at(nodes: &[VisualNode], x: u32, y: u32) -> Option<VisualTargetIdentity> {
+    let (x, y) = (i64::from(x), i64::from(y));
+    nodes
+        .iter()
+        .rev()
+        .find(|node| {
+            i64::from(node.bounds.left) <= x
+                && x < i64::from(node.bounds.right)
+                && i64::from(node.bounds.top) <= y
+                && y < i64::from(node.bounds.bottom)
+        })
+        .map(VisualTargetIdentity::of)
+}
+
+/// Checks, immediately before input is dispatched, that the fresh scene still holds what the
+/// caller aimed at. An observation with nodes holds the window's package and the node under the
+/// point, so changes elsewhere on the screen leave it usable; one without nodes saw nothing
+/// narrower than the whole scene, so the whole scene is held.
+pub fn verify_coordinate_scene(
+    fresh: &VisualHierarchySnapshot,
+    observed: &VisualSceneProof,
+    operation: &str,
+    x: u32,
+    y: u32,
+    target: Option<&VisualTarget>,
+) -> Result<(), DomainError> {
+    let Some(target) = target else {
+        return if &fresh.proof == observed {
+            Ok(())
+        } else {
+            Err(visual_stale(STALE_SCENE))
+        };
+    };
+    let package = fresh
+        .foreground
+        .as_ref()
+        .and_then(|foreground| foreground.package.clone());
+    if package != target.package {
+        return Err(visual_stale(STALE_WINDOW));
+    }
+    if operation != "swipe" && target_at(&fresh.nodes, x, y) != target.node {
+        return Err(visual_stale(STALE_TARGET));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisualHierarchySnapshot {
     pub display: VisualDisplaySnapshot,
@@ -155,6 +260,7 @@ pub enum VisualInteractionRequest {
         duration_ms: Option<u64>,
         display: VisualDisplaySnapshot,
         proof: VisualSceneProof,
+        target: Option<VisualTarget>,
     },
     FocusedText {
         text: String,
@@ -357,9 +463,28 @@ struct VisualObservationRecord {
     display: Option<VisualDisplaySnapshot>,
     hierarchy_executor: Option<ExecutorRecord>,
     proof: Option<VisualSceneProof>,
+    /// The nodes the caller was shown, kept so a coordinate input knows what it aims at.
+    observed: Option<ObservedNodes>,
     node_refs: BTreeSet<String>,
     image_ref: Option<String>,
     pins: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ObservedNodes {
+    max_nodes: u32,
+    package: Option<String>,
+    nodes: Vec<VisualNode>,
+}
+
+impl ObservedNodes {
+    fn target(&self, node: Option<VisualTargetIdentity>) -> VisualTarget {
+        VisualTarget {
+            max_nodes: self.max_nodes,
+            package: self.package.clone(),
+            node,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -406,6 +531,7 @@ impl VisualObservationCache {
                 display: None,
                 hierarchy_executor: None,
                 proof: None,
+                observed: None,
                 node_refs: BTreeSet::new(),
                 image_ref: None,
                 pins: 1,
@@ -642,6 +768,7 @@ where
             display: Some(display.clone()),
             hierarchy_executor: None,
             proof: None,
+            observed: None,
             node_refs: BTreeSet::new(),
             image_ref: None,
             pins: 0,
@@ -780,6 +907,14 @@ where
                                         .iter()
                                         .filter_map(|node| node.node_ref.clone())
                                         .collect();
+                                    record.observed = Some(ObservedNodes {
+                                        max_nodes: input.max_nodes,
+                                        package: hierarchy
+                                            .foreground
+                                            .as_ref()
+                                            .and_then(|foreground| foreground.package.clone()),
+                                        nodes: hierarchy.nodes.clone(),
+                                    });
                                     result.foreground = hierarchy.foreground;
                                     result.nodes = Some(hierarchy.nodes);
                                     result.nodes_truncated = Some(hierarchy.truncated);
@@ -997,6 +1132,10 @@ where
                     duration_ms: Some(*duration_ms),
                     display,
                     proof,
+                    target: record
+                        .observed
+                        .as_ref()
+                        .map(|observed| observed.target(None)),
                 })
             })();
             let request = match built {
@@ -1163,6 +1302,10 @@ fn interaction_target(
                     duration_ms: None,
                     display,
                     proof,
+                    target: record
+                        .observed
+                        .as_ref()
+                        .map(|observed| observed.target(target_at(&observed.nodes, *x, *y))),
                 })
             })();
             match built {
@@ -1620,7 +1763,7 @@ fn error_code_token(code: ErrorCode) -> String {
 }
 
 fn stale_reference() -> DomainError {
-    DomainError::new(ErrorCode::StaleReference, "visual reference is stale")
+    visual_stale(STALE_EXPIRED)
 }
 
 fn verified_failure(error: DomainError) -> ExecutionFailure {

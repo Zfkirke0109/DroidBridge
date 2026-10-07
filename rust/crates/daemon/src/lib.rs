@@ -1,10 +1,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use contract::{CapabilityState, ErrorCode, RuntimeHost, UuidV4};
-use domain::{DomainError, OutstandingWork};
+use contract::{CapabilityState, ErrorCode, UuidV4};
+use domain::DomainError;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::{HashMap, HashSet};
 
 #[cfg(unix)]
 mod android;
@@ -108,81 +106,10 @@ pub fn helper_family_facts(
         }
     })
 }
-pub const MAX_FRAME_BYTES: usize = 262_144;
-pub const MAX_FILE_DESCRIPTORS: usize = 4;
-pub const MAX_OUTSTANDING: usize = 64;
-pub const RESERVED_CONTROL: usize = 4;
-pub const MAX_BUSINESS_OUTSTANDING: usize = MAX_OUTSTANDING - RESERVED_CONTROL;
-pub const MAX_CONNECTION_MESSAGES: usize = 65_536;
+/// The bound on one IPC frame; a frontend reply carries at most one bounded public result.
+pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 pub const PACKAGE_PRIMITIVE_TIMEOUT_MS: u64 = 15_000;
 pub const PACKAGE_PRIMITIVE_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-pub const COMPANION_CAPABILITY_KEYS: &[&str] = &[
-    "android.local_network",
-    "android.notifications",
-    "android.notification_listener",
-    "automation.exact_alarm",
-    "visual.accessibility",
-    "visual.media_projection_session",
-    "shizuku.shell",
-    "execution.app_guard",
-    "execution.shell_guard",
-];
-
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CompanionCapabilityRegistration {
-    pub key: String,
-    pub state: CapabilityState,
-    pub reason: Option<String>,
-    pub source_generation: u64,
-    pub has_executor: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompanionCapabilitySnapshot {
-    registrations: Vec<CompanionCapabilityRegistration>,
-}
-
-pub fn decode_companion_capability_snapshot(
-    payload: &Value,
-) -> Result<Vec<CompanionCapabilityRegistration>, DomainError> {
-    let snapshot: CompanionCapabilitySnapshot =
-        serde_json::from_value(payload.clone()).map_err(|_| {
-            DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "invalid companion capability snapshot",
-            )
-        })?;
-    if snapshot.registrations.len() > COMPANION_CAPABILITY_KEYS.len() {
-        return Err(DomainError::new(
-            ErrorCode::ProtocolIncompatible,
-            "companion capability snapshot exceeds the fixed key set",
-        ));
-    }
-    let mut keys = HashSet::new();
-    for registration in &snapshot.registrations {
-        let reason_valid = match registration.state {
-            CapabilityState::Available => registration.reason.is_none(),
-            CapabilityState::Unavailable | CapabilityState::Unknown => registration
-                .reason
-                .as_ref()
-                .is_some_and(|reason| !reason.is_empty()),
-        };
-        if !COMPANION_CAPABILITY_KEYS.contains(&registration.key.as_str())
-            || !keys.insert(registration.key.as_str())
-            || registration.source_generation == 0
-            || (registration.state != CapabilityState::Available && registration.has_executor)
-            || !reason_valid
-        {
-            return Err(DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "invalid companion capability registration",
-            ));
-        }
-    }
-    Ok(snapshot.registrations)
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MagiskPrimitiveFamily {
@@ -395,54 +322,12 @@ fn valid_package_name(value: &str) -> bool {
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EndpointRole {
-    ApkRuntime,
-    Droidbridged,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Handshake {
-    pub protocol_version: u32,
-    pub role: EndpointRole,
-    pub package: String,
-    pub user_id: u32,
-    pub runtime_epoch: UuidV4,
-    pub host: RuntimeHost,
-    pub host_generation: u64,
-    pub runtime_instance_id: Option<UuidV4>,
-}
-
-impl Handshake {
-    pub fn validate_peer(
-        &self,
-        peer_uid: u32,
-        expected_uid: u32,
-        expected_role: EndpointRole,
-        identity: &ModuleIdentity,
-    ) -> Result<(), DomainError> {
-        if peer_uid != expected_uid
-            || self.protocol_version != PROTOCOL_VERSION
-            || self.role != expected_role
-            || self.package != identity.package
-            || self.user_id != 0
-            || self.host_generation == 0
-        {
-            return Err(DomainError::new(
-                ErrorCode::PermissionDenied,
-                "daemon handshake authentication failed",
-            ));
-        }
-        Ok(())
-    }
-}
-
+/// The fixed identity of one module build: its Magisk module id, the frontend package it installs
+/// and the abstract socket that frontend serves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ModuleIdentity {
     pub module_id: &'static str,
-    pub package: &'static str,
+    pub frontend_package: &'static str,
     pub socket_name: &'static str,
 }
 
@@ -450,17 +335,22 @@ impl ModuleIdentity {
     pub const fn stable() -> Self {
         Self {
             module_id: "droidbridge",
-            package: "com.droidbridge.android",
-            socket_name: "droidbridge.com.droidbridge.android.u0.v1",
+            frontend_package: "com.droidbridge.root",
+            socket_name: "droidbridge.com.droidbridge.root.u0.v1",
         }
     }
 
     pub const fn debug() -> Self {
         Self {
             module_id: "droidbridge_debug",
-            package: "com.droidbridge.android.debug",
-            socket_name: "droidbridge.com.droidbridge.android.debug.u0.v1",
+            frontend_package: "com.droidbridge.root.debug",
+            socket_name: "droidbridge.com.droidbridge.root.debug.u0.v1",
         }
+    }
+
+    /// The daemon's own root-only state, apart from the module directory an update replaces.
+    pub fn state_base(&self) -> std::path::PathBuf {
+        std::path::Path::new("/data/adb/droidbridge").join(self.module_id)
     }
 }
 
@@ -471,9 +361,6 @@ pub struct ModuleObservation {
     pub enabled: bool,
     pub module_version_code: u64,
     pub daemon_version_code: u64,
-    pub protocol_version: u32,
-    pub metadata_self_test: bool,
-    pub excluded: bool,
 }
 
 impl ModuleObservation {
@@ -493,14 +380,13 @@ impl ModuleObservation {
         } else {
             self.debug_present
         };
-        if !present || !self.enabled || self.excluded || !self.metadata_self_test {
+        if !present || !self.enabled {
             return Err(DomainError::new(
                 ErrorCode::CapabilityUnavailable,
                 "Magisk backend is not ready",
             ));
         }
-        if self.protocol_version != PROTOCOL_VERSION
-            || self.module_version_code != expected_version_code
+        if self.module_version_code != expected_version_code
             || self.daemon_version_code != expected_version_code
         {
             return Err(DomainError::new(
@@ -508,379 +394,6 @@ impl ModuleObservation {
                 "Magisk backend version is incompatible",
             ));
         }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DaemonRole {
-    BackendOnly,
-    RuntimeHost,
-}
-
-impl DaemonRole {
-    pub const fn from_owner(host: RuntimeHost) -> Self {
-        match host {
-            RuntimeHost::ApkRuntime => Self::BackendOnly,
-            RuntimeHost::MagiskBackend => Self::RuntimeHost,
-        }
-    }
-
-    pub const fn may_create_core(self) -> bool {
-        matches!(self, Self::RuntimeHost)
-    }
-
-    pub const fn ready(self, module_ready: bool, runtime_host_ready: bool) -> bool {
-        module_ready && (matches!(self, Self::BackendOnly) || runtime_host_ready)
-    }
-
-    pub const fn permits(self, operation: Operation) -> bool {
-        match self {
-            Self::BackendOnly => matches!(
-                operation,
-                Operation::HostStatus
-                    | Operation::HostPrepareTransition
-                    | Operation::HostAbortTransition
-                    | Operation::HostActivate
-                    | Operation::CapabilitySnapshot
-                    | Operation::DiagnosticsSnapshot
-                    | Operation::MaintenanceStatus
-                    | Operation::MaintenanceInstallApk
-                    | Operation::MaintenanceInstallModule
-            ),
-            Self::RuntimeHost => !matches!(
-                operation,
-                Operation::MaintenanceInstallApk | Operation::MaintenanceInstallModule
-            ),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum Operation {
-    HostStatus,
-    HostPrepareTransition,
-    HostAbortTransition,
-    HostRelease,
-    HostActivate,
-    RuntimeForward,
-    RuntimeCancel,
-    CompanionExecute,
-    CompanionCancel,
-    CapabilitySnapshot,
-    NetworkDefaultChanged,
-    NetworkAttachment,
-    DiagnosticsSnapshot,
-    MaintenanceStatus,
-    MaintenanceInstallApk,
-    MaintenanceInstallModule,
-}
-
-impl Operation {
-    pub const fn is_control(self) -> bool {
-        matches!(
-            self,
-            Self::HostStatus
-                | Self::HostPrepareTransition
-                | Self::HostAbortTransition
-                | Self::HostRelease
-                | Self::HostActivate
-                | Self::RuntimeCancel
-                | Self::CompanionCancel
-                | Self::MaintenanceStatus
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageKind {
-    Request,
-    Response,
-    Cancel,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WireEnvelope {
-    pub protocol_version: u32,
-    pub kind: MessageKind,
-    pub message_id: UuidV4,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<UuidV4>,
-    pub runtime_epoch: UuidV4,
-    pub host_generation: u64,
-    pub runtime_instance_id: Option<UuidV4>,
-    pub operation: Operation,
-    pub payload: Value,
-    pub fd_roles: Vec<String>,
-}
-
-impl WireEnvelope {
-    pub fn request(
-        message_id: UuidV4,
-        runtime_epoch: UuidV4,
-        host_generation: u64,
-        runtime_instance_id: Option<UuidV4>,
-        operation: Operation,
-        payload: Value,
-        fd_roles: Vec<String>,
-    ) -> Self {
-        Self {
-            protocol_version: PROTOCOL_VERSION,
-            kind: MessageKind::Request,
-            message_id,
-            reply_to: None,
-            runtime_epoch,
-            host_generation,
-            runtime_instance_id,
-            operation,
-            payload,
-            fd_roles,
-        }
-    }
-
-    pub fn response(
-        message_id: UuidV4,
-        request: &Self,
-        runtime_instance_id: Option<UuidV4>,
-        payload: Value,
-        fd_roles: Vec<String>,
-    ) -> Self {
-        Self {
-            protocol_version: PROTOCOL_VERSION,
-            kind: MessageKind::Response,
-            message_id,
-            reply_to: Some(request.message_id.clone()),
-            runtime_epoch: request.runtime_epoch.clone(),
-            host_generation: request.host_generation,
-            runtime_instance_id,
-            operation: request.operation,
-            payload,
-            fd_roles,
-        }
-    }
-
-    pub fn validate(&self, descriptor_count: usize) -> Result<(), DomainError> {
-        if self.protocol_version != PROTOCOL_VERSION
-            || self.host_generation == 0
-            || self.fd_roles.len() > MAX_FILE_DESCRIPTORS
-            || self.fd_roles.len() != descriptor_count
-            || self.fd_roles.iter().any(|role| !valid_fd_role(role))
-            || (self.kind == MessageKind::Request && self.reply_to.is_some())
-            || (self.kind != MessageKind::Request && self.reply_to.is_none())
-            || (matches!(
-                self.operation,
-                Operation::RuntimeForward
-                    | Operation::RuntimeCancel
-                    | Operation::CompanionExecute
-                    | Operation::CompanionCancel
-                    | Operation::NetworkDefaultChanged
-            ) && self.runtime_instance_id.is_none())
-        {
-            return Err(DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "invalid daemon protocol envelope",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn valid_fd_role(role: &str) -> bool {
-    matches!(
-        role,
-        "execution_guard_proof"
-            | "verified_apk"
-            | "verified_module_zip"
-            | "visual_raw_frame"
-            | "visual_source_image"
-            | "visual_encoded_image"
-            | "stdin"
-            | "stdout"
-            | "stderr"
-            | "content"
-            | "mcp_artifact"
-    )
-}
-
-pub fn encode_frame(envelope: &WireEnvelope) -> Result<Vec<u8>, DomainError> {
-    envelope.validate(envelope.fd_roles.len())?;
-    let body = serde_json::to_vec(envelope).map_err(|_| {
-        DomainError::new(ErrorCode::InternalError, "daemon envelope encoding failed")
-    })?;
-    if body.is_empty() || body.len() > MAX_FRAME_BYTES {
-        return Err(DomainError::new(
-            ErrorCode::ResourceLimit,
-            "daemon envelope exceeds the frame bound",
-        ));
-    }
-    let length = u32::try_from(body.len())
-        .map_err(|_| DomainError::new(ErrorCode::ResourceLimit, "daemon frame length overflow"))?;
-    let mut frame = Vec::with_capacity(body.len() + 4);
-    frame.extend_from_slice(&length.to_be_bytes());
-    frame.extend_from_slice(&body);
-    Ok(frame)
-}
-
-pub fn decode_frame(frame: &[u8]) -> Result<WireEnvelope, DomainError> {
-    let header: [u8; 4] = frame
-        .get(..4)
-        .and_then(|value| value.try_into().ok())
-        .ok_or_else(|| DomainError::new(ErrorCode::ProtocolIncompatible, "missing frame header"))?;
-    let length = u32::from_be_bytes(header) as usize;
-    if length == 0 || length > MAX_FRAME_BYTES || frame.len() != length + 4 {
-        return Err(DomainError::new(
-            ErrorCode::ProtocolIncompatible,
-            "invalid daemon frame length",
-        ));
-    }
-    let envelope: WireEnvelope = serde_json::from_slice(&frame[4..]).map_err(|_| {
-        DomainError::new(ErrorCode::ProtocolIncompatible, "invalid daemon frame JSON")
-    })?;
-    envelope.validate(envelope.fd_roles.len())?;
-    Ok(envelope)
-}
-
-#[derive(Default)]
-pub struct ConnectionLedger {
-    outstanding: HashMap<UuidV4, PendingRequest>,
-    business: HashSet<UuidV4>,
-    seen: HashSet<UuidV4>,
-    incoming_messages: usize,
-    outgoing_messages: usize,
-}
-
-#[derive(Clone)]
-struct PendingRequest {
-    operation: Operation,
-    runtime_epoch: UuidV4,
-    host_generation: u64,
-    runtime_instance_id: Option<UuidV4>,
-}
-
-impl ConnectionLedger {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn reserve_business_envelope(&mut self, request: &WireEnvelope) -> Result<(), DomainError> {
-        if self.business.len() >= MAX_BUSINESS_OUTSTANDING
-            || self.outstanding.len() >= MAX_OUTSTANDING
-        {
-            return Err(DomainError::new(
-                ErrorCode::ResourceLimit,
-                "daemon business request slots are full",
-            ));
-        }
-        self.reserve(request, true)
-    }
-
-    pub fn reserve_control_envelope(&mut self, request: &WireEnvelope) -> Result<(), DomainError> {
-        if self.outstanding.len() >= MAX_OUTSTANDING {
-            return Err(DomainError::new(
-                ErrorCode::ResourceLimit,
-                "daemon request slots are full",
-            ));
-        }
-        self.reserve(request, false)
-    }
-
-    fn reserve(&mut self, request: &WireEnvelope, business: bool) -> Result<(), DomainError> {
-        if request.kind != MessageKind::Request {
-            return Err(DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "only requests can reserve daemon correlation state",
-            ));
-        }
-        let message_id = request.message_id.clone();
-        self.observe_outgoing(message_id.clone())?;
-        if business {
-            let inserted = self.business.insert(message_id.clone());
-            debug_assert!(inserted);
-        }
-        let prior = self.outstanding.insert(
-            message_id,
-            PendingRequest {
-                operation: request.operation,
-                runtime_epoch: request.runtime_epoch.clone(),
-                host_generation: request.host_generation,
-                runtime_instance_id: request.runtime_instance_id.clone(),
-            },
-        );
-        debug_assert!(prior.is_none());
-        Ok(())
-    }
-
-    pub fn complete_envelope(&mut self, response: &WireEnvelope) -> Result<(), DomainError> {
-        if response.kind != MessageKind::Response {
-            return Err(DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "only responses can complete daemon correlation state",
-            ));
-        }
-        let reply_to = response.reply_to.as_ref().ok_or_else(|| {
-            DomainError::new(ErrorCode::ProtocolIncompatible, "response lacks reply id")
-        })?;
-        let request = self.outstanding.get(reply_to).ok_or_else(|| {
-            DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "unknown daemon reply correlation",
-            )
-        })?;
-        if request.operation != response.operation {
-            return Err(DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "mismatched daemon reply operation",
-            ));
-        }
-        let instance_must_match = matches!(
-            request.operation,
-            Operation::RuntimeForward
-                | Operation::RuntimeCancel
-                | Operation::CompanionExecute
-                | Operation::CompanionCancel
-        );
-        if request.runtime_epoch != response.runtime_epoch
-            || request.host_generation != response.host_generation
-            || (instance_must_match && request.runtime_instance_id != response.runtime_instance_id)
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "daemon reply owner fence is stale",
-            ));
-        }
-        self.outstanding.remove(reply_to);
-        self.business.remove(reply_to);
-        Ok(())
-    }
-
-    pub fn observe_incoming(&mut self, message_id: UuidV4) -> Result<(), DomainError> {
-        Self::record_message(&mut self.seen, &mut self.incoming_messages, message_id)
-    }
-
-    pub fn observe_outgoing(&mut self, message_id: UuidV4) -> Result<(), DomainError> {
-        Self::record_message(&mut self.seen, &mut self.outgoing_messages, message_id)
-    }
-
-    fn record_message(
-        seen: &mut HashSet<UuidV4>,
-        direction_count: &mut usize,
-        message_id: UuidV4,
-    ) -> Result<(), DomainError> {
-        if *direction_count >= MAX_CONNECTION_MESSAGES {
-            return Err(DomainError::new(
-                ErrorCode::ResourceLimit,
-                "daemon connection message history is exhausted",
-            ));
-        }
-        if !seen.insert(message_id) {
-            return Err(DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "duplicate daemon message id",
-            ));
-        }
-        *direction_count += 1;
         Ok(())
     }
 }
@@ -919,125 +432,19 @@ impl WakeAlarmProbe {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct HostPreparation {
-    pub transition_id: UuidV4,
-    pub store_revision: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PromotionOutcome {
-    Prepared(HostPreparation),
-    Deferred,
-}
-
-impl PromotionOutcome {
-    pub const fn is_deferred(&self) -> bool {
-        matches!(self, Self::Deferred)
-    }
-}
-
-pub struct HostCoordinator {
-    host: RuntimeHost,
-    generation: u64,
-    instance: UuidV4,
-    preparing: Option<UuidV4>,
-    retired: bool,
-}
-
-impl HostCoordinator {
-    pub fn new(host: RuntimeHost, generation: u64, instance: UuidV4) -> Self {
-        Self {
-            host,
-            generation,
-            instance,
-            preparing: None,
-            retired: false,
-        }
-    }
-
-    pub const fn admission_open(&self) -> bool {
-        self.preparing.is_none() && !self.retired
-    }
-
-    pub fn prepare(
-        &mut self,
-        transition_id: UuidV4,
-        target: RuntimeHost,
-        outstanding: OutstandingWork,
-        store_revision: u64,
-    ) -> Result<HostPreparation, DomainError> {
-        if self.retired || self.preparing.is_some() || target == self.host {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "runtime transition cannot be prepared",
-            ));
-        }
-        if !outstanding.is_idle() {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "runtime host is not idle",
-            ));
-        }
-        self.preparing = Some(transition_id.clone());
-        Ok(HostPreparation {
-            transition_id,
-            store_revision,
-        })
-    }
-
-    pub fn optional_promotion(
-        &mut self,
-        transition_id: UuidV4,
-        outstanding: OutstandingWork,
-        store_revision: u64,
-    ) -> PromotionOutcome {
-        if !outstanding.is_idle() {
-            return PromotionOutcome::Deferred;
-        }
-        self.prepare(
-            transition_id,
-            RuntimeHost::MagiskBackend,
-            outstanding,
-            store_revision,
-        )
-        .map(PromotionOutcome::Prepared)
-        .unwrap_or(PromotionOutcome::Deferred)
-    }
-
-    pub fn abort(&mut self, transition_id: &UuidV4) -> Result<(), DomainError> {
-        if self.preparing.as_ref() != Some(transition_id) || self.retired {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "transition id is not prepared",
-            ));
-        }
-        self.preparing = None;
-        Ok(())
-    }
-
-    pub fn release(&mut self, transition_id: &UuidV4) -> Result<(), DomainError> {
-        if self.preparing.as_ref() != Some(transition_id) || self.retired {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "transition id is not prepared",
-            ));
-        }
-        self.retired = true;
-        Ok(())
-    }
-
-    pub fn identity(&self) -> (RuntimeHost, u64, &UuidV4) {
-        (self.host, self.generation, &self.instance)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HelperHello {
     pub protocol_version: u32,
     pub sdk_int: u32,
     pub helper_generation: u64,
+}
+
+/// The module's framework helper jar for this device's API level.
+pub fn framework_jar(module_root: &std::path::Path, sdk_int: u32) -> std::path::PathBuf {
+    module_root
+        .join("framework")
+        .join(format!("droidbridge-framework-api{sdk_int}.jar"))
 }
 
 pub struct HelperRegistry {
@@ -1064,8 +471,8 @@ impl HelperRegistry {
         })
     }
 
-    pub fn jar_name(&self) -> String {
-        format!("droidbridge-framework-api{}.jar", self.sdk_int)
+    pub fn jar(&self, module_root: &std::path::Path) -> std::path::PathBuf {
+        framework_jar(module_root, self.sdk_int)
     }
 
     pub fn accept_hello(&mut self, peer_uid: u32, hello: HelperHello) -> Result<(), DomainError> {
@@ -1096,88 +503,6 @@ impl HelperRegistry {
     }
 }
 
-#[derive(Default)]
-pub struct CompanionLink {
-    connected: bool,
-}
-
-impl CompanionLink {
-    pub fn observe_connected(&mut self) {
-        self.connected = true;
-    }
-
-    pub fn observe_disconnected(&mut self) {
-        self.connected = false;
-    }
-
-    pub const fn capability_state(&self) -> CapabilityState {
-        if self.connected {
-            CapabilityState::Available
-        } else {
-            CapabilityState::Unavailable
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MagiskFacts {
-    pub magisk_module: CapabilityState,
-    pub magisk_root: CapabilityState,
-    pub magisk_framework: CapabilityState,
-    pub execution_root_guard: CapabilityState,
-    pub app_execution_surface: CapabilityState,
-    pub shizuku_shell: CapabilityState,
-}
-
-impl MagiskFacts {
-    pub const fn ready(companion: bool, helper: bool) -> Self {
-        Self {
-            magisk_module: CapabilityState::Available,
-            magisk_root: CapabilityState::Available,
-            magisk_framework: if helper {
-                CapabilityState::Available
-            } else {
-                CapabilityState::Unavailable
-            },
-            execution_root_guard: CapabilityState::Available,
-            app_execution_surface: if companion {
-                CapabilityState::Available
-            } else {
-                CapabilityState::Unavailable
-            },
-            shizuku_shell: CapabilityState::Unavailable,
-        }
-    }
-
-    pub const fn with_companion(mut self, connected: bool) -> Self {
-        self.app_execution_surface = if connected {
-            CapabilityState::Available
-        } else {
-            CapabilityState::Unavailable
-        };
-        if !connected {
-            self.shizuku_shell = CapabilityState::Unavailable;
-        }
-        self
-    }
-}
-
-#[cfg(any(unix, test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CanonicalDirectoryIdentity {
-    pub(crate) device: u64,
-    pub(crate) inode: u64,
-    pub(crate) uid: u32,
-}
-
-#[cfg(any(unix, test))]
-pub(crate) fn canonical_directory_matches(
-    expected: CanonicalDirectoryIdentity,
-    observed: Option<CanonicalDirectoryIdentity>,
-) -> bool {
-    observed == Some(expected)
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionGuardState {
     Clean,
@@ -1187,20 +512,20 @@ pub enum ExecutionGuardState {
 
 pub mod network;
 
-#[cfg(any(unix, test))]
-mod process_network;
-
 #[cfg(unix)]
 pub mod unix_transport;
 
 #[cfg(unix)]
-pub mod companion;
+pub mod frontend;
+
+#[cfg(unix)]
+mod settings;
+
+#[cfg(unix)]
+mod content;
 
 #[cfg(unix)]
 mod command;
-
-#[cfg(unix)]
-mod maintenance;
 
 #[cfg(unix)]
 mod magisk_guard_recovery;
@@ -1212,10 +537,10 @@ mod magisk_host;
 mod recycle;
 
 #[cfg(unix)]
-mod automation_wake;
+mod ingress;
 
-#[cfg(any(unix, test))]
-mod app_keepalive;
+#[cfg(unix)]
+mod automation_wake;
 
 #[cfg(unix)]
 pub mod process;
@@ -1233,43 +558,5 @@ impl ExecutionGuardState {
 
     pub const fn blocks_admission(self) -> bool {
         matches!(self, Self::CleanupUnverified)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{CanonicalDirectoryIdentity, canonical_directory_matches};
-
-    #[test]
-    fn i7_g01_replaced_or_missing_canonical_directory_deactivates_daemon() {
-        let expected = CanonicalDirectoryIdentity {
-            device: 11,
-            inode: 22,
-            uid: 33,
-        };
-
-        assert!(canonical_directory_matches(expected, Some(expected)));
-        assert!(!canonical_directory_matches(expected, None));
-        assert!(!canonical_directory_matches(
-            expected,
-            Some(CanonicalDirectoryIdentity {
-                device: 12,
-                ..expected
-            }),
-        ));
-        assert!(!canonical_directory_matches(
-            expected,
-            Some(CanonicalDirectoryIdentity {
-                inode: 23,
-                ..expected
-            }),
-        ));
-        assert!(!canonical_directory_matches(
-            expected,
-            Some(CanonicalDirectoryIdentity {
-                uid: 34,
-                ..expected
-            }),
-        ));
     }
 }

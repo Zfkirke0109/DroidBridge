@@ -15,8 +15,8 @@ body:
   - type: dropdown
     id: privilege
     attributes:
-      label: Privilege level you can offer / 你能提供的权限档位
+      label: Edition you can use / 你能使用的版本
       options:
-        - No root / 无 Root
-        - Shizuku
-        - Magisk module / Magisk 模块
+        - DroidBridge app / 卓爱桥 App
+        - DroidBridge app + Shizuku / 卓爱桥 App + Shizuku
+        - Root edition (Magisk / KernelSU / APatch) / Root 版

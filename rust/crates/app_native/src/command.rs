@@ -150,9 +150,9 @@ pub(crate) fn run_shizuku_guarded(
     ))
 }
 
-/// Requests cancellation of the one Shizuku process this execution started. It is the
-/// same typed primitive the Magisk surface forwards, so the identity that owns the
-/// process is always the one that cancels it.
+/// Requests cancellation of the one Shizuku process this execution started through the
+/// same typed primitive, so the identity that owns the process is always the one that
+/// cancels it.
 #[cfg(target_os = "android")]
 fn cancel_shell(
     execution: &AdmittedExecution,
@@ -177,16 +177,15 @@ fn cancel_shell(
 #[cfg(target_os = "android")]
 const SHELL_CANCEL_POLL_MS: u64 = 25;
 
-/// The App-identity commands this process runs as the authenticated companion of the
-/// Magisk host. One claim per execution, so a forwarded cancel reaches the very run its
-/// guard polls and no second runner can appear for one execution.
+/// The App-identity commands this process runs. One claim per execution, so a cancel
+/// reaches the very run its guard polls and no second runner can appear for one execution.
 static APP_COMMAND_CLAIMS: std::sync::OnceLock<LocalExecutionClaims> = std::sync::OnceLock::new();
 
 fn app_command_claims() -> &'static LocalExecutionClaims {
     APP_COMMAND_CLAIMS.get_or_init(LocalExecutionClaims::default)
 }
 
-/// One `AppProcessStart` request as the Magisk Command surface forwards it.
+/// One `AppProcessStart` request as the App execution surface carries it.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AppCommandRequest {
@@ -200,10 +199,9 @@ struct AppCommandRequest {
     stdin: Option<String>,
 }
 
-/// Runs one App-identity command the Magisk host delegated to this authenticated
-/// companion and reports it through the one settlement both host Command surfaces
-/// decode. The App surface owns this identity, so the command runs under the guard scope
-/// this process published or adopted and never under a different identity.
+/// Runs one App-identity command and reports it through the Command settlement the
+/// Runtime decodes. The App surface owns this identity, so the command runs under the
+/// guard scope this process published and never under a different identity.
 pub(crate) fn run_app_command(execution_id: &str, request_json: &str) -> String {
     match run_app_command_inner(execution_id, request_json) {
         Ok(encoded) => encoded,

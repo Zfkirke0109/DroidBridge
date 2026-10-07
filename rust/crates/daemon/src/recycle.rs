@@ -1,4 +1,4 @@
-use crate::{companion::CompanionPort, magisk_guard_recovery::ProcFacts, magisk_host::new_uuid};
+use crate::{magisk_guard_recovery::ProcFacts, magisk_host::new_uuid};
 use contract::UuidV4;
 use domain::DomainError;
 use persistence::{
@@ -15,8 +15,8 @@ use std::{
     time::Duration,
 };
 
-/// How long a requested recycle waits before it interrupts the connection loop, so the
-/// settlement that requested it commits and answers first.
+/// How long a requested recycle waits before the main loop exits, so the settlement that
+/// requested it commits and answers first.
 const SETTLE_WINDOW: Duration = Duration::from_secs(2);
 
 /// The bound on the orderly shutdown of a recycling daemon; work that outlives it is ended by
@@ -44,7 +44,7 @@ enum State {
 }
 
 impl Recycle {
-    pub(crate) fn request(self: &Arc<Self>, companion: CompanionPort) {
+    pub(crate) fn request(self: &Arc<Self>) {
         {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             if *state != State::Serving {
@@ -57,7 +57,6 @@ impl Recycle {
             thread::sleep(SETTLE_WINDOW);
             *recycle.state.lock().unwrap_or_else(PoisonError::into_inner) = State::Due;
             recycle.wake.notify_all();
-            companion.close_live();
         });
     }
 
@@ -94,7 +93,6 @@ pub(crate) struct CleanupWatch {
     lease: Arc<LifetimeLease>,
     canonical_base: PathBuf,
     boot_id: UuidV4,
-    companion: CompanionPort,
     capabilities: ApkCapabilityPort,
     recycle: Arc<Recycle>,
     watching: Arc<AtomicBool>,
@@ -106,7 +104,6 @@ impl CleanupWatch {
         lease: Arc<LifetimeLease>,
         canonical_base: PathBuf,
         boot_id: UuidV4,
-        companion: CompanionPort,
         capabilities: ApkCapabilityPort,
         recycle: Arc<Recycle>,
     ) -> Self {
@@ -115,7 +112,6 @@ impl CleanupWatch {
             lease,
             canonical_base,
             boot_id,
-            companion,
             capabilities,
             recycle,
             watching: Arc::default(),
@@ -137,7 +133,7 @@ impl CleanupWatch {
                     .as_ref()
                     .is_some_and(GuardRecoveryPlan::guards_are_clean)
                 {
-                    watch.recycle.request(watch.companion.clone());
+                    watch.recycle.request();
                     return;
                 }
                 let _ = watch
@@ -180,7 +176,6 @@ fn reason(plan: Option<&GuardRecoveryPlan>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::Recycle;
-    use crate::companion::CompanionPort;
     use std::{
         sync::Arc,
         time::{Duration, Instant},
@@ -189,8 +184,8 @@ mod tests {
     #[test]
     fn a_request_becomes_due_after_the_settle_window_and_wakes_a_sleeping_loop() {
         let recycle = Arc::new(Recycle::default());
-        recycle.request(CompanionPort::default());
-        recycle.request(CompanionPort::default());
+        recycle.request();
+        recycle.request();
         assert!(!recycle.due());
         let started = Instant::now();
         recycle.sleep(Duration::from_secs(30));

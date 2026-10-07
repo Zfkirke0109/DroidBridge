@@ -14,8 +14,8 @@
 //! call the Runtime's single shared R-NET-009 probes; `connectivity` and `route` are
 //! answered from the App/framework and read-only Shizuku facts the same sources establish.
 //!
-//! Raw capture and injection stay refused here with the Magisk-host error, because
-//! S-AUTH-NET-001 never admits them for this host and S-NET-005 allows only one capture
+//! Raw capture and injection stay refused here, because S-AUTH-NET-001 never admits
+//! them for this host and S-NET-005 allows only one capture
 //! abstraction. The one capture fact this host supplies is the bytes of a caller-named
 //! file, read through the filesystem primitives it already owns; the Runtime owns the PCAP
 //! format.
@@ -153,7 +153,7 @@ where
             }
             NetworkPrimitiveRequest::CaptureStart { .. }
             | NetworkPrimitiveRequest::CaptureStop { .. }
-            | NetworkPrimitiveRequest::PacketInject { .. } => return Err(magisk_only()),
+            | NetworkPrimitiveRequest::PacketInject { .. } => return Err(root_only()),
         };
         Ok(NetworkPrimitiveSettlement {
             outcome,
@@ -508,7 +508,7 @@ where
             }
             FileTargetType::ContentUri => {
                 let source = AndroidFrameworkFilesystemPort::new(self.dispatch.clone())
-                    .open_read(execution, target);
+                    .open_read(execution, target, claim);
                 let source = source.map_err(failure)?;
                 if source
                     .total_size
@@ -604,11 +604,11 @@ fn unresolved(error: DomainError) -> Result<(), ExecutionFailure> {
     Ok(())
 }
 
-/// The typed refusal this host reports for the raw operations only the Magisk surface owns.
-fn magisk_only() -> ExecutionFailure {
+/// The typed refusal this host reports for the raw operations only the root edition owns.
+fn root_only() -> ExecutionFailure {
     failure(DomainError::new(
         ErrorCode::CapabilityUnavailable,
-        "raw network operations require the Magisk host",
+        "raw network operations require the root edition",
     ))
 }
 
@@ -1068,7 +1068,7 @@ wlan0\t007E1EAC\t00000000\t0001\t0\t0\t0\t00FEFFFF\t0\t0\t0
 ";
 
     const SNAPSHOT_PRIMITIVE: &str = "AndroidNetworkSnapshot";
-    const MAGISK_ONLY: &str = "raw network operations require the Magisk host";
+    const ROOT_ONLY: &str = "raw network operations require the root edition";
 
     fn uuid(prefix: u32, value: u64) -> UuidV4 {
         UuidV4::parse(format!("{prefix:08x}-0000-4000-8000-{value:012x}")).unwrap()
@@ -1592,10 +1592,10 @@ wlan0\t007E1EAC\t00000000\t0001\t0\t0\t0\t00FEFFFF\t0\t0\t0
         assert!(settlement.sockets.is_none());
     }
 
-    /// S-NET-004 keeps raw capture and injection on the Magisk host; this surface refuses
+    /// S-NET-004 keeps raw capture and injection on the root edition; this surface refuses
     /// them with that exact reason instead of degrading to a partial implementation.
     #[test]
-    fn i8_net_g_raw_capture_and_injection_require_the_magisk_host() {
+    fn i8_net_g_raw_capture_and_injection_require_the_root_edition() {
         let port = ApkNetworkPort::new(
             ScriptedFramework::answering(&snapshot(Vec::new(), Vec::new(), Vec::new(), None)),
             ScriptedInterfaces::reporting(Vec::new()),
@@ -1625,7 +1625,7 @@ wlan0\t007E1EAC\t00000000\t0001\t0\t0\t0\t00FEFFFF\t0\t0\t0
             let failure = run(&port, &execution, request)
                 .expect_err("a raw network operation is refused on the APK host");
             assert_eq!(failure.error.code, ErrorCode::CapabilityUnavailable);
-            assert_eq!(failure.error.reason, MAGISK_ONLY);
+            assert_eq!(failure.error.reason, ROOT_ONLY);
             assert!(failure.cleanup_verified);
         }
     }

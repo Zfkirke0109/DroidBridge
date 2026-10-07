@@ -135,14 +135,6 @@ fn i1_g02_catalog_fields_defaults_bounds_and_internal_schemas_are_serializable()
         }
     }
 
-    let update_id = UuidV4::parse(REQUEST_ID).unwrap();
-    let operation = DaemonOperation::MaintenanceStatus(MaintenanceStatus { update_id });
-    assert_eq!(
-        serde_json::to_value(operation).unwrap(),
-        json!({
-            "operation":"MaintenanceStatus","payload":{"update_id":REQUEST_ID}
-        })
-    );
     assert!(serde_json::from_value::<True>(json!(false)).is_err());
     assert!(serde_json::from_value::<True>(json!(true)).is_ok());
 }

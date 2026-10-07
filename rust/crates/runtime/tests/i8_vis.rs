@@ -12,7 +12,7 @@ use runtime::{
     ExecutionFailure, ExecutionPort, FilesystemCandidate, FilesystemPreflightPort,
     LocalExecutionClaim, NativeVisualExecutionSurface, PortFuture, RecoveryProof, RuntimeCore,
     VisualDisplaySnapshot, VisualEncodedImage, VisualHierarchySnapshot, VisualInteractionRequest,
-    VisualPrimitivePort, VisualSceneProof, VisualTransformSource,
+    VisualPrimitivePort, VisualSceneProof, VisualTarget, VisualTransformSource,
     fakes::{FakeArtifacts, FakeCapabilities, FakeHostControl, FakePersistence},
     parse_privileged_hierarchy,
 };
@@ -536,6 +536,8 @@ async fn i8_vis_g07_accessibility_node_ref_remains_bound_to_its_live_provider_an
     .await;
     assert_eq!(stale["outcome"], "error");
     assert_eq!(stale["error"]["code"], "STALE_REFERENCE");
+    // A fresh observation resolves it, and the caller is told so.
+    assert_eq!(stale["error"]["retryable"], true, "{stale}");
     assert_eq!(primitive.interactions().len(), 1);
 }
 
@@ -861,5 +863,132 @@ fn i8_vis_g08_privileged_xml_rejects_external_entities_and_malformed_attributes(
             .unwrap_err()
             .code,
         ErrorCode::IoError,
+    );
+}
+
+fn scene(nodes: Vec<VisualNode>, hierarchy: &str) -> VisualHierarchySnapshot {
+    VisualHierarchySnapshot {
+        display: display(1),
+        foreground: Some(ForegroundFact {
+            package: Some("com.sankuai.meituan".to_owned()),
+            activity: None,
+        }),
+        nodes,
+        truncated: false,
+        proof: VisualSceneProof::Privileged {
+            hierarchy_sha256: hierarchy.to_owned(),
+        },
+    }
+}
+
+fn placed(text: &str, left: i32, top: i32, right: i32, bottom: i32) -> VisualNode {
+    VisualNode {
+        text: Some(text.to_owned()),
+        package_name: Some("com.sankuai.meituan".to_owned()),
+        bounds: NodeBounds {
+            left,
+            top,
+            right,
+            bottom,
+        },
+        ..node(None)
+    }
+}
+
+#[test]
+fn i8_vis_coordinate_input_holds_its_target_not_the_whole_scene() {
+    let root = placed("", 0, 0, 1264, 2780);
+    let search = placed("Search", 1080, 232, 1232, 319);
+    let banner = placed("Lunch deals", 0, 400, 1264, 800);
+    let observed = scene(vec![root.clone(), search.clone(), banner.clone()], "a");
+    // The last node in the provider's order that contains the point is the one input reaches.
+    assert_eq!(
+        runtime::target_at(&observed.nodes, 1100, 300)
+            .unwrap()
+            .text
+            .as_deref(),
+        Some("Search")
+    );
+    let target = VisualTarget {
+        max_nodes: 3,
+        package: Some("com.sankuai.meituan".to_owned()),
+        node: runtime::target_at(&observed.nodes, 1100, 300),
+    };
+    let tap = |fresh: &VisualHierarchySnapshot| {
+        runtime::verify_coordinate_scene(fresh, &observed.proof, "tap", 1100, 300, Some(&target))
+    };
+
+    // A rotating banner elsewhere changes the scene but not what the tap reaches.
+    let rotated = scene(
+        vec![
+            root.clone(),
+            search.clone(),
+            placed("Dinner deals", 0, 400, 1264, 800),
+        ],
+        "b",
+    );
+    assert_eq!(tap(&rotated), Ok(()));
+
+    // The target itself changing, or something now on top of it, is stale.
+    let renamed = scene(
+        vec![
+            root.clone(),
+            placed("Cancel", 1080, 232, 1232, 319),
+            banner.clone(),
+        ],
+        "c",
+    );
+    assert_eq!(tap(&renamed).unwrap_err().reason, runtime::STALE_TARGET);
+    let covered = scene(
+        vec![
+            root.clone(),
+            search.clone(),
+            banner.clone(),
+            placed("Popup", 900, 200, 1264, 400),
+        ],
+        "d",
+    );
+    assert_eq!(tap(&covered).unwrap_err().reason, runtime::STALE_TARGET);
+    let moved = scene(
+        vec![root.clone(), placed("Search", 1080, 332, 1232, 419)],
+        "e",
+    );
+    assert_eq!(tap(&moved).unwrap_err().code, ErrorCode::StaleReference);
+
+    // Another App in front is a different window, whatever sits under the point.
+    let mut other = rotated.clone();
+    other.foreground = Some(ForegroundFact {
+        package: Some("com.android.settings".to_owned()),
+        activity: None,
+    });
+    assert_eq!(tap(&other).unwrap_err().reason, runtime::STALE_WINDOW);
+
+    // A swipe aims at no single node, so only the window is held.
+    let swipe = VisualTarget {
+        node: None,
+        ..target.clone()
+    };
+    assert_eq!(
+        runtime::verify_coordinate_scene(
+            &renamed,
+            &observed.proof,
+            "swipe",
+            1100,
+            300,
+            Some(&swipe)
+        ),
+        Ok(())
+    );
+
+    // An observation without nodes saw only the whole scene, so the whole scene is held.
+    assert_eq!(
+        runtime::verify_coordinate_scene(&observed, &observed.proof, "tap", 1100, 300, None),
+        Ok(())
+    );
+    assert_eq!(
+        runtime::verify_coordinate_scene(&rotated, &observed.proof, "tap", 1100, 300, None)
+            .unwrap_err()
+            .reason,
+        runtime::STALE_SCENE
     );
 }

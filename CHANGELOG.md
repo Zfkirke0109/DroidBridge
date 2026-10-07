@@ -1,5 +1,75 @@
 # Changelog / 更新日志
 
+## 0.5.0
+
+### English
+
+**Changed**
+- DroidBridge now comes in two editions, released separately at the same version:
+  - **DroidBridge** is the app for phones without root. It runs everything itself, uses Shizuku
+    when it is running, and updates itself from its Updates page. Releases are tagged
+    `apk-v<version>`.
+  - **The root edition** is a module for Magisk, KernelSU or APatch. Its backend runs as root on
+    its own, serves ChatGPT and local MCP itself and starts at boot without any app. Installing the
+    module also installs the **DroidBridge Root** app, which shows the backend's state and settings
+    but runs nothing itself. Module updates come through the root manager. Releases are tagged
+    `magisk-v<version>`.
+- Both editions are new packages, so settings, tasks and automations from 0.4.x are not carried
+  over. Uninstall the 0.4.x app before installing either edition; it would otherwise offer to put
+  its own module back. Then set up the ChatGPT tunnel and local MCP again.
+- The root edition serves local MCP on port 8766, so it can run next to DroidBridge on 8765.
+- In the root edition, commands run as root only; `run_as` `app` and `shell` report
+  `RUN_AS_UNAVAILABLE`.
+
+- Tapping right after reading the screen works on pages that keep changing (rotating banners,
+  changing hints, running timers). A tap now checks only the app in front and the element it aims
+  at; a change to that element, something covering it, another window or a new display still
+  refuses it. A stale reference is now reported as retryable and says what changed.
+- DroidBridge reads only what is on screen, as the root edition does, so long pages no longer use
+  up the node budget with content off screen.
+
+**Fixed**
+- Once a request had expired, its record could make every later change to the Runtime's store fail
+  with `IO_ERROR` until the Runtime data was reset. Expired requests are now cleared first, and a
+  store that cannot be written takes the Runtime out of ready with `STORE_UNAVAILABLE` instead of
+  leaving it ready while every call fails.
+- Reading a file with more than 16 KB returned inline, including the default 64 KB read, failed
+  with `RESOURCE_LIMIT`.
+- In DroidBridge, creating a file that already exists reported `CAPABILITY_UNAVAILABLE` instead of
+  `ALREADY_EXISTS`.
+- Shell commands through Shizuku longer than 16 KB failed, although commands up to 32 KB are allowed.
+- The root edition could not read the screen while it kept changing (for example a running
+  stopwatch); it now reads it as it is.
+- `resources/read` on a capture reference now says to use the network capture reader, and the
+  command tool's schema states its size limits.
+
+### 中文
+
+**变更**
+- 卓爱桥现在分为两个版本，以相同版本号分别发布：
+  - **卓爱桥** 是面向未 Root 手机的 App，自己完成所有工作；Shizuku 运行时会使用 Shizuku，并在「更新」页自行更新。
+    发布标签为 `apk-v<版本>`。
+  - **Root 版** 是适用于 Magisk、KernelSU 或 APatch 的模块。它的后端以 Root 身份独立运行，直接提供 ChatGPT 和本地 MCP，
+    开机自启，不依赖任何 App。安装模块时会一并安装 **DroidBridge Root** App，用于查看后端状态和修改设置，本身不承担运行。
+    模块更新由 Root 管理器提供。发布标签为 `magisk-v<版本>`。
+- 两个版本都是新的应用包，0.4.x 的设置、任务和自动化不会迁移。安装任一版本前请先卸载 0.4.x 的 App，否则它会提示装回它自带的模块；
+  之后重新设置 ChatGPT 隧道和本地 MCP。
+- Root 版的本地 MCP 使用 8766 端口，可以和使用 8765 端口的卓爱桥同时运行。
+- Root 版只以 Root 身份运行命令；`run_as` 为 `app` 或 `shell` 时返回 `RUN_AS_UNAVAILABLE`。
+
+- 在一直变化的页面上（轮播广告、变化的提示词、正在走的计时器），读屏后立即点击不再被判过期。点击现在只核对前台 App 和要点的那个元素；
+  该元素本身变了、被遮挡、换了窗口或显示参数变了，仍会拒绝。过期错误现在标为可重试，并说明是什么变了。
+- 卓爱桥读屏只返回屏幕上可见的内容（与 Root 版一致），长页面不再被屏幕外的节点占满节点预算。
+
+**修复**
+- 某个请求过期后，它的记录可能让运行时存储之后的每次修改都失败并报 `IO_ERROR`，直到重置运行时数据。现在会先清理过期请求；
+  存储无法写入时，运行时会以 `STORE_UNAVAILABLE` 退出就绪状态，而不是保持就绪却让每次调用都失败。
+- 读取文件时内联返回超过 16 KB（包括默认的 64 KB）会报 `RESOURCE_LIMIT`。
+- 卓爱桥中创建已存在的文件时报 `CAPABILITY_UNAVAILABLE`，现在报 `ALREADY_EXISTS`。
+- 通过 Shizuku 运行超过 16 KB 的 shell 命令会失败，而接口允许最长 32 KB。
+- Root 版在屏幕持续变化时（例如秒表在走）读不到屏幕元素，现在会按当前画面读取。
+- 对抓包引用调用 `resources/read` 时会提示改用网络抓包读取；命令工具的 schema 写明了大小上限。
+
 ## 0.4.3
 
 ### English

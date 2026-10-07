@@ -70,6 +70,7 @@ impl FilesystemFrameworkPort for FixtureFrameworkPort {
         &self,
         _execution: &AdmittedExecution,
         input: FilesystemInspectInput,
+        _claim: &runtime::LocalExecutionClaim,
     ) -> Result<contract::FilesystemInspectResult, domain::DomainError> {
         Ok(contract::FilesystemInspectResult {
             target: input.target,
@@ -85,6 +86,7 @@ impl FilesystemFrameworkPort for FixtureFrameworkPort {
         &self,
         _execution: &AdmittedExecution,
         _target: &FileTarget,
+        _claim: &runtime::LocalExecutionClaim,
     ) -> Result<FilesystemFrameworkSource, domain::DomainError> {
         let file = fs::File::open(&self.source).unwrap();
         Ok(FilesystemFrameworkSource {
@@ -196,6 +198,28 @@ async fn i8_fs_g01_canonical_ingress_preserves_path_mutation_and_data_ref_semant
     assert_eq!(create_response["outcome"], "success", "{create_response}");
     assert_eq!(fs::read(&created_path).unwrap(), b"created-through-ingress");
 
+    // Creating it again is a conflict on the file, not a missing provider.
+    let mut recreate = create.clone();
+    recreate["request_id"] = "10000000-0000-4000-8000-000000000015".into();
+    recreate["payload"]["input"]["content"] = "replacement".into();
+    let recreate_response: serde_json::Value = serde_json::from_slice(
+        &runtime::submit_public(
+            &core,
+            &serde_json::to_vec(&recreate).unwrap(),
+            "2026-09-12T00:00:00.500Z".to_owned(),
+            1_789_171_200_500,
+            true,
+            |_| async { panic!("filesystem escaped its canonical ingress handler") },
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(
+        recreate_response["error"]["code"], "ALREADY_EXISTS",
+        "{recreate_response}"
+    );
+    assert_eq!(fs::read(&created_path).unwrap(), b"created-through-ingress");
+
     let large_path = fixture.root.join("large.txt");
     fs::write(&large_path, vec![b'x'; 300_000]).unwrap();
     let read = serde_json::json!({
@@ -257,6 +281,39 @@ async fn i8_fs_g01_canonical_ingress_preserves_path_mutation_and_data_ref_semant
     assert_eq!(ref_response["outcome"], "success");
     assert_eq!(ref_response["result"]["data"], "xxxxx");
     assert_eq!(ref_response["result"]["truncated"], true);
+
+    // A read with the default bound is answered inline, however much larger than the
+    // settlement floor its result is.
+    let text_path = fixture.root.join("text.txt");
+    fs::write(&text_path, vec![b'A'; 100_000]).unwrap();
+    let default_read = serde_json::json!({
+        "protocol_version": 1,
+        "request_id": "10000000-0000-4000-8000-000000000014",
+        "payload": {
+            "tool": "filesystem",
+            "action": "read",
+            "input": {"target": {"type": "path", "value": text_path.to_string_lossy()}}
+        }
+    });
+    let default_response: serde_json::Value = serde_json::from_slice(
+        &runtime::submit_public(
+            &core,
+            &serde_json::to_vec(&default_read).unwrap(),
+            "2026-09-12T00:00:03.000Z".to_owned(),
+            1_789_171_203_000,
+            true,
+            |_| async { panic!("filesystem escaped its canonical ingress handler") },
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(default_response["outcome"], "success", "{default_response}");
+    assert_eq!(
+        default_response["result"]["data"].as_str().unwrap().len(),
+        65_536
+    );
+    assert_eq!(default_response["result"]["returned_bytes"], 65_536);
+    assert_eq!(default_response["result"]["truncated"], true);
 }
 
 #[test]
@@ -977,7 +1034,7 @@ async fn i8_fs_g01_shizuku_write_uses_exclusive_temp_and_atomic_publication() {
 }
 
 #[test]
-fn i8_fs_g05_preflight_rejects_conflicting_destination_without_mutation() {
+fn i8_fs_g05_preflight_keeps_an_observed_conflict_on_its_identity_without_mutation() {
     let fixture = Fixture::new("preflight-destination");
     fs::write(fixture.root.join("existing"), b"keep").unwrap();
 
@@ -999,8 +1056,9 @@ fn i8_fs_g05_preflight_rejects_conflicting_destination_without_mutation() {
         }),
     ];
 
+    // The App sees the conflict, so it stays the executor and the operation reports it.
     for call in calls {
-        assert_eq!(filesystem_preflight(&call).unwrap(), Preflight::Negative);
+        assert_eq!(filesystem_preflight(&call).unwrap(), Preflight::Positive);
         assert_eq!(fs::read(fixture.root.join("existing")).unwrap(), b"keep");
     }
 }
@@ -1384,7 +1442,7 @@ fn i8_fs_g02_all_actions_share_one_non_mutating_executor_resolver() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(content_executor.provider(), Provider::AppFramework);
+    assert_eq!(content_executor.provider(), Provider::MagiskNative);
     assert!(preflight.calls.into_inner().is_empty());
 
     let unsupported = resolve_filesystem_executor(
@@ -2029,7 +2087,7 @@ fn framework_execution(
 }
 
 #[test]
-fn i8_fs_g02_magisk_content_route_follows_the_authenticated_app_surface() {
+fn i8_fs_g02_magisk_content_route_follows_the_root_provider() {
     let call = FilesystemCall::Inspect(FilesystemInspectInput {
         target: FileTarget {
             target_type: FileTargetType::ContentUri,
@@ -2039,121 +2097,39 @@ fn i8_fs_g02_magisk_content_route_follows_the_authenticated_app_surface() {
         max_depth: 1,
         max_entries: 200,
     });
-    let connected = capability(RuntimeHost::MagiskBackend);
-    let executor = resolve_filesystem_executor(
-        &connected,
-        &RecordingPreflight {
-            app: Preflight::Unknown,
-            shizuku: Preflight::Unknown,
-            calls: RefCell::new(Vec::new()),
-        },
-        &call,
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(executor.provider(), Provider::AppFramework);
-    assert_eq!(
-        executor.capability_generation(),
-        connected.resolver_facts.generations.app_framework
-    );
-
-    let mut detached = connected.clone();
-    detached.context.app_execution_surface = CapabilityState::Unavailable;
-    detached.resolver_facts.app_framework = CapabilityState::Unavailable;
-    let error = resolve_filesystem_executor(
-        &detached,
-        &RecordingPreflight {
-            app: Preflight::Unknown,
-            shizuku: Preflight::Unknown,
-            calls: RefCell::new(Vec::new()),
-        },
-        &call,
-    )
-    .unwrap_err();
-    assert_eq!(error.code, contract::ErrorCode::CapabilityUnavailable);
-}
-
-#[test]
-fn i8_fs_g02_magisk_framework_fact_tracks_the_companion_connection_lifetime() {
-    let vertical = runtime::ApkRuntimeVertical::new_for_host(
-        runtime::VerticalEnvironment {
-            sdk_int: 35,
-            abi: "arm64-v8a".to_owned(),
-            timezone: "UTC".to_owned(),
-            manufacturer: "fixture".to_owned(),
-            model: "fixture".to_owned(),
-            device: "fixture".to_owned(),
-            build_fingerprint: "fixture".to_owned(),
-            version_name: "0.1.0".to_owned(),
-            version_code: 1000,
-            runtime_epoch: uuid(1),
-            host_generation: 7,
-        },
-        RuntimeHost::MagiskBackend,
-    )
-    .unwrap();
-    let port = vertical.capability_port(uuid(2));
-    let call = FilesystemCall::Read(FilesystemReadInput {
-        source: ReadSource::Target {
-            target: FileTarget {
-                target_type: FileTargetType::ContentUri,
-                value: "content://authority/document/1".to_owned(),
-            },
-        },
-        offset: 0,
-        max_bytes: 64,
-        encoding: DataEncoding::Utf8,
-    });
     let preflight = || RecordingPreflight {
         app: Preflight::Unknown,
         shizuku: Preflight::Unknown,
         calls: RefCell::new(Vec::new()),
     };
-
-    let detached = runtime::CapabilityPort::current(&port).unwrap();
-    assert_eq!(
-        detached.context.app_execution_surface,
-        CapabilityState::Unavailable
-    );
-    assert_eq!(
-        detached.resolver_facts.app_framework,
-        CapabilityState::Unavailable
-    );
-    assert_eq!(
-        resolve_filesystem_executor(&detached, &preflight(), &call)
-            .unwrap_err()
-            .code,
-        contract::ErrorCode::CapabilityUnavailable
-    );
-
-    vertical
-        .set_app_execution_surface(CapabilityState::Available)
+    let rooted = capability(RuntimeHost::MagiskBackend);
+    let executor = resolve_filesystem_executor(&rooted, &preflight(), &call)
+        .unwrap()
         .unwrap();
-    let connected = runtime::CapabilityPort::current(&port).unwrap();
+    assert_eq!(executor.provider(), Provider::MagiskNative);
     assert_eq!(
-        connected.resolver_facts.app_framework,
-        CapabilityState::Available
+        executor.capability_generation(),
+        rooted.resolver_facts.generations.magisk_native
     );
-    assert_eq!(connected.resolver_facts.generations.app_framework, 7);
+
+    // The App surface plays no part on the root host, so its absence changes nothing and the
+    // root provider's absence is the only loss.
+    let mut without_app = rooted.clone();
+    without_app.context.app_execution_surface = CapabilityState::Unavailable;
+    without_app.resolver_facts.app_framework = CapabilityState::Unavailable;
     assert_eq!(
-        resolve_filesystem_executor(&connected, &preflight(), &call)
+        resolve_filesystem_executor(&without_app, &preflight(), &call)
             .unwrap()
             .unwrap()
             .provider(),
-        Provider::AppFramework
+        Provider::MagiskNative
     );
-
-    vertical
-        .set_app_execution_surface(CapabilityState::Unavailable)
-        .unwrap();
+    let mut without_root = rooted;
+    without_root.resolver_facts.magisk_native = CapabilityState::Unavailable;
     assert_eq!(
-        resolve_filesystem_executor(
-            &runtime::CapabilityPort::current(&port).unwrap(),
-            &preflight(),
-            &call,
-        )
-        .unwrap_err()
-        .code,
+        resolve_filesystem_executor(&without_root, &preflight(), &call)
+            .unwrap_err()
+            .code,
         contract::ErrorCode::CapabilityUnavailable
     );
 }
@@ -2255,6 +2231,8 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         91,
         FilesystemCall::Inspect(inspect_input(target.clone())),
     );
+    let claims = runtime::LocalExecutionClaims::default();
+    let claim = claims.claim(execution.execution_id.clone()).unwrap();
     let inspection = bridge_inspection(target.clone());
 
     let (port, bridge) = bridge_port(vec![Ok(runtime::AndroidPrimitiveResult {
@@ -2262,7 +2240,7 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         descriptors: Vec::new(),
     })]);
     assert_eq!(
-        port.inspect(&execution, inspect_input(target.clone()))
+        port.inspect(&execution, inspect_input(target.clone()), &claim)
             .unwrap(),
         inspection
     );
@@ -2281,7 +2259,7 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         descriptors: vec![("content".to_owned(), fs::File::open(&source).unwrap())],
     })]);
     assert_eq!(
-        port.inspect(&execution, inspect_input(target.clone()))
+        port.inspect(&execution, inspect_input(target.clone()), &claim)
             .unwrap_err()
             .code,
         contract::ErrorCode::IoError
@@ -2296,7 +2274,7 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         descriptors: Vec::new(),
     })]);
     assert_eq!(
-        port.inspect(&execution, inspect_input(target.clone()))
+        port.inspect(&execution, inspect_input(target.clone()), &claim)
             .unwrap_err()
             .code,
         contract::ErrorCode::IoError
@@ -2307,7 +2285,7 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         descriptors: Vec::new(),
     })]);
     assert_eq!(
-        port.inspect(&execution, inspect_input(target.clone()))
+        port.inspect(&execution, inspect_input(target.clone()), &claim)
             .unwrap_err()
             .code,
         contract::ErrorCode::IoError
@@ -2318,7 +2296,7 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         "companion fence is stale",
     ))]);
     assert_eq!(
-        port.inspect(&execution, inspect_input(target.clone()))
+        port.inspect(&execution, inspect_input(target.clone()), &claim)
             .unwrap_err()
             .code,
         contract::ErrorCode::StaleAuthority
@@ -2331,7 +2309,7 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
             fs::File::open(&source).unwrap(),
         )],
     })]);
-    let opened = port.open_read(&execution, &target).unwrap();
+    let opened = port.open_read(&execution, &target, &claim).unwrap();
     assert_eq!(opened.total_size, Some(6));
     let mut bytes = Vec::new();
     opened.file.take(6).read_to_end(&mut bytes).unwrap();
@@ -2349,7 +2327,9 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         descriptors: vec![("content_read".to_owned(), fs::File::open(&source).unwrap())],
     })]);
     assert_eq!(
-        port.open_read(&execution, &target).unwrap_err().code,
+        port.open_read(&execution, &target, &claim)
+            .unwrap_err()
+            .code,
         contract::ErrorCode::IoError
     );
 
@@ -2358,7 +2338,9 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         descriptors: Vec::new(),
     })]);
     assert_eq!(
-        port.open_read(&execution, &target).unwrap_err().code,
+        port.open_read(&execution, &target, &claim)
+            .unwrap_err()
+            .code,
         contract::ErrorCode::IoError
     );
 
@@ -2374,7 +2356,9 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         )],
     })]);
     assert_eq!(
-        port.open_read(&execution, &target).unwrap_err().code,
+        port.open_read(&execution, &target, &claim)
+            .unwrap_err()
+            .code,
         contract::ErrorCode::PermissionDenied
     );
 
@@ -2386,7 +2370,9 @@ fn i8_fs_g04_bridge_port_verifies_what_the_authenticated_surface_returned() {
         )],
     })]);
     assert_eq!(
-        port.open_read(&execution, &target).unwrap_err().code,
+        port.open_read(&execution, &target, &claim)
+            .unwrap_err()
+            .code,
         contract::ErrorCode::IoError
     );
 }

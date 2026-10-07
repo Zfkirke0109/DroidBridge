@@ -778,6 +778,16 @@ async fn i10_g07_tool_and_resource_references_map_deterministically() {
         json_body(&facade.handle(read(image_uri), TOKEN).await)["result"]["contents"],
         json!([{"uri": image_uri, "mimeType": "image/png", "blob": "iVBORw=="}])
     );
+    // A capture is not a resource; the caller is told which reader serves it.
+    let capture_uri = "dbref:capture:99300000-0000-4000-8000-000000000003";
+    let capture = json_body(&facade.handle(read(capture_uri), TOKEN).await);
+    assert_eq!(capture["error"]["code"], -32602, "{capture}");
+    assert!(
+        capture["error"]["data"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("network action capture")
+    );
     host.queue_query(json!({"error": "not_found"}), None);
     let missing = json_body(&facade.handle(read("dbref:stdout:gone"), TOKEN).await);
     assert_eq!(missing["error"]["code"], -32602);

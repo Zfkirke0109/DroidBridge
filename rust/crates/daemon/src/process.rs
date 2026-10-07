@@ -1,34 +1,53 @@
+//! The root edition's daemon. It owns its canonical store under `/data/adb/droidbridge`, is the
+//! only Runtime host that store ever has, serves MCP itself and answers the frontend App, which
+//! only shows and changes this daemon's state.
+
 use crate::{
-    COMPANION_CAPABILITY_KEYS, CanonicalDirectoryIdentity, CompanionCapabilityRegistration,
-    CompanionLink, DaemonRole, EndpointRole, Handshake, ModuleIdentity, ModuleObservation,
-    Operation, PROTOCOL_VERSION, WireEnvelope,
-    app_keepalive::AppKeepAlive,
-    canonical_directory_matches,
-    companion::{CompanionChannel, CompanionEvent, CompanionPort},
-    decode_companion_capability_snapshot,
-    magisk_host::{MagiskHost, VERSION_CODE, fixed_property, observe_module},
-    unix_transport::{connect_abstract, peer_uid, receive_json, send_json},
+    ModuleIdentity, ModuleObservation,
+    frontend::{self, Handler, error_payload},
+    ingress::DaemonIngress,
+    magisk_guard_recovery::{ProcFacts, read_boot_id},
+    magisk_host::{HostSubmitter, MagiskHost, VERSION_CODE, fixed_property, observe_module},
+    recycle::Recycle,
+    settings::SettingsStore,
+    unix_transport::connect_abstract,
 };
-use contract::{CapabilityState, ErrorCode, RuntimeHost, UuidV4};
-use domain::{AdmissionFence, DomainError};
-use persistence::{CanonicalState, RuntimeOwner, StateStore, TransitionRecovery, read_json};
-use runtime::{NetworkDefaultChangedEvent, NetworkDefaultSourceRegistration, NetworkEventDelivery};
+use contract::{ErrorCode, RuntimeHost, UuidV4};
+use domain::DomainError;
+use persistence::{
+    CanonicalState, FaultFileStore, MaintenanceBlocker, RuntimeOwner, RuntimeResetIntent,
+    StateStore,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
-    os::fd::OwnedFd,
-    os::unix::fs::MetadataExt,
-    os::unix::net::UnixStream,
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
-const CONNECT_DELAYS_SECONDS: [u64; 6] = [1, 2, 4, 8, 16, 30];
+/// The main loop's period: how soon a newly opened frontend is connected.
+const TICK: Duration = Duration::from_secs(1);
+/// How often the host's facts (helper, module, quarantine) are observed again.
+const REFRESH_EVERY: Duration = Duration::from_secs(5);
+/// The waits before another activation attempt after a failed one.
+const ACTIVATION_DELAYS_SECONDS: [u64; 6] = [1, 2, 4, 8, 16, 30];
+/// How long a cleared stranded execution waits for an instance that still holds the live lock.
+const STRANDED_CLEAR_WAIT: Duration = Duration::from_secs(20);
+const LIVE_LOCK_RELEASE_WAIT: Duration = Duration::from_secs(5);
+/// The S-SEC-005 bound on one fault file.
+const FAULT_FILE_LIMIT_BYTES: u64 = 65_536;
 
 pub fn main() -> ExitCode {
-    match Daemon::discover().and_then(Daemon::run) {
+    // Magisk starts services with umask 0; everything this daemon creates is its own alone.
+    unsafe { libc::umask(0o077) };
+    match Daemon::discover().and_then(|daemon| Arc::new(daemon).run()) {
         Ok(()) => ExitCode::SUCCESS,
         // The supervisor records only the exit code; the reason goes to the daemon's stderr log.
         Err(error) => {
@@ -41,19 +60,23 @@ pub fn main() -> ExitCode {
 struct Daemon {
     identity: ModuleIdentity,
     module_root: PathBuf,
-    canonical_base: PathBuf,
-    canonical_identity: CanonicalDirectoryIdentity,
-    store: Arc<StateStore>,
+    base: PathBuf,
     sdk_int: u32,
-    observation: ModuleObservation,
+    store: Arc<StateStore>,
+    recycle: Arc<Recycle>,
+    host: Mutex<HostSlot>,
+    /// Taken after [host] whenever both are held.
+    ingress: Mutex<DaemonIngress<HostSubmitter>>,
+    frontend_connected: AtomicBool,
+}
+
+struct HostSlot {
     host: Option<MagiskHost>,
-    target_preparation: Option<UuidV4>,
-    companion: CompanionLink,
-    companion_port: CompanionPort,
-    companion_capabilities: Vec<CompanionCapabilityRegistration>,
-    maintenance: crate::maintenance::MaintenanceAttempts,
-    task_activity: Arc<crate::app_keepalive::TaskActivityBeacon>,
-    recycle: Arc<crate::recycle::Recycle>,
+    observation: Option<ModuleObservation>,
+    failure: Option<DomainError>,
+    failures: usize,
+    retry_at: Instant,
+    refreshed_at: Instant,
 }
 
 impl Daemon {
@@ -76,16 +99,6 @@ impl Daemon {
                 "daemon executable is outside its fixed module identity",
             ));
         }
-        let canonical_base = PathBuf::from("/data/user_de/0")
-            .join(identity.package)
-            .join("files/droidbridge");
-        if !canonical_base.is_dir() {
-            return Err(DomainError::new(
-                ErrorCode::NotFound,
-                "App canonical store is not initialized",
-            ));
-        }
-        let canonical_identity = canonical_directory_identity(&canonical_base)?;
         let sdk_int = fixed_property("ro.build.version.sdk")?
             .parse()
             .ok()
@@ -96,706 +109,462 @@ impl Daemon {
                     "device SDK has no fixed helper",
                 )
             })?;
-        let observation = observe_module(&module_root, &canonical_base, &identity)?;
-        let store = Arc::new(StateStore::new(canonical_base.clone()));
-        let task_activity = crate::app_keepalive::TaskActivityBeacon::new(identity.package);
-        let mut daemon = Self {
+        let base = identity.state_base();
+        let store = Arc::new(initialize_store(&base)?);
+        let port = if identity.module_id == ModuleIdentity::debug().module_id {
+            runtime::MCP_ROOT_DEBUG_PORT
+        } else {
+            runtime::MCP_ROOT_STABLE_PORT
+        };
+        Ok(Self {
             identity,
             module_root,
-            canonical_base,
-            canonical_identity,
-            store,
+            ingress: Mutex::new(DaemonIngress::new(SettingsStore::new(base.clone()), port)),
+            base,
             sdk_int,
-            observation,
-            host: None,
-            target_preparation: None,
-            companion: CompanionLink::default(),
-            companion_port: CompanionPort::default(),
-            companion_capabilities: Vec::new(),
-            maintenance: crate::maintenance::MaintenanceAttempts::default(),
-            task_activity,
+            store,
             recycle: Arc::default(),
-        };
-        let owner = daemon.store.read_owner()?;
-        if DaemonRole::from_owner(owner.host).may_create_core() {
-            daemon.activate_current_owner()?;
-        }
-        Ok(daemon)
+            host: Mutex::new(HostSlot {
+                host: None,
+                observation: None,
+                failure: None,
+                failures: 0,
+                retry_at: Instant::now(),
+                refreshed_at: Instant::now(),
+            }),
+            frontend_connected: AtomicBool::new(false),
+        })
     }
 
-    fn run(mut self) -> Result<(), DomainError> {
-        let mut failure_index = 0_usize;
-        let mut keepalive = AppKeepAlive::new(self.identity.package);
+    fn run(self: Arc<Self>) -> Result<(), DomainError> {
         loop {
-            if !self.canonical_directory_is_current() {
-                return Ok(());
-            }
             if self.recycle.due() {
-                crate::recycle::Recycle::bound_shutdown();
+                Recycle::bound_shutdown();
+                let host = self.slot().host.take();
+                self.ingress().attach(None);
+                if let Some(host) = host {
+                    host.shutdown();
+                }
                 return Err(DomainError::new(
                     ErrorCode::IoError,
                     "execution cleanup is unverified; the supervisor restarts the daemon",
                 ));
             }
-            let started = Instant::now();
-            if let Ok(mut stream) = connect_abstract(self.identity.socket_name) {
-                keepalive.observe_present();
-                // The App that answers here serves the Android primitives this daemon's Tasks
-                // execute, so it is told what it must hold for as long as this connection lives.
-                self.task_activity.set_connected(true);
-                if let Err(error) = self.serve_connection(&mut stream) {
-                    // The only record of a companion connection that ended, and the only way a
-                    // rejected handshake is visible at all; the supervisor keeps this stderr.
-                    eprintln!(
-                        "droidbridged: companion connection ended: {:?} {}",
-                        error.code, error.reason
-                    );
-                }
-                self.task_activity.set_connected(false);
-                self.companion_port.withdraw()?;
-                self.set_companion(false)?;
-                // The backoff is not shortened for keep-alive: reconnecting within a second of a
-                // Runtime restart overlapped the App's start and failed in-flight daemon Tasks with
-                // REVISION_CONFLICT (network.capture stop, device gate), so a revived App waits for
-                // the ordinary retry.
-                if started.elapsed() >= Duration::from_secs(300) {
-                    failure_index = 0;
-                }
-            } else {
-                // No Runtime listens: an enabled agent connection, or a Task this daemon still
-                // owns, needs the App started again.
-                keepalive.observe_absent(&self.canonical_base, self.task_activity.wake_wanted());
-            }
-            if !self.canonical_directory_is_current() {
-                return Ok(());
-            }
-            let delay = CONNECT_DELAYS_SECONDS[failure_index.min(CONNECT_DELAYS_SECONDS.len() - 1)];
-            failure_index = (failure_index + 1).min(CONNECT_DELAYS_SECONDS.len() - 1);
-            self.recycle.sleep(Duration::from_secs(delay));
+            self.maintain_host();
+            self.connect_frontend();
+            self.recycle.sleep(TICK);
         }
     }
 
-    fn serve_connection(&mut self, stream: &mut UnixStream) -> Result<(), DomainError> {
-        self.require_canonical_directory()?;
-        // The App's uid is read from the package data directory the system created for it, not
-        // from the canonical base inside it: a base recreated by root after App data was cleared
-        // carries root as its owner, and would lock the App out for good.
-        let package_directory = self
-            .canonical_base
-            .ancestors()
-            .nth(2)
-            .ok_or_else(|| io_error("App canonical directory has no package directory"))?;
-        let expected_uid = fs::metadata(package_directory)
-            .map_err(|_| io_error("cannot inspect App package directory"))?
-            .uid();
-        // Any App can bind the abstract name while DroidBridge is not running, so the peer is
-        // authenticated before this daemon tells it anything.
-        let app_uid = peer_uid(stream).map_err(|_| io_error("cannot authenticate App socket"))?;
-        if app_uid != expected_uid {
-            return Err(DomainError::new(
-                ErrorCode::PermissionDenied,
-                "companion socket peer is not the App",
-            ));
+    /// Activates the host when its retry is due and observes an active host's facts.
+    fn maintain_host(&self) {
+        let mut slot = self.slot();
+        let now = Instant::now();
+        if slot.host.is_none() {
+            if now >= slot.retry_at {
+                self.activate(&mut slot);
+            }
+            return;
         }
-        let owner = self.store.read_owner()?;
-        let daemon_handshake = Handshake {
-            protocol_version: PROTOCOL_VERSION,
-            role: EndpointRole::Droidbridged,
-            package: self.identity.package.to_owned(),
-            user_id: 0,
-            runtime_epoch: owner.runtime_epoch.clone(),
-            host: owner.host,
-            host_generation: owner.host_generation,
-            runtime_instance_id: self.host.as_ref().map(|host| host.instance_id().clone()),
-        };
-        send_json(stream, &daemon_handshake)?;
-        let app_handshake: Handshake = receive_json(stream)?;
-        app_handshake.validate_peer(
-            app_uid,
-            expected_uid,
-            EndpointRole::ApkRuntime,
-            &self.identity,
-        )?;
-        self.require_canonical_directory()?;
-        let current_owner = self.store.read_owner()?;
-        if app_handshake.runtime_epoch != current_owner.runtime_epoch
-            || app_handshake.host != current_owner.host
-            || app_handshake.host_generation != current_owner.host_generation
+        if now.duration_since(slot.refreshed_at) < REFRESH_EVERY {
+            return;
+        }
+        slot.refreshed_at = now;
+        let observed = observe_module(&self.module_root, &self.identity);
+        let module_ready = observed
+            .as_ref()
+            .is_ok_and(|observation| observation.readiness(&self.identity, VERSION_CODE).is_ok());
+        slot.observation = observed.ok();
+        if let Some(host) = slot.host.as_mut()
+            && let Err(error) =
+                host.refresh_runtime_facts(&self.module_root, self.sdk_int, module_ready)
         {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "App handshake owner fence is stale",
-            ));
-        }
-        self.set_companion(false)?;
-        let channel = CompanionChannel::start(stream)?;
-        // The delegation surface is live only for the life of this authenticated
-        // connection, so it is published before any companion-fenced business work can
-        // be admitted and withdrawn with the connection.
-        self.companion_port.publish(Arc::clone(&channel))?;
-        self.bind_companion_fence(&current_owner)?;
-        let status_request = WireEnvelope::request(
-            new_uuid()?,
-            current_owner.runtime_epoch.clone(),
-            current_owner.host_generation,
-            self.host.as_ref().map(|host| host.instance_id().clone()),
-            Operation::HostStatus,
-            self.status_payload()?,
-            Vec::new(),
-        );
-        channel.request_control(&status_request)?;
-        let capability_request = WireEnvelope::request(
-            new_uuid()?,
-            current_owner.runtime_epoch,
-            current_owner.host_generation,
-            self.host.as_ref().map(|host| host.instance_id().clone()),
-            Operation::CapabilitySnapshot,
-            json!({}),
-            Vec::new(),
-        );
-        channel.request_control(&capability_request)?;
-
-        loop {
-            let event = channel.next_event()?;
-            self.require_canonical_directory()?;
-            match event {
-                CompanionEvent::Response(envelope) => {
-                    if envelope.operation == Operation::CapabilitySnapshot {
-                        self.companion_capabilities =
-                            decode_companion_capability_snapshot(&envelope.payload)?;
-                        self.set_companion(true)?;
-                    }
-                    continue;
-                }
-                CompanionEvent::Request(received) => {
-                    let installs = matches!(
-                        received.envelope.operation,
-                        Operation::MaintenanceInstallApk | Operation::MaintenanceInstallModule
-                    );
-                    if !received.descriptors.is_empty() && !installs {
-                        return Err(DomainError::new(
-                            ErrorCode::ProtocolIncompatible,
-                            "operation does not accept descriptors",
-                        ));
-                    }
-                    let request = received.envelope;
-                    let received_descriptors = received.descriptors;
-                    self.validate_request_fence(&request)?;
-                    if request.operation == Operation::HostStatus && self.host.is_some() {
-                        let capability_request = WireEnvelope::request(
-                            new_uuid()?,
-                            request.runtime_epoch.clone(),
-                            request.host_generation,
-                            self.host.as_ref().map(|host| host.instance_id().clone()),
-                            Operation::CapabilitySnapshot,
-                            json!({}),
-                            Vec::new(),
-                        );
-                        channel.request_control(&capability_request)?;
-                    }
-                    let (response_payload, descriptors) =
-                        self.handle_request_with_descriptors(&request, received_descriptors)?;
-                    let response = WireEnvelope::response(
-                        new_uuid()?,
-                        &request,
-                        self.host.as_ref().map(|host| host.instance_id().clone()),
-                        response_payload,
-                        descriptors.iter().map(|(role, _)| role.clone()).collect(),
-                    );
-                    channel.respond(&response, descriptors)?;
-                }
-            }
-            if self.recycle.due() {
-                return Ok(());
-            }
-        }
-    }
-
-    fn canonical_directory_is_current(&self) -> bool {
-        canonical_directory_matches(
-            self.canonical_identity,
-            canonical_directory_identity(&self.canonical_base).ok(),
-        )
-    }
-
-    fn require_canonical_directory(&self) -> Result<(), DomainError> {
-        if self.canonical_directory_is_current() {
-            Ok(())
-        } else {
-            Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "App canonical directory identity changed",
-            ))
-        }
-    }
-
-    fn validate_request_fence(&self, request: &WireEnvelope) -> Result<(), DomainError> {
-        let owner = self.store.read_owner()?;
-        if request.runtime_epoch != owner.runtime_epoch
-            || request.host_generation != owner.host_generation
-            || matches!(
-                request.operation,
-                Operation::CompanionExecute | Operation::CompanionCancel
-            )
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "daemon request fence is stale or has invalid direction",
-            ));
-        }
-        if matches!(
-            request.operation,
-            Operation::RuntimeForward
-                | Operation::RuntimeCancel
-                | Operation::NetworkDefaultChanged
-                | Operation::NetworkAttachment
-        ) && request.runtime_instance_id
-            != self.host.as_ref().map(|host| host.instance_id().clone())
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "daemon Runtime instance fence is stale",
-            ));
-        }
-        let role = DaemonRole::from_owner(owner.host);
-        if !role.permits(request.operation) {
-            return Err(DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "operation is illegal for the daemon role",
-            ));
-        }
-        Ok(())
-    }
-
-    fn handle_request_with_descriptors(
-        &mut self,
-        request: &WireEnvelope,
-        received: Vec<OwnedFd>,
-    ) -> Result<(Value, Vec<(String, OwnedFd)>), DomainError> {
-        let install = match request.operation {
-            Operation::MaintenanceInstallApk => Some(crate::maintenance::InstallKind::Apk),
-            Operation::MaintenanceInstallModule => Some(crate::maintenance::InstallKind::Module),
-            _ => None,
-        };
-        if let Some(kind) = install {
-            let reply = self.maintenance.install(
-                kind,
-                &self.canonical_base,
-                &self.module_root,
-                &self.identity,
-                request,
-                received,
+            eprintln!(
+                "droidbridged: runtime fact refresh failed: {:?} {}",
+                error.code, error.reason
             );
-            return Ok((reply, Vec::new()));
         }
-        if request.operation == Operation::RuntimeForward
-            && runtime::McpArtifactQuery::is_artifact_query(&request.payload)
-        {
-            return Ok(self.answer_artifact_query(&request.payload));
-        }
-        self.handle_request(request)
-            .map(|payload| (payload, Vec::new()))
     }
 
-    /// Answers one S-MCP-006 internal artifact query. A host failure is a typed reply the facade
-    /// maps to `-32603`, never a reason to drop the companion connection.
-    fn answer_artifact_query(&self, payload: &Value) -> (Value, Vec<(String, OwnedFd)>) {
-        let answered = self
+    fn activate(&self, slot: &mut HostSlot) {
+        let activated = (|| {
+            let observation = observe_module(&self.module_root, &self.identity)?;
+            slot.observation = Some(observation.clone());
+            observation.readiness(&self.identity, VERSION_CODE)?;
+            let owner = self.store.read_owner()?;
+            if owner.host != RuntimeHost::MagiskBackend {
+                return Err(DomainError::new(
+                    ErrorCode::StaleAuthority,
+                    "the canonical store belongs to another host",
+                ));
+            }
+            MagiskHost::activate(
+                Arc::clone(&self.store),
+                &self.identity,
+                &self.module_root,
+                &self.base,
+                self.sdk_int,
+                owner,
+                Arc::clone(&self.recycle),
+            )
+        })();
+        match activated {
+            Ok(host) => {
+                self.ingress().attach(Some(host.submitter()));
+                slot.host = Some(host);
+                slot.failure = None;
+                slot.failures = 0;
+                slot.refreshed_at = Instant::now();
+            }
+            Err(error) => {
+                eprintln!(
+                    "droidbridged: Runtime activation failed: {:?} {}",
+                    error.code, error.reason
+                );
+                let delay = ACTIVATION_DELAYS_SECONDS
+                    [slot.failures.min(ACTIVATION_DELAYS_SECONDS.len() - 1)];
+                slot.failures += 1;
+                slot.retry_at = Instant::now() + Duration::from_secs(delay);
+                slot.failure = Some(error);
+            }
+        }
+    }
+
+    /// Connects a frontend that is listening, unless one is already served.
+    fn connect_frontend(self: &Arc<Self>) {
+        if self.frontend_connected.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(stream) = connect_abstract(self.identity.socket_name) else {
+            return;
+        };
+        self.frontend_connected.store(true, Ordering::Release);
+        let daemon = Arc::clone(self);
+        thread::spawn(move || {
+            let handler: Handler = {
+                let daemon = Arc::clone(&daemon);
+                Arc::new(move |operation, payload| daemon.handle(operation, payload))
+            };
+            if let Err(error) = frontend::serve(stream, &daemon.identity, handler) {
+                // The only record of a frontend connection that ended or was refused.
+                eprintln!(
+                    "droidbridged: frontend connection ended: {:?} {}",
+                    error.code, error.reason
+                );
+            }
+            daemon.frontend_connected.store(false, Ordering::Release);
+        });
+    }
+
+    fn handle(&self, operation: &str, payload: &Value) -> Value {
+        let flag = |name: &str| payload.get(name).and_then(Value::as_bool);
+        let text = |name: &str| payload.get(name).and_then(Value::as_str);
+        let answered = match operation {
+            "status" => Ok(self.status()),
+            "submit" => self.submit(payload),
+            "mcp_settings" => Ok(self.ingress().mcp_settings()),
+            "mcp_set_enabled" => flag("enabled")
+                .map(|enabled| self.ingress().mcp_set_enabled(enabled))
+                .ok_or_else(invalid_payload),
+            "mcp_rotate_token" => Ok(self.ingress().mcp_rotate()),
+            "mcp_reveal_token" => Ok(self.ingress().mcp_reveal()),
+            "tunnel_settings" => Ok(self.ingress().tunnel_settings()),
+            "tunnel_configure" => match (text("tunnel_id"), text("api_key")) {
+                (Some(tunnel_id), Some(api_key)) => {
+                    Ok(self.ingress().tunnel_configure(tunnel_id, api_key))
+                }
+                _ => Err(invalid_payload()),
+            },
+            "tunnel_set_enabled" => flag("enabled")
+                .map(|enabled| self.ingress().tunnel_set_enabled(enabled))
+                .ok_or_else(invalid_payload),
+            "tunnel_clear" => Ok(self.ingress().tunnel_clear()),
+            "diagnostics_snapshot" => Ok(self.diagnostics_snapshot()),
+            "maintenance_state" => self.maintenance_state(),
+            "fault_files" => Ok(self.fault_files()),
+            "reset_runtime_data" => Ok(self.reset_runtime_data()),
+            "stranded_executions" => persistence::stranded_execution_count(&self.base)
+                .map(|count| json!({"count": count})),
+            "clear_stranded_executions" => Ok(self.clear_stranded_executions()),
+            _ => Err(DomainError::new(
+                ErrorCode::ProtocolIncompatible,
+                "unknown frontend operation",
+            )),
+        };
+        answered.unwrap_or_else(|error| error_payload(&error))
+    }
+
+    fn status(&self) -> Value {
+        let slot = self.slot();
+        let mut status = json!({
+            "schema_version": 1,
+            "module_id": self.identity.module_id,
+            "version_name": env!("CARGO_PKG_VERSION"),
+            "version_code": VERSION_CODE,
+            "started": slot.host.is_some(),
+        });
+        if let Some(host) = &slot.host {
+            status["runtime_instance_id"] = Value::from(host.instance_id().as_str());
+            status["root_guard_ready"] = Value::from(host.guard_ready());
+            status["helper_ready"] = Value::from(host.helper_ready());
+        }
+        if let Some(observation) = &slot.observation {
+            status["module_version_code"] = Value::from(observation.module_version_code);
+        }
+        if let Some(error) = &slot.failure {
+            status["start_failure"] = error_payload(error)["error"].clone();
+        }
+        status
+    }
+
+    fn submit(&self, payload: &Value) -> Result<Value, DomainError> {
+        let envelope = payload
+            .get("envelope")
+            .filter(|value| value.is_object())
+            .ok_or_else(invalid_payload)?;
+        let submitter = self
+            .slot()
             .host
             .as_ref()
+            .map(MagiskHost::submitter)
             .ok_or_else(|| {
                 DomainError::new(
                     ErrorCode::CapabilityUnavailable,
-                    "Magisk Runtime is unavailable",
+                    "Magisk Runtime is not started",
                 )
-            })
-            .and_then(|host| host.answer_artifact_query(payload));
-        match answered {
-            Ok(reply) => (
-                reply.payload,
-                reply
-                    .descriptor
-                    .map(|file| vec![("mcp_artifact".to_owned(), OwnedFd::from(file))])
-                    .unwrap_or_default(),
-            ),
-            Err(error) => (error_payload(error.code), Vec::new()),
-        }
+            })?;
+        let encoded = serde_json::to_vec(envelope).map_err(|_| invalid_payload())?;
+        let response = submitter.submit_blocking(encoded)?;
+        serde_json::from_slice(&response)
+            .map_err(|_| io_error("Magisk Runtime response is invalid"))
     }
 
-    fn handle_request(&mut self, request: &WireEnvelope) -> Result<Value, DomainError> {
-        match request.operation {
-            Operation::HostStatus => self.status_payload(),
-            Operation::HostPrepareTransition => self.prepare_transition(&request.payload),
-            Operation::HostAbortTransition => self.abort_transition(&request.payload),
-            Operation::HostRelease => self.release_transition(&request.payload),
-            Operation::HostActivate => self.activate_transition(&request.payload),
-            Operation::RuntimeForward => self.forward_runtime(&request.payload),
-            Operation::RuntimeCancel => Ok(json!({"cancelled":false})),
-            Operation::CapabilitySnapshot => self.capability_payload(),
-            Operation::NetworkDefaultChanged => self.network_default_changed(request),
-            Operation::NetworkAttachment => self.network_attachment(request),
-            Operation::DiagnosticsSnapshot => Ok(json!({"faults":[]})),
-            Operation::MaintenanceStatus => Ok(self
-                .maintenance
-                .status(&self.canonical_base, &request.payload)),
-            Operation::MaintenanceInstallApk | Operation::MaintenanceInstallModule => {
-                Err(DomainError::new(
-                    ErrorCode::InternalError,
-                    "maintenance installs are routed with their descriptors",
-                ))
-            }
-            Operation::CompanionExecute | Operation::CompanionCancel => Err(DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "companion operation has invalid direction",
-            )),
-        }
-    }
-
-    fn network_default_changed(&self, request: &WireEnvelope) -> Result<Value, DomainError> {
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Payload {
-            subscription_generation: u64,
-            source_generation: u64,
-            #[serde(default)]
-            network_id: Option<String>,
-            #[serde(default)]
-            transport: Option<String>,
-        }
-
-        let payload: Payload = decode_payload(&request.payload)?;
-        let instance = request.runtime_instance_id.clone().ok_or_else(|| {
-            DomainError::new(
-                ErrorCode::ProtocolIncompatible,
-                "network event instance fence is absent",
-            )
-        })?;
-        let host = self.host.as_ref().ok_or_else(|| {
-            DomainError::new(
-                ErrorCode::CapabilityUnavailable,
-                "Magisk Runtime is unavailable",
-            )
-        })?;
-        let delivery = host.observe_network_default(
-            NetworkDefaultSourceRegistration {
-                fence: AdmissionFence {
-                    runtime_epoch: request.runtime_epoch.clone(),
-                    host_generation: request.host_generation,
-                    runtime_instance_id: instance,
-                },
-                subscription_generation: payload.subscription_generation,
-                source_generation: payload.source_generation,
-            },
-            NetworkDefaultChangedEvent::new(payload.network_id, payload.transport),
-        )?;
-        if delivery == NetworkEventDelivery::IgnoredStale {
-            return Ok(error_payload(ErrorCode::StaleAuthority));
-        }
-        Ok(json!({"accepted":true}))
-    }
-
-    /// The companion asserts the default network its own process runs under, so the network this
-    /// process runs under follows it. This is a host fact, not a Runtime event: the Automation
-    /// event plane carries `network.default_changed` only while an Automation requires it, and
-    /// this process must follow the device's network whenever it is the Magisk host.
-    fn network_attachment(&self, request: &WireEnvelope) -> Result<Value, DomainError> {
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Payload {
-            #[serde(default)]
-            network_id: Option<String>,
-        }
-
-        let payload: Payload = decode_payload(&request.payload)?;
-        let host = self.host.as_ref().ok_or_else(|| {
-            DomainError::new(
-                ErrorCode::CapabilityUnavailable,
-                "Magisk Runtime is unavailable",
-            )
-        })?;
-        host.apply_network_attachment(payload.network_id.as_deref())?;
-        Ok(json!({"accepted":true}))
-    }
-
-    fn prepare_transition(&mut self, payload: &Value) -> Result<Value, DomainError> {
-        let request: contract::HostPrepareTransition = decode_payload(payload)?;
-        let owner = self.store.read_owner()?;
-        if request.runtime_epoch != owner.runtime_epoch
-            || request.from_host != owner.host
-            || request.from_generation != owner.host_generation
-            || request.target_host == owner.host
+    /// The Runtime session plus a full status read, as the frontend's diagnostics show them.
+    fn diagnostics_snapshot(&self) -> Value {
+        let status = self.submit(&json!({"envelope": {
+            "protocol_version": 1,
+            "request_id": uuid::Uuid::new_v4().hyphenated().to_string(),
+            "payload": {"tool": "context", "action": "status", "input": {"detail": "full"}},
+        }}));
+        let started = self.slot().host.is_some();
+        let mut snapshot = json!({
+            "schema_version": 1,
+            "session": {"started": started, "host": "magisk_backend"},
+        });
+        if let Ok(response) = status
+            && response.get("outcome").and_then(Value::as_str) == Some("success")
+            && let Some(result) = response.get("result")
         {
-            return Ok(error_payload(ErrorCode::StaleAuthority));
+            snapshot["status"] = result.clone();
         }
-        if owner.host == RuntimeHost::ApkRuntime {
-            if request.target_host != RuntimeHost::MagiskBackend
-                || self.refresh_observation().is_err()
-                || self
-                    .observation
-                    .readiness(&self.identity, VERSION_CODE)
-                    .is_err()
-            {
-                return Ok(error_payload(ErrorCode::CapabilityUnavailable));
+        snapshot
+    }
+
+    /// The S-SEC-005 fault files as stored, for the frontend's diagnostics export to validate.
+    fn fault_files(&self) -> Value {
+        let mut files = serde_json::Map::new();
+        for role in ["runtime", "host", "supervisor", "maintenance"] {
+            let path = self.base.join("diagnostics").join(format!("{role}.json"));
+            let read = fs::File::open(&path).and_then(|file| {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(file, FAULT_FILE_LIMIT_BYTES + 1),
+                    &mut bytes,
+                )?;
+                Ok(bytes)
+            });
+            let entry = match read {
+                Ok(bytes) if bytes.len() as u64 <= FAULT_FILE_LIMIT_BYTES => {
+                    match String::from_utf8(bytes) {
+                        Ok(content) => json!({"content": content}),
+                        Err(_) => json!({"status": "corrupt"}),
+                    }
+                }
+                Ok(_) => json!({"status": "corrupt"}),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    json!({"status": "missing"})
+                }
+                Err(_) => json!({"status": "unreadable"}),
+            };
+            files.insert(role.to_owned(), entry);
+        }
+        Value::Object(files)
+    }
+
+    fn maintenance_state(&self) -> Result<Value, DomainError> {
+        let blocker = self.store.maintenance_blocker()?;
+        let cleanup =
+            persistence::guard_cleanup_verified(&self.base, &read_boot_id()?, &ProcFacts)?;
+        Ok(json!({
+            "schema_version": 1,
+            "blocker": blocker.token(),
+            "cleanup": if cleanup { "verified" } else { "unverified" },
+        }))
+    }
+
+    /// Empties the store into a fresh generation of this same host, then starts that host. A
+    /// live host is reset only once it holds no work; without one, only a corrupt store or owner
+    /// qualifies.
+    fn reset_runtime_data(&self) -> Value {
+        let mut slot = self.slot();
+        let reset = (|| -> Result<(), DomainError> {
+            if let Some(host) = slot.host.as_ref() {
+                let owner = self.store.read_owner()?;
+                host.record_reset_intent(&reset_intent_for(&owner)?)?;
+                self.ingress().attach(None);
+                if let Some(host) = slot.host.take() {
+                    host.shutdown();
+                }
+            } else {
+                let cleanup =
+                    persistence::guard_cleanup_verified(&self.base, &read_boot_id()?, &ProcFacts)?;
+                match self.store.maintenance_blocker()? {
+                    MaintenanceBlocker::OwnerCorrupt => {
+                        self.store.reset_malformed_owner(
+                            new_uuid()?,
+                            RuntimeHost::MagiskBackend,
+                            cleanup,
+                        )?;
+                        return Ok(());
+                    }
+                    MaintenanceBlocker::StoreCorrupt => {
+                        let owner = self.store.read_owner()?;
+                        self.store.record_corrupt_store_reset_intent(
+                            &reset_intent_for(&owner)?,
+                            cleanup,
+                        )?;
+                    }
+                    MaintenanceBlocker::None
+                        if !self.base.join("runtime-reset-intent.json").exists() =>
+                    {
+                        return Err(DomainError::new(
+                            ErrorCode::HostTransitionPending,
+                            "reset needs the started Runtime or a corrupt store",
+                        ));
+                    }
+                    MaintenanceBlocker::None => {}
+                }
             }
-            self.target_preparation = Some(request.transition_id.clone());
-            let state: CanonicalState = read_json(&self.canonical_base.join("runtime-state.json"))?;
-            return Ok(json!({"prepared":true,"store_revision":state.store_revision}));
+            await_live_lock_release(&self.base)?;
+            let cleanup =
+                persistence::guard_cleanup_verified(&self.base, &read_boot_id()?, &ProcFacts)?;
+            self.store.recover_confirmed_reset(cleanup).map(|_| ())
+        })();
+        if let Err(error) = reset {
+            return error_payload(&error);
         }
-        let host = self.host.as_mut().ok_or_else(|| {
-            DomainError::new(
-                ErrorCode::CapabilityUnavailable,
-                "Magisk Runtime is unavailable",
-            )
-        })?;
-        if !host.guard_ready() {
-            return Ok(error_payload(ErrorCode::IoError));
-        }
-        if &request.from_instance_id != host.instance_id() {
-            return Ok(error_payload(ErrorCode::StaleAuthority));
-        }
-        match host.prepare_transition(request.transition_id, request.target_host) {
-            Ok(prepared) => Ok(json!({
-                "prepared":true,
-                "store_revision":prepared.store_revision,
-            })),
-            Err(error) => Ok(error_payload(error.code)),
+        slot.failures = 0;
+        self.activate(&mut slot);
+        match &slot.failure {
+            None => json!({"reset": true}),
+            Some(error) => error_payload(error),
         }
     }
 
-    fn abort_transition(&mut self, payload: &Value) -> Result<Value, DomainError> {
-        let request: contract::TransitionId = decode_payload(payload)?;
-        if self.target_preparation.as_ref() == Some(&request.transition_id) {
-            self.target_preparation = None;
-            return Ok(json!({"aborted":true}));
-        }
-        let result = self
-            .host
-            .as_mut()
-            .ok_or_else(|| {
-                DomainError::new(ErrorCode::StaleAuthority, "no source Runtime is prepared")
-            })?
-            .abort_transition(&request.transition_id);
-        Ok(match result {
-            Ok(()) => json!({"aborted":true}),
-            Err(error) => error_payload(error.code),
-        })
-    }
-
-    fn release_transition(&mut self, payload: &Value) -> Result<Value, DomainError> {
-        let request: contract::TransitionId = decode_payload(payload)?;
-        let host = self.host.as_mut().ok_or_else(|| {
-            DomainError::new(ErrorCode::StaleAuthority, "Magisk Runtime is not active")
-        })?;
-        // The instance ends here, and the companion's authority over this process's default
-        // network ends with it. The binding is cleared first because releasing the transition is
-        // one-way: a refused clear must leave the release retryable.
-        if let Err(error) = host.clear_process_network() {
-            return Ok(error_payload(error.code));
-        }
-        if let Err(error) = host.release_transition(&request.transition_id) {
-            return Ok(error_payload(error.code));
-        }
-        self.host = None;
-        let owner = self.store.read_owner()?;
-        self.bind_companion_fence(&owner)?;
-        Ok(json!({"released":true}))
-    }
-
-    fn activate_transition(&mut self, payload: &Value) -> Result<Value, DomainError> {
-        let request: contract::HostActivate = decode_payload(payload)?;
-        let owner = self.store.read_owner()?;
-        let transition = self.store.observe_transition()?;
-        if request.runtime_epoch != owner.runtime_epoch
-            || request.host_generation != owner.host_generation
-            || request.target_host != owner.host
-            || owner.host != RuntimeHost::MagiskBackend
-            || !transition.is_some_and(|(recovery, intent)| {
-                recovery == TransitionRecovery::ActivateCommittedTarget
-                    && intent.transition_id == request.transition_id
-                    && intent.runtime_epoch == request.runtime_epoch
-                    && intent.target_host == request.target_host
-                    && intent.target_generation == request.host_generation
-            })
-            || self
-                .target_preparation
-                .as_ref()
-                .is_some_and(|value| value != &request.transition_id)
-        {
-            return Ok(error_payload(ErrorCode::StaleAuthority));
-        }
-        self.activate_current_owner()?;
-        self.target_preparation = None;
-        let instance = self.host.as_ref().map(|host| host.instance_id().clone());
-        Ok(json!({"ready":true,"runtime_instance_id":instance}))
-    }
-
-    fn activate_current_owner(&mut self) -> Result<(), DomainError> {
-        if self.host.is_some() {
-            return Ok(());
-        }
-        self.refresh_observation()?;
-        self.observation.readiness(&self.identity, VERSION_CODE)?;
-        let owner = self.store.read_owner()?;
-        if owner.host != RuntimeHost::MagiskBackend {
-            return Err(DomainError::new(
+    /// Settles the executions a lost instance left running, which keep this host from starting,
+    /// then starts it. Refused while the host is started, since its executions are not stranded.
+    fn clear_stranded_executions(&self) -> Value {
+        let mut slot = self.slot();
+        if slot.host.is_some() {
+            return error_payload(&DomainError::new(
                 ErrorCode::StaleAuthority,
-                "Magisk Runtime is not the selected owner",
+                "the started Runtime owns its executions",
             ));
         }
-        let host = MagiskHost::activate(
-            Arc::clone(&self.store),
-            &self.module_root,
-            &self.canonical_base,
-            self.sdk_int,
-            owner.clone(),
-            self.companion_port.clone(),
-            Arc::clone(&self.task_activity),
-            Arc::clone(&self.recycle),
-        )?;
-        host.set_app_execution_surface(self.companion.capability_state())?;
-        self.host = Some(host);
-        // The fence is bound before any companion-derived capability becomes available, so
-        // no request can be admitted for a delegation the connection cannot present.
-        self.bind_companion_fence(&owner)?;
-        if self.companion.capability_state() == CapabilityState::Available {
-            self.apply_companion_capabilities()?;
-            self.host
-                .as_ref()
-                .expect("activated Magisk host")
-                .use_companion_network_events()?;
-        }
-        Ok(())
-    }
-
-    /// Binds the live companion connection to the daemon's current Runtime identity: the
-    /// connection may delegate only for the instance this daemon currently holds, so the
-    /// fence follows the owner record and the active host instance.
-    fn bind_companion_fence(&self, owner: &RuntimeOwner) -> Result<(), DomainError> {
-        self.companion_port.set_fence(
-            owner.runtime_epoch.clone(),
-            owner.host_generation,
-            self.host.as_ref().map(|host| host.instance_id().clone()),
-        )
-    }
-
-    fn forward_runtime(&self, payload: &Value) -> Result<Value, DomainError> {
-        let host = self.host.as_ref().ok_or_else(|| {
-            DomainError::new(
-                ErrorCode::CapabilityUnavailable,
-                "Magisk Runtime is unavailable",
-            )
-        })?;
-        host.forward_runtime(payload)
-    }
-
-    fn set_companion(&mut self, connected: bool) -> Result<(), DomainError> {
-        if connected {
-            self.companion.observe_connected();
-        } else {
-            self.companion.observe_disconnected();
-            self.companion_capabilities.clear();
-        }
-        if let Some(host) = self.host.as_ref() {
-            if connected {
-                self.apply_companion_capabilities()?;
-                host.use_companion_network_events()?;
-                return Ok(());
-            }
-            host.withdraw_capabilities(COMPANION_CAPABILITY_KEYS, "COMPANION_UNAVAILABLE")?;
-            host.set_app_execution_surface(self.companion.capability_state())?;
-            host.use_native_network_events()?;
-        }
-        Ok(())
-    }
-
-    fn apply_companion_capabilities(&self) -> Result<(), DomainError> {
-        let Some(host) = self.host.as_ref() else {
-            return Ok(());
-        };
-        for registration in &self.companion_capabilities {
-            host.register_companion_capability(registration)?;
-        }
-        host.set_app_execution_surface(CapabilityState::Available)
-    }
-
-    fn status_payload(&mut self) -> Result<Value, DomainError> {
-        let observation_ready = self
-            .refresh_observation()
-            .and_then(|()| self.observation.readiness(&self.identity, VERSION_CODE))
-            .is_ok();
-        if let Some(host) = self.host.as_mut() {
-            host.refresh_runtime_facts(&self.module_root, self.sdk_int, observation_ready)?;
-        }
-        let owner = self.store.read_owner().ok();
-        let role = owner
-            .as_ref()
-            .map(|value| DaemonRole::from_owner(value.host));
-        let ready = role.is_some_and(|value| {
-            value.ready(
-                observation_ready,
-                self.host.as_ref().is_some_and(MagiskHost::guard_ready),
-            )
-        });
-        Ok(json!({
-            "role": match role {
-                Some(DaemonRole::RuntimeHost) => "runtime_host",
-                _ => "backend_only",
+        let cleared = runtime::AutomationClock::wall(&runtime::BoottimeClock).and_then(
+            |(ended_at, now_ms)| {
+                persistence::clear_stranded_executions(
+                    &self.base,
+                    &ended_at,
+                    now_ms,
+                    STRANDED_CLEAR_WAIT,
+                )
             },
-            "ready": ready,
-            "transition_cleanup_ready": self.host.as_ref().is_none_or(MagiskHost::guard_ready),
-            "module_id": self.identity.module_id,
-            "module_version": env!("CARGO_PKG_VERSION"),
-            "version_code": VERSION_CODE,
-            "protocol_version": PROTOCOL_VERSION,
-            "runtime_instance_id": self.host.as_ref().map(|host| host.instance_id().clone()),
-            "helper_ready": self.host.as_ref().is_some_and(MagiskHost::helper_ready),
-        }))
-    }
-
-    fn capability_payload(&mut self) -> Result<Value, DomainError> {
-        let module_ready = self
-            .refresh_observation()
-            .and_then(|()| self.observation.readiness(&self.identity, VERSION_CODE))
-            .is_ok();
-        if let Some(host) = self.host.as_mut() {
-            host.refresh_runtime_facts(&self.module_root, self.sdk_int, module_ready)?;
+        );
+        match cleared {
+            Ok(cleared) => {
+                slot.failures = 0;
+                self.activate(&mut slot);
+                json!({"cleared": cleared})
+            }
+            Err(error) => error_payload(&error),
         }
-        let root_ready = module_ready && self.host.as_ref().is_some_and(MagiskHost::guard_ready);
-        let helper_ready = module_ready && self.host.as_ref().is_some_and(MagiskHost::helper_ready);
-        let companion_ready = self
-            .host
-            .as_ref()
-            .is_some_and(MagiskHost::companion_available);
-        let wake_alarm_ready =
-            module_ready && self.host.as_ref().is_some_and(MagiskHost::wake_alarm_ready);
-        Ok(json!({
-            "magisk.module": state_token(capability_state(module_ready)),
-            "magisk.root": state_token(capability_state(root_ready)),
-            "magisk.framework": state_token(capability_state(helper_ready)),
-            "magisk.wake_alarm": state_token(capability_state(wake_alarm_ready)),
-            "execution.root_guard": state_token(capability_state(root_ready)),
-            "app_execution_surface": state_token(capability_state(companion_ready)),
-            "shizuku.shell": state_token(CapabilityState::Unavailable),
-        }))
     }
 
-    fn refresh_observation(&mut self) -> Result<(), DomainError> {
-        self.observation = observe_module(&self.module_root, &self.canonical_base, &self.identity)?;
-        Ok(())
+    fn slot(&self) -> MutexGuard<'_, HostSlot> {
+        self.host.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn ingress(&self) -> MutexGuard<'_, DaemonIngress<HostSubmitter>> {
+        self.ingress.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-fn canonical_directory_identity(path: &Path) -> Result<CanonicalDirectoryIdentity, DomainError> {
-    let metadata =
-        fs::metadata(path).map_err(|_| io_error("cannot inspect App canonical directory"))?;
-    if !metadata.is_dir() {
-        return Err(io_error("App canonical directory is not a directory"));
+/// Creates the daemon's root-only state directory and, on first start, a store this host owns.
+fn initialize_store(base: &Path) -> Result<StateStore, DomainError> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(base)
+        .map_err(|error| {
+            DomainError::os(
+                ErrorCode::IoError,
+                "cannot create the state directory",
+                &error,
+            )
+        })?;
+    fs::set_permissions(base, fs::Permissions::from_mode(0o700)).map_err(|error| {
+        DomainError::os(
+            ErrorCode::IoError,
+            "cannot protect the state directory",
+            &error,
+        )
+    })?;
+    let store = StateStore::new(base.to_path_buf());
+    if !base.join("runtime-owner.json").exists() && !base.join("runtime-state.json").exists() {
+        store.initialize(
+            &RuntimeOwner {
+                schema_version: 1,
+                runtime_epoch: new_uuid()?,
+                host: RuntimeHost::MagiskBackend,
+                host_generation: 1,
+            },
+            &CanonicalState::default(),
+        )?;
     }
-    Ok(CanonicalDirectoryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        uid: metadata.uid(),
+    FaultFileStore::initialize_all_by_apk(base)?;
+    Ok(store)
+}
+
+fn reset_intent_for(owner: &RuntimeOwner) -> Result<RuntimeResetIntent, DomainError> {
+    Ok(RuntimeResetIntent {
+        schema_version: 1,
+        reset_id: new_uuid()?,
+        runtime_epoch: owner.runtime_epoch.clone(),
+        source_host_generation: owner.host_generation,
+        target_host: owner.host,
+        target_host_generation: owner.host_generation.checked_add(1).ok_or_else(|| {
+            DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
+        })?,
     })
+}
+
+/// Waits a bounded time for the released instance's live lock, so a lingering reference fails the
+/// reset explicitly, leaving its intent for the next attempt.
+fn await_live_lock_release(base: &Path) -> Result<(), DomainError> {
+    let deadline = Instant::now() + LIVE_LOCK_RELEASE_WAIT;
+    loop {
+        if persistence::FileLock::try_acquire(&base.join("runtime-live.lock"))?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(DomainError::new(
+                ErrorCode::IoError,
+                "the released Runtime instance still holds the live lock",
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn new_uuid() -> Result<UuidV4, DomainError> {
@@ -803,28 +572,8 @@ fn new_uuid() -> Result<UuidV4, DomainError> {
         .map_err(|_| DomainError::new(ErrorCode::InternalError, "UUID generation failed"))
 }
 
-fn decode_payload<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, DomainError> {
-    serde_json::from_value(payload.clone()).map_err(|_| DomainError::invalid("invalid IPC payload"))
-}
-
-fn error_payload(code: ErrorCode) -> Value {
-    json!({"error":{"code":code,"retryable":false}})
-}
-
-const fn capability_state(available: bool) -> CapabilityState {
-    if available {
-        CapabilityState::Available
-    } else {
-        CapabilityState::Unavailable
-    }
-}
-
-const fn state_token(state: CapabilityState) -> &'static str {
-    match state {
-        CapabilityState::Available => "available",
-        CapabilityState::Unavailable => "unavailable",
-        CapabilityState::Unknown => "unknown",
-    }
+fn invalid_payload() -> DomainError {
+    DomainError::invalid("invalid frontend request payload")
 }
 
 const fn io_error(reason: &'static str) -> DomainError {

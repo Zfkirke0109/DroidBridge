@@ -425,6 +425,11 @@ pub trait HostControlPort: Send + Sync {
     fn activate(&self, fence: &AdmissionFence) -> Result<(), DomainError>;
     fn recover(&self, old_instance_id: &UuidV4) -> Result<RecoveryProof, DomainError>;
 
+    /// A canonical commit could not be written. This instance's work can no longer be trusted to
+    /// persist, so the host withdraws readiness and records the fault where it outlives the
+    /// instance; the caller still receives the commit's own error.
+    fn store_write_failed(&self, error: &DomainError);
+
     /// Publishes the authoritative count of non-terminal Tasks after a canonical commit. This is
     /// a derived platform projection: it cannot recast an already committed mutation as failed,
     /// and an implementation must report its own delivery failure. Headless hosts do nothing.

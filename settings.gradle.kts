@@ -15,4 +15,6 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "DroidBridge"
-include(":app")
+include(":standalone")
+include(":ui-common")
+include(":root-frontend")

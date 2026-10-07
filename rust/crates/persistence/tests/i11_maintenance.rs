@@ -128,25 +128,27 @@ fn i11_maintenance_blocker_distinguishes_owner_from_store_corruption() {
 fn i11_malformed_owner_reset_replaces_only_the_owner_at_generation_one() {
     let (directory, store) = initialized("owner-reset");
     assert_eq!(
-        code(store.reset_malformed_owner(id(9), true)),
+        code(store.reset_malformed_owner(id(9), RuntimeHost::ApkRuntime, true)),
         ErrorCode::StaleAuthority
     );
 
     fs::write(directory.path().join("runtime-owner.json"), b"garbage").unwrap();
     let state_before = fs::read(directory.path().join("runtime-state.json")).unwrap();
     assert_eq!(
-        code(store.reset_malformed_owner(id(9), false)),
+        code(store.reset_malformed_owner(id(9), RuntimeHost::ApkRuntime, false)),
         ErrorCode::IoError
     );
 
-    fs::write(directory.path().join("runtime-transition.json"), b"{}").unwrap();
+    fs::write(directory.path().join("runtime-reset-intent.json"), b"{}").unwrap();
     assert_eq!(
-        code(store.reset_malformed_owner(id(9), true)),
+        code(store.reset_malformed_owner(id(9), RuntimeHost::ApkRuntime, true)),
         ErrorCode::StaleAuthority
     );
-    fs::remove_file(directory.path().join("runtime-transition.json")).unwrap();
+    fs::remove_file(directory.path().join("runtime-reset-intent.json")).unwrap();
 
-    let reset = store.reset_malformed_owner(id(9), true).unwrap();
+    let reset = store
+        .reset_malformed_owner(id(9), RuntimeHost::ApkRuntime, true)
+        .unwrap();
     assert_eq!(
         reset,
         RuntimeOwner {

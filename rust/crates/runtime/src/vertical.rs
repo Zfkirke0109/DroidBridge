@@ -42,6 +42,7 @@ struct Registration {
     has_executor: bool,
 }
 
+#[derive(Clone)]
 pub struct ApkRuntimeVertical {
     environment: VerticalEnvironment,
     host: RuntimeHost,
@@ -71,7 +72,7 @@ impl ApkRuntimeVertical {
             registrations.insert(
                 (*key).to_owned(),
                 Registration {
-                    availability: unavailable_or_unknown(key),
+                    availability: initial_availability(host, key),
                     source_generation: 0,
                     has_executor: false,
                 },
@@ -425,8 +426,16 @@ impl crate::CapabilityPort for ApkCapabilityPort {
     }
 }
 
-fn unavailable_or_unknown(key: &str) -> Availability {
-    if key == "visual.media_projection_session" {
+/// A grant the host's edition never provides is unavailable from the start; one it does provide
+/// is unknown until its adapter reports.
+fn initial_availability(host: RuntimeHost, key: &str) -> Availability {
+    let root_grant = key.starts_with("magisk.") || key == "execution.root_guard";
+    if root_grant != (host == RuntimeHost::MagiskBackend) {
+        Availability {
+            state: CapabilityState::Unavailable,
+            reason: Some("NOT_PROVIDED_BY_HOST".to_owned()),
+        }
+    } else if key == "visual.media_projection_session" {
         Availability {
             state: CapabilityState::Unavailable,
             reason: Some("USER_CONSENT_REQUIRED".to_owned()),

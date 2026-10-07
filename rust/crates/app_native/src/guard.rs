@@ -1,10 +1,8 @@
 //! The App-UID execution guard scope.
 //!
 //! One guarded process owns exactly one proof whose identity is the Runtime instance
-//! that admitted it. The APK process writes those proofs while it is the Runtime host
-//! and while it is the authenticated companion of the Magisk host, so one scope serves
-//! both roles and a guarded command has a single proof-ownership path (S-AUTH-CMD-001,
-//! S-EXEC-001).
+//! that admitted it. The APK Runtime host writes those proofs under one scope, so a
+//! guarded command has a single proof-ownership path (S-AUTH-CMD-001, S-EXEC-001).
 
 use contract::{ErrorCode, UuidV4};
 use domain::DomainError;
@@ -45,9 +43,8 @@ fn scope_slot() -> &'static Mutex<Option<GuardScope>> {
     GUARD_SCOPE.get_or_init(|| Mutex::new(None))
 }
 
-/// Publishes the scope this process is the guard owner under. The APK Runtime host
-/// installs its own scope, and the companion adopts the Magisk host's instance identity
-/// in its place, so a proof always names the Runtime instance that admitted it.
+/// Publishes the scope this process is the guard owner under, so a proof always names
+/// the Runtime instance that admitted it.
 pub(crate) fn publish_scope(scope: GuardScope) -> Result<(), DomainError> {
     *scope_slot()
         .lock()
@@ -118,9 +115,8 @@ impl GuardScope {
         self.quarantined.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Binds the guard binary this process launches. The Runtime host binds it from the
-    /// verified APK native library directory; the companion binds the same packaged
-    /// binary it advertises to the Magisk host.
+    /// Binds the guard binary this process launches, from the verified APK native library
+    /// directory.
     pub(crate) fn bind_guard_path(&self, guard_path: PathBuf) {
         if let Ok(mut slot) = self.guard_path.lock() {
             *slot = Some(guard_path);

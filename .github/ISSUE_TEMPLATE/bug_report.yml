@@ -18,7 +18,7 @@ body:
     id: version
     attributes:
       label: DroidBridge version / 版本
-      description: App version, and the Magisk module version if installed. / App 版本；如装了 Magisk 模块也请写上模块版本。
+      description: The version of the app or root module you use. / 你使用的 App 或 Root 模块的版本。
     validations:
       required: true
   - type: input
@@ -31,11 +31,11 @@ body:
   - type: dropdown
     id: privilege
     attributes:
-      label: Privilege level / 权限档位
+      label: Edition / 版本类型
       options:
-        - No root / 无 Root
-        - Shizuku
-        - Magisk module / Magisk 模块
+        - DroidBridge app / 卓爱桥 App
+        - DroidBridge app + Shizuku / 卓爱桥 App + Shizuku
+        - Root edition (Magisk / KernelSU / APatch) / Root 版
     validations:
       required: true
   - type: dropdown
@@ -58,4 +58,4 @@ body:
     id: diagnostics
     attributes:
       label: Diagnostics / 诊断信息
-      description: Attach the export from Settings → Diagnostics. If the app was stopped in the background, also paste `adb shell dumpsys activity exit-info com.droidbridge.android`. / 请附上 设置 → 诊断 导出的文件；如果是后台被结束，请附上 exit-info 输出。
+      description: Attach the export from Settings → Diagnostics. If the app was stopped in the background, also paste `adb shell dumpsys activity exit-info com.droidbridge.standalone`. / 请附上 设置 → 诊断 导出的文件；如果是后台被结束，请附上 exit-info 输出。

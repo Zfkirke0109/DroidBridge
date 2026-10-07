@@ -17,6 +17,9 @@ pub const MCP_BODY_LIMIT_BYTES: usize = 262_144;
 pub const MCP_RESPONSE_LIMIT_BYTES: usize = 12_000_000;
 pub const MCP_STABLE_PORT: u16 = 8765;
 pub const MCP_DEBUG_PORT: u16 = 18765;
+/// The root edition listens on its own ports, so both editions can serve on one phone.
+pub const MCP_ROOT_STABLE_PORT: u16 = 8766;
+pub const MCP_ROOT_DEBUG_PORT: u16 = 18766;
 /// The R-TOOL-001 mother tools in their fixed `tools/list` order.
 pub const MCP_TOOL_NAMES: [&str; 8] = [
     "context",
@@ -806,6 +809,17 @@ impl<H: McpHost> McpFacade<H> {
         let Some(uri) = params["uri"].as_str() else {
             return invalid_params(id, field_detail("params.uri", "expected a string"));
         };
+        // A capture can be far larger than one response, so it is no resource; its own reader
+        // pages through it.
+        if uri.starts_with("dbref:capture:") || uri.starts_with("dbref:packet:") {
+            return invalid_params(
+                id,
+                field_detail(
+                    "params.uri",
+                    "a capture or packet reference is read with network action capture, operation read",
+                ),
+            );
+        }
         let reply = match self
             .host
             .artifact_query(json!({

@@ -373,6 +373,7 @@ pub struct FakeHostControl {
     capabilities: Option<FakeCapabilities>,
     cleanup_reports: Arc<Mutex<Vec<(domain::AdmissionFence, UuidV4)>>>,
     task_activity: Arc<Mutex<Vec<usize>>>,
+    store_write_failures: Arc<Mutex<Vec<DomainError>>>,
 }
 
 impl FakeHostControl {
@@ -382,7 +383,15 @@ impl FakeHostControl {
             capabilities: None,
             cleanup_reports: Arc::default(),
             task_activity: Arc::default(),
+            store_write_failures: Arc::default(),
         }
+    }
+
+    pub fn store_write_failures(&self) -> Vec<DomainError> {
+        self.store_write_failures
+            .lock()
+            .expect("fake store failure lock")
+            .clone()
     }
 
     pub fn with_capabilities(mut self, capabilities: FakeCapabilities) -> Self {
@@ -445,6 +454,14 @@ impl HostControlPort for FakeHostControl {
             self.withdraw_readiness()?;
         }
         Ok(proof)
+    }
+
+    fn store_write_failed(&self, error: &DomainError) {
+        self.store_write_failures
+            .lock()
+            .expect("fake store failure lock")
+            .push(error.clone());
+        let _ = self.withdraw_readiness();
     }
 
     fn task_activity_changed(&self, active_tasks: usize, _canonical_revision: u64) {

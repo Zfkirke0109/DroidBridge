@@ -345,6 +345,113 @@ async fn i4_g10_synchronous_mutation_round_trips_and_replays_from_the_canonical_
     assert_eq!(execution.executor.provider, ProviderToken::AppNative);
 }
 
+/// An expired request whose retained mutation result outlived its dedup entry made every later
+/// commit fail, so all execution failed while status stayed ready (issues #1 and #2). Each admission
+/// path removes what an expired request owns before it reserves its own request.
+#[tokio::test]
+async fn i4_g10_an_expired_retained_result_never_blocks_later_admissions() {
+    use contract::{MotherTool, RunAs};
+    use runtime::{
+        ExecutionCompletion, ExecutionOutcome, ExecutionPayload, RecoveryProof, RuntimeCore,
+        SynchronousAdmission, TaskAdmission, TaskAdmissionResult,
+        fakes::{FakeArtifacts, FakeCapabilities, FakeExecutions, FakeHostControl},
+    };
+
+    const NOW_MS: u64 = 1_788_825_600_000;
+    let (_directory, store, lease) = initialized_store("expired-retained-result");
+    let lease = Arc::new(lease);
+    let expired = |request: u64, mutation: bool| RequestRecord {
+        request_id: id(request),
+        payload_sha256: format!("{request:02}").repeat(32),
+        expires_at_ms: Some(NOW_MS - 1),
+        task_id: None,
+        synchronous_execution: None,
+        mutation_result: mutation.then(|| serde_json::json!({"saved": true})),
+    };
+    store
+        .compare_and_commit(&lease, 0, |state| {
+            state.request_records.push(expired(86, true));
+            Ok(())
+        })
+        .unwrap();
+    let capabilities = FakeCapabilities::new(ready_capability());
+    let executions = FakeExecutions::default();
+    executions.push(Ok(ExecutionCompletion {
+        fence: ready_capability().fence,
+        capability_generation: 2,
+        outcome: ExecutionOutcome::SynchronousCompleted {
+            result: serde_json::json!({"ran": true}),
+            encoded_bytes: 1,
+        },
+        cleanup_verified: true,
+    }));
+    let core = RuntimeCore::new(
+        JsonPersistencePort::new(store.clone(), lease.clone()),
+        FakeArtifacts::default(),
+        executions,
+        capabilities.clone(),
+        FakeHostControl::new(RecoveryProof::Clean).with_capabilities(capabilities),
+    );
+
+    let ran = core
+        .run_synchronous(
+            SynchronousAdmission {
+                request_id: id(870),
+                payload_sha256: "87".repeat(32),
+                execution_id: id(871),
+                operation: "command.run".to_owned(),
+                route: domain::ExecutorRequest::Command(RunAs::App),
+                payload: ExecutionPayload::OpaqueOperation("command.run".to_owned()),
+                settlement_bound_bytes: runtime::RESERVE_FLOOR_BYTES,
+                now_ms: NOW_MS,
+            },
+            "2026-09-08T00:00:01.000Z".to_owned(),
+            NOW_MS + 1_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ran, serde_json::json!({"ran": true}));
+    let canonical = store.load(&lease).unwrap();
+    assert!(
+        canonical
+            .request_records
+            .iter()
+            .all(|record| record.request_id != id(86))
+    );
+
+    store
+        .compare_and_commit(&lease, canonical.store_revision, |state| {
+            state.request_records.push(expired(88, true));
+            Ok(())
+        })
+        .unwrap();
+    let admitted = core
+        .admit_task(TaskAdmission {
+            request_id: id(890),
+            payload_sha256: "89".repeat(32),
+            task_id: id(891),
+            execution_id: id(892),
+            tool: MotherTool::Command,
+            action: "run".to_owned(),
+            route: domain::ExecutorRequest::Command(RunAs::App),
+            payload: ExecutionPayload::OpaqueOperation("command.run".to_owned()),
+            created_at: "2026-09-08T00:00:02.000Z".to_owned(),
+            settlement_bound_bytes: runtime::RESERVE_FLOOR_BYTES,
+            now_ms: NOW_MS + 2_000,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(admitted, TaskAdmissionResult::Admitted(_)));
+    assert!(
+        store
+            .load(&lease)
+            .unwrap()
+            .request_records
+            .iter()
+            .all(|record| record.request_id != id(88))
+    );
+}
+
 #[tokio::test]
 async fn i4_g10_a_result_over_the_retention_bound_is_not_rewritten_with_every_later_commit() {
     use contract::{ErrorCode, RunAs};
@@ -730,185 +837,6 @@ impl ProcessFacts for FakeProcessFacts {
 }
 
 #[test]
-fn i4_g04_dead_owner_takeover_retains_intent_and_rechecks_fresh_recovery_truth() {
-    let directory = TestDirectory::new("dead-owner-two-phase");
-    let store = StateStore::new(directory.path().to_path_buf());
-    let source_owner = RuntimeOwner {
-        schema_version: 1,
-        runtime_epoch: id(1),
-        host: RuntimeHost::MagiskBackend,
-        host_generation: 8,
-    };
-    store
-        .initialize(&source_owner, &CanonicalState::default())
-        .unwrap();
-    let source_live = RuntimeLive {
-        runtime_epoch: id(1),
-        host: RuntimeHost::MagiskBackend,
-        host_generation: 8,
-        runtime_instance_id: id(80),
-        boot_id: id(3),
-        pid: 42,
-        start_ticks: 99,
-    };
-    drop(store.acquire_lifetime(source_live).unwrap());
-    let intent = RuntimeTransitionIntent {
-        schema_version: 1,
-        transition_id: id(81),
-        runtime_epoch: id(1),
-        from_host: RuntimeHost::MagiskBackend,
-        from_generation: 8,
-        from_instance_id: id(80),
-        target_host: RuntimeHost::ApkRuntime,
-        target_generation: 9,
-    };
-    let target_live = RuntimeLive {
-        runtime_epoch: id(1),
-        host: RuntimeHost::ApkRuntime,
-        host_generation: 9,
-        runtime_instance_id: id(82),
-        boot_id: id(3),
-        pid: 43,
-        start_ticks: 100,
-    };
-    let proof_directory = directory
-        .path()
-        .join("execution-guards")
-        .join(id(3).as_str());
-    fs::create_dir_all(&proof_directory).unwrap();
-    let proof_identity = GuardIdentity {
-        runtime_epoch: id(1),
-        runtime_instance_id: id(80),
-        execution_id: id(83),
-        boot_id: id(3),
-    };
-    let mut proof = encode_guard_frame(&proof_identity).unwrap();
-    proof.extend(
-        encode_guard_frame(&GuardStarted {
-            pid: 45,
-            start_ticks: 102,
-        })
-        .unwrap(),
-    );
-    fs::write(
-        proof_directory.join(format!("{}.proof", id(83).as_str())),
-        &proof,
-    )
-    .unwrap();
-    assert_eq!(
-        store
-            .begin_dead_owner_takeover(
-                &intent,
-                target_live.clone(),
-                &id(3),
-                &FakeProcessFacts(false),
-            )
-            .err()
-            .unwrap()
-            .code,
-        ErrorCode::IoError
-    );
-    assert_eq!(store.read_owner().unwrap().host_generation, 8);
-    assert!(!directory.path().join("runtime-transition.json").exists());
-
-    proof.extend(
-        encode_guard_frame(&GuardClean {
-            shell_exit_code: Some(0),
-            cause: GuardCleanCause::OwnerLost,
-        })
-        .unwrap(),
-    );
-    fs::write(
-        proof_directory.join(format!("{}.proof", id(83).as_str())),
-        &proof,
-    )
-    .unwrap();
-    let pending = store
-        .begin_dead_owner_takeover(
-            &intent,
-            target_live.clone(),
-            &id(3),
-            &FakeProcessFacts(false),
-        )
-        .unwrap();
-    assert_eq!(pending.recovery_plan().records().len(), 1);
-    assert!(directory.path().join("runtime-transition.json").exists());
-    assert_eq!(store.read_owner().unwrap().host_generation, 9);
-    fs::remove_file(proof_directory.join(format!("{}.proof", id(83).as_str()))).unwrap();
-
-    let late_identity = GuardIdentity {
-        execution_id: id(85),
-        ..proof_identity
-    };
-    let mut late_proof = encode_guard_frame(&late_identity).unwrap();
-    late_proof.extend(
-        encode_guard_frame(&GuardStarted {
-            pid: 46,
-            start_ticks: 103,
-        })
-        .unwrap(),
-    );
-    late_proof.extend(
-        encode_guard_frame(&GuardClean {
-            shell_exit_code: Some(0),
-            cause: GuardCleanCause::OwnerLost,
-        })
-        .unwrap(),
-    );
-    fs::write(
-        proof_directory.join(format!("{}.proof", id(85).as_str())),
-        late_proof,
-    )
-    .unwrap();
-    assert_eq!(
-        store
-            .complete_dead_owner_takeover(pending, &FakeProcessFacts(false))
-            .err()
-            .unwrap()
-            .code,
-        ErrorCode::HostTransitionPending
-    );
-    assert!(directory.path().join("runtime-transition.json").exists());
-    fs::remove_file(proof_directory.join(format!("{}.proof", id(85).as_str()))).unwrap();
-
-    assert_eq!(
-        store
-            .resume_dead_owner_takeover(
-                &intent,
-                target_live.clone(),
-                &id(3),
-                &FakeProcessFacts(false),
-            )
-            .err()
-            .unwrap()
-            .code,
-        ErrorCode::StaleAuthority
-    );
-    let resumed_live = RuntimeLive {
-        runtime_instance_id: id(84),
-        pid: 44,
-        start_ticks: 101,
-        ..target_live
-    };
-    let resumed = store
-        .resume_dead_owner_takeover(
-            &intent,
-            resumed_live.clone(),
-            &id(3),
-            &FakeProcessFacts(false),
-        )
-        .unwrap();
-    assert_eq!(store.read_owner().unwrap().host_generation, 9);
-    assert_eq!(resumed.lease().live(), &resumed_live);
-    let active = store
-        .complete_dead_owner_takeover(resumed, &FakeProcessFacts(false))
-        .unwrap();
-    assert_eq!(active.live(), &resumed_live);
-    assert!(!directory.path().join("runtime-transition.json").exists());
-    store.validate_lease(&active).unwrap();
-}
-
-#[test]
 fn i4_g05_artifact_and_recovery_ports_preserve_opaque_and_proven_truth() {
     let directory = TestDirectory::new("artifact");
     let state_store = Arc::new(StateStore::new(directory.path().to_path_buf()));
@@ -1056,50 +984,6 @@ fn i4_g05_artifact_and_recovery_ports_preserve_opaque_and_proven_truth() {
         .unwrap(),
         b"preserved"
     );
-
-    let transition_directory = TestDirectory::new("transition");
-    let transition_store = StateStore::new(transition_directory.path().to_path_buf());
-    transition_store
-        .initialize(&owner(), &CanonicalState::default())
-        .unwrap();
-    let source_lease = transition_store.acquire_lifetime(live(2)).unwrap();
-    let transition = RuntimeTransitionIntent {
-        schema_version: 1,
-        transition_id: id(35),
-        runtime_epoch: id(1),
-        from_host: RuntimeHost::ApkRuntime,
-        from_generation: 1,
-        from_instance_id: id(2),
-        target_host: RuntimeHost::MagiskBackend,
-        target_generation: 2,
-    };
-    transition_store
-        .record_transition_intent(&source_lease, &transition)
-        .unwrap();
-    drop(source_lease);
-    assert_eq!(
-        transition_store
-            .acquire_lifetime(live(2))
-            .err()
-            .unwrap()
-            .code,
-        ErrorCode::HostTransitionPending
-    );
-    let target_owner = transition_store
-        .commit_owner_transition(&transition, &id(3), &FakeProcessFacts(false))
-        .unwrap();
-    assert_eq!(target_owner.host, RuntimeHost::MagiskBackend);
-    assert_eq!(target_owner.host_generation, 2);
-    let target_live = RuntimeLive {
-        runtime_epoch: id(1),
-        host: RuntimeHost::MagiskBackend,
-        host_generation: 2,
-        runtime_instance_id: id(36),
-        boot_id: id(3),
-        pid: 43,
-        start_ticks: 100,
-    };
-    transition_store.acquire_lifetime(target_live).unwrap();
 }
 
 #[test]
@@ -1376,6 +1260,11 @@ impl runtime::HostControlPort for CleanupQuarantine {
         self.unavailable
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(runtime::RecoveryProof::CleanupUnverified)
+    }
+
+    fn store_write_failed(&self, _: &domain::DomainError) {
+        self.unavailable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

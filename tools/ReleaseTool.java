@@ -34,16 +34,22 @@ import java.util.zip.ZipOutputStream;
 /**
  * DroidBridge release helper (JDK 17 source-file mode, standard library only).
  *
+ * <p>The two editions are released separately at one version: the standalone App under the
+ * {@code apk-v<version>} tag with its signed update manifest, and the Magisk module, which carries
+ * the root frontend App, under {@code magisk-v<version>} with the committed {@code magisk/update.json}.
+ *
  * <p>Commands:
  * <pre>
  *   --i0-probe
  *   check-config                                   fail unless all six release values are provisioned and valid
  *   module-zip STAGING_DIR OUT_ZIP                 deterministic Magisk ZIP
- *   manifest VERSION PUBLISHED_AT DIST_DIR         canonical DIST_DIR/release.json from the final artifacts
+ *   manifest VERSION PUBLISHED_AT DIST_DIR         canonical DIST_DIR/release.json from the final APK
  *   sign RELEASE_JSON PKCS8_PEM OUT_SIG            SHA256withECDSA over the exact manifest bytes
- *   sums DIST_DIR VERSION                          DIST_DIR/SHA256SUMS.txt over the five fixed files
+ *   sums DIST_DIR VERSION apk|magisk               DIST_DIR/SHA256SUMS.txt over that release's fixed files
+ *   update-json VERSION OUT                        canonical Magisk updateJson for the module release
  *   apk-unsigned APK                               fail if the APK carries any signature
- *   verify-release DIST_DIR VERSION unsigned|signed full manifest/signature/checksum verification
+ *   verify-release DIST_DIR VERSION unsigned|signed full APK manifest/signature/checksum verification
+ *   verify-module DIST_DIR VERSION                 module ZIP contents, checksums and committed update.json
  * </pre>
  * Private keys are only read from the operator-supplied path and are never printed.
  */
@@ -122,8 +128,12 @@ public final class ReleaseTool {
                 sign(Path.of(args[1]), Path.of(args[2]), Path.of(args[3]));
             }
             case "sums" -> {
+                expectArgs(args, 4);
+                writeSums(Path.of(args[1]), releaseFiles(args[2], args[3]));
+            }
+            case "update-json" -> {
                 expectArgs(args, 3);
-                writeSums(Path.of(args[1]), args[2]);
+                Files.writeString(Path.of(args[2]), updateJson(args[1]), StandardCharsets.UTF_8);
             }
             case "apk-unsigned" -> {
                 expectArgs(args, 2);
@@ -133,6 +143,10 @@ public final class ReleaseTool {
             case "verify-release" -> {
                 expectArgs(args, 4);
                 verifyRelease(Path.of(args[1]), args[2], Mode.parse(args[3]));
+            }
+            case "verify-module" -> {
+                expectArgs(args, 3);
+                verifyModule(Path.of(args[1]), args[2]);
             }
             default -> {
                 System.err.println("usage: see ReleaseTool.java header");
@@ -198,11 +212,19 @@ public final class ReleaseTool {
         }
 
         String releaseBase(String version) {
-            return "https://github.com/" + owner + "/" + repo + "/releases/download/v" + version + "/";
+            return downloadBase(APK_TAG + version);
         }
 
         String notesUrl(String version) {
-            return "https://github.com/" + owner + "/" + repo + "/releases/tag/v" + version;
+            return "https://github.com/" + owner + "/" + repo + "/releases/tag/" + APK_TAG + version;
+        }
+
+        String downloadBase(String tag) {
+            return "https://github.com/" + owner + "/" + repo + "/releases/download/" + tag + "/";
+        }
+
+        String rawMain(String path) {
+            return "https://raw.githubusercontent.com/" + owner + "/" + repo + "/main/" + path;
         }
     }
 
@@ -223,9 +245,17 @@ public final class ReleaseTool {
         return "droidbridge-magisk-" + version + ".zip";
     }
 
-    private static List<String> distributedFiles(String version) {
-        List<String> names = new ArrayList<>(List.of(apkName(version), moduleName(version), "release.json",
-                "release.json.sig", "THIRD_PARTY_NOTICES.txt"));
+    private static final String APK_TAG = "apk-v";
+    private static final String MAGISK_TAG = "magisk-v";
+    private static final String FRONTEND_PACKAGE = "com.droidbridge.root";
+
+    /** The fixed, sorted file set one edition's release publishes besides SHA256SUMS.txt. */
+    private static List<String> releaseFiles(String version, String edition) {
+        List<String> names = new ArrayList<>(switch (edition) {
+            case "apk" -> List.of(apkName(version), "release.json", "release.json.sig", "THIRD_PARTY_NOTICES.txt");
+            case "magisk" -> List.of(moduleName(version), "THIRD_PARTY_NOTICES.txt");
+            default -> throw new IllegalStateException("edition must be apk or magisk");
+        });
         names.sort(String::compareTo);
         return names;
     }
@@ -307,7 +337,6 @@ public final class ReleaseTool {
 
         Map<String, Object> artifacts = new LinkedHashMap<>();
         artifacts.put("apk", artifact(dist, apkName(version), config.releaseBase(version)));
-        artifacts.put("magisk", artifact(dist, moduleName(version), config.releaseBase(version)));
 
         Map<String, Object> manifest = new LinkedHashMap<>();
         manifest.put("schema_version", 1L);
@@ -395,9 +424,9 @@ public final class ReleaseTool {
 
     // ---- checksums ------------------------------------------------------------------------------
 
-    private static void writeSums(Path dist, String version) throws IOException {
+    private static void writeSums(Path dist, List<String> files) throws IOException {
         StringBuilder sums = new StringBuilder();
-        for (String name : distributedFiles(version)) {
+        for (String name : files) {
             sums.append(sha256Hex(Files.readAllBytes(dist.resolve(name)))).append("  ").append(name).append('\n');
         }
         Files.writeString(dist.resolve("SHA256SUMS.txt"), sums, StandardCharsets.US_ASCII);
@@ -460,11 +489,19 @@ public final class ReleaseTool {
         check(config.apkSignerSha256().equals(provenance.get("apk_signer_sha256")), "provenance apk_signer_sha256 matches configuration");
         check(config.releaseKeyId().equals(provenance.get("release_key_id")), "provenance release_key_id matches configuration");
 
-        Map<String, Object> artifacts = objectOf(manifest.get("artifacts"), List.of("apk", "magisk"), "artifacts");
+        Map<String, Object> artifacts = objectOf(manifest.get("artifacts"), List.of("apk"), "artifacts");
         verifyArtifact(dist, objectOf(artifacts.get("apk"), ARTIFACT_KEYS, "apk"), apkName(version), config.releaseBase(version));
-        verifyArtifact(dist, objectOf(artifacts.get("magisk"), ARTIFACT_KEYS, "magisk"), moduleName(version), config.releaseBase(version));
+        verifySums(dist, releaseFiles(version, "apk"));
 
-        List<String> expected = distributedFiles(version);
+        Path apk = dist.resolve(apkName(version));
+        if (mode == Mode.UNSIGNED) {
+            requireUnsignedApk(apk);
+            System.out.println("PASS APK carries no signature");
+        }
+        System.out.println("RESULT PASS verify-release " + mode.name().toLowerCase());
+    }
+
+    private static void verifySums(Path dist, List<String> expected) throws IOException {
         List<String> lines = Files.readAllLines(dist.resolve("SHA256SUMS.txt"), StandardCharsets.US_ASCII);
         check(lines.size() == expected.size(), "SHA256SUMS.txt has exactly the fixed file set");
         byte[] sumsBytes = Files.readAllBytes(dist.resolve("SHA256SUMS.txt"));
@@ -473,13 +510,52 @@ public final class ReleaseTool {
             String name = expected.get(i);
             check((sha256Hex(Files.readAllBytes(dist.resolve(name))) + "  " + name).equals(lines.get(i)), "SHA256SUMS entry " + name);
         }
+    }
 
-        Path apk = dist.resolve(apkName(version));
-        if (mode == Mode.UNSIGNED) {
-            requireUnsignedApk(apk);
-            System.out.println("PASS APK carries no signature");
+    // ---- Magisk module release ------------------------------------------------------------------
+
+    /** The module.prop the stable module carries for this version, LF-terminated. */
+    private static String moduleProp(ReleaseConfig config, String version) {
+        return "id=droidbridge\nname=DroidBridge\nversion=" + version + "\nversionCode=" + versionCode(version)
+                + "\nauthor=DroidBridge\ndescription=DroidBridge root backend; installs the DroidBridge Root app\n"
+                + "updateJson=" + config.rawMain("magisk/update.json") + "\n";
+    }
+
+    /** The Magisk updateJson document: the module of this version from its magisk-v release. */
+    private static String updateJson(String version) throws Exception {
+        ReleaseConfig config = ReleaseConfig.provisioned(loadConfig());
+        Map<String, Object> update = new LinkedHashMap<>();
+        update.put("version", version);
+        update.put("versionCode", versionCode(version));
+        update.put("zipUrl", config.downloadBase(MAGISK_TAG + version) + moduleName(version));
+        update.put("changelog", config.rawMain("CHANGELOG.md"));
+        StringBuilder json = new StringBuilder();
+        writeJson(json, update);
+        return json.append('\n').toString();
+    }
+
+    private static void verifyModule(Path dist, String version) throws Exception {
+        ReleaseConfig config = ReleaseConfig.provisioned(loadConfig());
+        verifySums(dist, releaseFiles(version, "magisk"));
+        try (ZipFile zip = new ZipFile(dist.resolve(moduleName(version)).toFile())) {
+            for (String binary : List.of("bin/droidbridged", "bin/droidbridge-supervisor", "bin/droidbridge-exec-guard",
+                    "customize.sh", "service.sh", "uninstall.sh", "frontend.sh", "frontend.apk")) {
+                check(zip.getEntry(binary) != null, "module carries " + binary);
+            }
+            check(moduleProp(config, version).equals(entryText(zip, "module.prop")), "module.prop names this release and its updateJson");
+            check((FRONTEND_PACKAGE + "\n").equals(entryText(zip, "frontend.package")), "module installs " + FRONTEND_PACKAGE);
         }
-        System.out.println("RESULT PASS verify-release " + mode.name().toLowerCase());
+        String committed = Files.readString(Path.of("magisk/update.json"), StandardCharsets.UTF_8);
+        check(updateJson(version).equals(committed), "committed magisk/update.json offers exactly this module release");
+        System.out.println("RESULT PASS verify-module");
+    }
+
+    private static String entryText(ZipFile zip, String name) throws IOException {
+        ZipEntry entry = zip.getEntry(name);
+        if (entry == null) throw new IllegalStateException("FAIL module carries " + name);
+        try (InputStream input = zip.getInputStream(entry)) {
+            return new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        }
     }
 
     private static void verifyArtifact(Path dist, Map<String, Object> artifact, String name, String base) throws IOException {

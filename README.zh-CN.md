@@ -36,7 +36,7 @@
 | 连接方式 | 适用于 | 如何到达手机 |
 |---|---|---|
 | **ChatGPT** | 网页版 ChatGPT（开发者模式） | OpenAI 官方安全隧道（Secure MCP Tunnel）。手机通过 HTTPS 主动向 OpenAI 取任务，不开放端口，也不需要公网地址。 |
-| **本地 MCP** | 同一台手机上的智能体，或通过 `adb forward` 连接的电脑 | `127.0.0.1:8765/mcp` 上的 Streamable HTTP，使用 Bearer 令牌。 |
+| **本地 MCP** | 同一台手机上的智能体，或通过 `adb forward` 连接的电脑 | `127.0.0.1:8765/mcp`（Root 版为 8766 端口）上的 Streamable HTTP，使用 Bearer 令牌。 |
 
 ## 智能体能做什么
 
@@ -46,56 +46,71 @@
 | `visual` | 观察屏幕（截图和界面层级）、点击、长按、滑动、输入文字、按键和组合键 |
 | `android` | 查看应用、启动应用和 Intent、剪贴板、通知 |
 | `filesystem` | 查看、读取、写入、编辑、移动、删除、ZIP 打包解包、下载文件 |
-| `command` | 以应用、Shell（Shizuku）或 Root（root 模块）身份运行命令 |
-| `network` | DNS、TCP、TLS 诊断；抓包和注入流量（需 Root） |
+| `command` | 以应用或 Shell（Shizuku）身份运行命令；Root 版以 Root 身份运行 |
+| `network` | DNS、TCP、TLS 诊断；抓包和注入流量（Root 版） |
 | `automation` | 创建、修改、启用、删除按计划运行的自动化 |
 | `task_control` | 列出、查看、取消后台任务 |
 
 每个工具都带有 MCP 安全标注（`readOnlyHint`、`destructiveHint`、`openWorldHint`），ChatGPT 等客户端会在执行改动类操作前请你确认。
 
-## 选择权限档位
+## 选择版本
 
-普通手机就能用，给的权限越多，能做的越多：
+卓爱桥有两个版本：
 
-| | 无 Root | + Shizuku | + Root 模块（Magisk / KernelSU / APatch） |
+- **卓爱桥** 是一个自己完成所有工作的 App。普通手机就能用，[Shizuku](https://shizuku.rikka.app/) 运行时还能获得 Shell 身份。
+- **Root 版** 是一个 Root 模块。它的后端以 Root 身份独立运行，开机自启，不受任何 App 状态影响。安装模块时会一并安装
+  **DroidBridge Root** App，用于查看后端状态和修改设置，本身不承担运行。
+
+两个版本可以装在同一台手机上：卓爱桥的本地 MCP 使用 8765 端口，Root 版使用 8766 端口。
+
+| | 卓爱桥 | 卓爱桥 + Shizuku | Root 版（Magisk / KernelSU / APatch） |
 |---|---|---|---|
 | 看屏幕 / 点击 / 输入 | 无障碍服务 | ✓（输入：仅 ASCII¹） | ✓ |
 | 截屏 | 屏幕捕获授权 | ✓ | ✓ |
 | 通知 | 通知使用权 | 通知使用权 | ✓ |
-| Shell 命令 | 应用身份 | Shell 身份 | Root 身份 |
+| Shell 命令 | 应用身份 | 应用和 Shell 身份 | Root 身份 |
 | 抓包 / 注入 | — | — | ✓ |
-| 后台保活 | 电池与自启动设置 | 保持到下次重启 | 保持，重启后自动恢复 |
+| 后台保活 | 电池与自启动设置 | 保持到下次重启 | 独立运行，重启后自动恢复 |
 
-¹ 通过 Shizuku 时，中文、Emoji 等非 ASCII 文字需要无障碍服务或 root 模块。
+¹ 通过 Shizuku 时，中文、Emoji 等非 ASCII 文字需要无障碍服务。
 
-App 内的 **执行环境与权限** 页会逐项引导：每一项都有直达对应系统设置的按钮，已被更强后端覆盖的项目会自动隐藏。
+卓爱桥的 **执行环境与权限** 页会逐项引导：每一项都有直达对应系统设置的按钮，已被 Shizuku 覆盖的项目会自动隐藏。
 
 ## 系统要求
 
 - Android 13 到 17，**arm64-v8a** 设备。
 - 连接 ChatGPT：需要支持网页开发者模式的套餐（Plus 及以上），以及在 OpenAI 平台创建的安全隧道和 Runtime API Key。
-- 可选：[Shizuku](https://shizuku.rikka.app/)，以及 [Magisk](https://github.com/topjohnwu/Magisk)、[KernelSU](https://github.com/tiann/KernelSU) 或 [APatch](https://github.com/bmax121/APatch)，用于更高权限档位。
+- 可选：[Shizuku](https://shizuku.rikka.app/)，以及 [Magisk](https://github.com/topjohnwu/Magisk)、[KernelSU](https://github.com/tiann/KernelSU) 或 [APatch](https://github.com/bmax121/APatch)，用于 Root 版。
 
 ## 安装
 
-1. 在 [Releases](https://github.com/zephyr7030/DroidBridge/releases/latest) 下载 `droidbridge-<版本>-arm64-v8a.apk` 并安装。
-2. *（可选，已 Root 的手机）* 下载 `droidbridge-magisk-<版本>.zip`，在 Magisk、KernelSU 或 APatch 中安装模块并重启。
-3. 打开卓爱桥，首次启动引导会让你选择智能体类型，并逐项完成权限设置。
+**卓爱桥**
 
-每个版本都附带 `SHA256SUMS.txt` 和签名的 `release.json`，App 自身更新时会校验签名。
+1. 在[最新版本](https://github.com/zephyr7030/DroidBridge/releases/latest)（标签 `apk-v<版本>`）下载 `droidbridge-<版本>-arm64-v8a.apk` 并安装。
+2. 打开卓爱桥，首次启动引导会让你选择智能体类型，并逐项完成权限设置。
+
+版本附带 `SHA256SUMS.txt` 和签名的 `release.json`，App 的 **更新** 页会用签名校验自身更新。
+
+**Root 版**
+
+1. 在 [Releases](https://github.com/zephyr7030/DroidBridge/releases) 页面的 `magisk-v<版本>` 版本中下载 `droidbridge-magisk-<版本>.zip`。
+2. 在 Magisk、KernelSU 或 APatch 中安装模块，安装时会一并安装 DroidBridge Root App。
+3. 重启手机，然后打开 DroidBridge Root。
+
+模块更新由你的 Root 管理器提供。
 
 ## 连接 ChatGPT
 
 1. 在 [OpenAI 平台](https://platform.openai.com/settings/organization/tunnels) 创建安全隧道，并创建一个可使用该隧道的 [API Key](https://platform.openai.com/api-keys)。
-2. 在卓爱桥打开 **智能体连接 → ChatGPT 连接**，粘贴 Tunnel ID 和 Key，打开隧道。Key 由 Android Keystore 加密保存，之后不再显示。
+2. 在 App 中打开 **智能体连接 → ChatGPT 连接**，粘贴 Tunnel ID 和 Key，打开隧道。Key 之后不再显示：卓爱桥用 Android Keystore 加密保存，Root 版保存为仅 Root 可读。
 3. 在电脑浏览器打开 [ChatGPT 安全设置](https://chatgpt.com/settings/security)，开启 **开发者模式**（对 Plus 账号仍在灰度测试）。
    再在 [ChatGPT 插件页](https://chatgpt.com/plugins) 点 **添加 → 创建 MCP 应用**，用你的隧道连接，认证选 **无**。App 页面上有这两个页面的链接。
 4. 让 ChatGPT 使用卓爱桥，第一次调用会显示在 App 里。
 
 ## 连接本地智能体
 
-1. 在卓爱桥打开 **智能体连接 → 本地 MCP**，打开并复制令牌。
-2. 让 MCP 客户端连接 `http://127.0.0.1:8765/mcp`，请求头 `Authorization: Bearer <令牌>`。从电脑连接时先转发端口：
+1. 在 App 中打开 **智能体连接 → 本地 MCP**，打开并复制令牌。
+2. 让 MCP 客户端连接 `http://127.0.0.1:8765/mcp`（Root 版为 `8766`），请求头 `Authorization: Bearer <令牌>`。从电脑连接时先转发端口：
 
    ```bash
    adb forward tcp:8765 tcp:8765
@@ -126,7 +141,7 @@ App 内的 **执行环境与权限** 页会逐项引导：每一项都有直达�
 - Root 网络工具需要 libpcap 1.10.6：`pwsh tools/build-libpcap.ps1`
 
 ```bash
-./gradlew :app:assembleDebug :app:assembleDebugMagiskModule
+./gradlew :standalone:assembleDebug :root-frontend:assembleDebugMagiskModule
 ```
 
 `pwsh tools/check-toolchain.ps1` 可检查工具链。详见 [CONTRIBUTING.md](CONTRIBUTING.md)。

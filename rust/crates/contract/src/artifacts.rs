@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 pub const GENERATED_ROOT: &str = "tools/fixtures/contract";
 pub const KOTLIN_FIXTURE_PATH: &str =
-    "app/src/test/resources/contract/kotlin-envelope-fixtures.v1.json";
+    "standalone/src/test/resources/contract/kotlin-envelope-fixtures.v1.json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedArtifact {
@@ -30,15 +30,6 @@ fn pretty<T: Serialize>(value: &T) -> Vec<u8> {
 fn schema_bundle() -> SchemaBundle {
     let mut schemas = BTreeMap::new();
     schemas.insert("automation", schema_for!(Automation));
-    schemas.insert("daemon_operation", schema_for!(DaemonOperation));
-    schemas.insert(
-        "daemon_result.maintenance_install",
-        schema_for!(MaintenanceInstallResult),
-    );
-    schemas.insert(
-        "daemon_result.maintenance_status",
-        schema_for!(MaintenanceStatusResult),
-    );
     schemas.insert(
         "internal_execution_envelope",
         schema_for!(InternalExecutionEnvelope<Value>),

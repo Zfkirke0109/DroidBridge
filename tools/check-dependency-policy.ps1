@@ -42,11 +42,11 @@ foreach($line in $expectedCargo){ RequireText $cargo $line $line }
 Require (-not ($cargo -match '(?m)^\s*[^#\r\n]+\s*=\s*["''][^"'']*[\*^~][^"'']*["'']')) 'dynamic/non-exact Cargo version detected'
 
 # Gradle lock/verification becomes mandatory when I0R reaches handoff.
-foreach($lock in @('buildscript-gradle.lockfile','settings-gradle.lockfile','app/gradle.lockfile','gradle/verification-metadata.xml')) {
+foreach($lock in @('buildscript-gradle.lockfile','settings-gradle.lockfile','standalone/gradle.lockfile','ui-common/gradle.lockfile','root-frontend/gradle.lockfile','gradle/verification-metadata.xml')) {
     Require (Test-Path $lock) "required dependency lock/verification file missing: $lock"
 }
 $selectedPre = New-Object System.Collections.Generic.List[string]
-foreach($lock in @('buildscript-gradle.lockfile','settings-gradle.lockfile','app/gradle.lockfile')) {
+foreach($lock in @('buildscript-gradle.lockfile','settings-gradle.lockfile','standalone/gradle.lockfile','ui-common/gradle.lockfile','root-frontend/gradle.lockfile')) {
     foreach($line in Get-Content $lock) {
         if($line -match '^([^=]+)=') {
             $coord=$Matches[1]

@@ -48,11 +48,13 @@ try {
     Write-Fixture 'rust/crates/daemon/src/magisk_guard_recovery.rs' 'use persistence::recovery::GuardRecoveryPlan;'
     Write-Fixture 'rust/crates/daemon/src/process.rs' 'mod magisk_host;'
     Write-Fixture 'rust/crates/daemon/src/lib.rs' 'pub enum DaemonOperation { HostActivate }'
-    Write-Fixture 'app/src/main/java/com/droidbridge/android/runtimehost/RuntimeHostController.kt' 'data class RuntimeSessionState(val started: Boolean, val host: String, val activeFence: Any?, val startFailure: String); private val runtimeSession = AtomicReference(RuntimeSessionState(false, "none", null, "RUNTIME_UNAVAILABLE"))'
-    Write-Fixture 'app/src/main/java/com/droidbridge/android/runtimehost/DaemonProtocol.kt' 'enum class DaemonMessageKind { Request, Response, Cancel }; enum class DaemonOperationToken { HostActivate }; internal object DaemonProtocol'
-    Write-Fixture 'app/src/main/java/com/droidbridge/android/runtimehost/MagiskCompanionServer.kt' 'internal class MagiskCompanionServer'
-    Write-Fixture 'app/src/main/java/com/droidbridge/android/execution/shizuku/ShizukuController.kt' 'internal class ShizukuController { fun connect() = Unit }'
-    Write-Fixture 'app/src/main/java/com/droidbridge/android/execution/shizuku/ShizukuGuardExecutor.kt' 'internal class ShizukuGuardExecutor'
+    $standalone = 'standalone/src/main/java/com/droidbridge/standalone'
+    $session = 'data class RuntimeSessionState(val started: Boolean, val activeFence: Any?, val startFailure: String); private val runtimeSession = AtomicReference(RuntimeSessionState(false, null, "RUNTIME_UNAVAILABLE"))'
+    Write-Fixture "$standalone/runtimehost/RuntimeHostController.kt" $session
+    Write-Fixture "$standalone/execution/shizuku/ShizukuController.kt" 'internal class ShizukuController { fun connect() = Unit }'
+    Write-Fixture "$standalone/execution/shizuku/ShizukuGuardExecutor.kt" 'internal class ShizukuGuardExecutor'
+    Write-Fixture "$standalone/ui/Screen.kt" 'import com.droidbridge.standalone.client.DroidBridgeClient'
+    Write-Fixture 'ui-common/src/main/java/com/droidbridge/ui/Shared.kt' 'import com.droidbridge.ui.client.RuntimeConnection'
 
     Invoke-Gate 'I8-FS'
     Assert-True $true 'conforming fixture was rejected'
@@ -88,16 +90,28 @@ try {
     } 'host-local App recovery plan was accepted'
 
     Assert-Rejected {
-        Write-Fixture 'app/src/main/java/com/droidbridge/android/runtimehost/RuntimeHostController.kt' 'private val started = AtomicBoolean(false); private val host = AtomicReference("none"); private val activeFence = AtomicReference<Any?>(null)'
+        Write-Fixture "$standalone/runtimehost/RuntimeHostController.kt" 'private val started = AtomicBoolean(false); private val activeFence = AtomicReference<Any?>(null)'
     } {
-        Write-Fixture 'app/src/main/java/com/droidbridge/android/runtimehost/RuntimeHostController.kt' 'data class RuntimeSessionState(val started: Boolean, val host: String, val activeFence: Any?, val startFailure: String); private val runtimeSession = AtomicReference(RuntimeSessionState(false, "none", null, "RUNTIME_UNAVAILABLE"))'
+        Write-Fixture "$standalone/runtimehost/RuntimeHostController.kt" $session
     } 'split Kotlin session projection was accepted'
 
     Assert-Rejected {
-        Write-Fixture 'app/src/main/java/com/droidbridge/android/execution/shizuku/ShizukuController.kt' 'internal class ShizukuController { private suspend fun executeProcess() = Unit }'
+        Write-Fixture "$standalone/execution/shizuku/ShizukuController.kt" 'internal class ShizukuController { private suspend fun executeProcess() = Unit }'
     } {
-        Write-Fixture 'app/src/main/java/com/droidbridge/android/execution/shizuku/ShizukuController.kt' 'internal class ShizukuController { fun connect() = Unit }'
+        Write-Fixture "$standalone/execution/shizuku/ShizukuController.kt" 'internal class ShizukuController { fun connect() = Unit }'
     } 'Shizuku controller-owned primitive was accepted'
+
+    Assert-Rejected {
+        Write-Fixture "$standalone/ui/Screen.kt" 'import com.droidbridge.standalone.runtimehost.NativeRuntime'
+    } {
+        Write-Fixture "$standalone/ui/Screen.kt" 'import com.droidbridge.standalone.client.DroidBridgeClient'
+    } 'standalone UI reaching the Runtime host was accepted'
+
+    Assert-Rejected {
+        Write-Fixture 'ui-common/src/main/java/com/droidbridge/ui/Shared.kt' 'import com.droidbridge.standalone.client.DroidBridgeClient'
+    } {
+        Write-Fixture 'ui-common/src/main/java/com/droidbridge/ui/Shared.kt' 'import com.droidbridge.ui.client.RuntimeConnection'
+    } 'shared UI depending on an edition was accepted'
 
     Assert-Rejected {
         Write-Fixture 'rust/crates/daemon/src/process.rs' 'struct MagiskRecoveryPlan;'
