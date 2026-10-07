@@ -145,8 +145,8 @@ export function sha256HexSync(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
 }
 
-export function pkcePair() {
-  const verifier = randomBytes(48).toString('base64url');
+/** @param {string} [verifier] a random 64-character verifier when omitted */
+export function pkcePair(verifier = randomBytes(48).toString('base64url')) {
   const challenge = createHash('sha256').update(verifier).digest('base64url');
   return { verifier, challenge };
 }
@@ -341,7 +341,8 @@ export function tokenPost(t, fields, origin = ORIGIN) {
 /**
  * Runs register -> authorize -> pairing -> consent -> code. Returns what /token needs.
  * @param {ReturnType<typeof makeRelay>} t
- * @param {{ origin?: string, redirectUri?: string, clientId?: string, pairingCode?: string, resource?: string }} [options]
+ * @param {{ origin?: string, redirectUri?: string, clientId?: string, pairingCode?: string, resource?: string,
+ *   verifier?: string }} [options]
  */
 export async function obtainCode(t, options = {}) {
   const origin = options.origin ?? ORIGIN;
@@ -352,7 +353,7 @@ export async function obtainCode(t, options = {}) {
     assert.equal(reg.status, 201);
     clientId = (await reg.json()).client_id;
   }
-  const { verifier, challenge } = pkcePair();
+  const { verifier, challenge } = pkcePair(options.verifier);
   const state = `state-${randomBytes(6).toString('hex')}`;
   const page = await t.relay.fetch(
     req(

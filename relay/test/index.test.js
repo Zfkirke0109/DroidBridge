@@ -162,6 +162,17 @@ test('a Durable Object failure on POST /mcp is a final HTTP 200 JSON-RPC -32002,
   assert.equal(notification.status, 200);
   assert.equal(await notification.text(), '');
 
+  // The empty 200 is for notifications only: a body with no id and no string method is not one,
+  // so it still gets the JSON-RPC error, with id null.
+  for (const invalid of ['{"jsonrpc":"2.0","params":{}}', '{"jsonrpc":"2.0","method":5}', '{}']) {
+    const res = await worker.fetch(mcpPost(invalid), env);
+    assert.equal(res.status, 200, invalid);
+    const answer = await res.json();
+    assert.equal(answer.id, null, invalid);
+    assert.equal(answer.error.code, -32002, invalid);
+    assert.deepEqual(answer.error.data, expectedData, invalid);
+  }
+
   // Only POST /mcp is wrapped: other routes still surface the failure to the runtime.
   await assert.rejects(worker.fetch(new Request('https://relay.example/token', { method: 'POST', body: 'x' }), env));
   await assert.rejects(worker.fetch(new Request('https://relay.example/mcp'), env));

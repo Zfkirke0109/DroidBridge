@@ -115,8 +115,9 @@ re-encoded, so nothing in it changes: 64-bit integers such as inode numbers, nan
 timestamps or large ids arrive digit for digit. The one exception is a leading UTF-8 byte order
 mark on Claude's request, which the relay removes (DroidBridge could not read it); every byte
 after it is forwarded unchanged. That exactness ends at the relay: DroidBridge on the phone
-parses each request and encodes it again before running it, which can rewrite how some numbers
-and escapes are written (`1e15` becomes `1000000000000000.0`) and make the request longer.
+parses each request and encodes it again before running it, which drops whitespace, sorts members
+by name, can rewrite how some numbers and escapes are written (`1e15` becomes
+`1000000000000000.0`) and can make the request longer.
 
 **What it stores.** Only SHA-256 hashes of access tokens, refresh tokens, authorization codes,
 consent request IDs, the pairing code and the device key. It also stores registered client
@@ -132,12 +133,14 @@ forwarded. Claude never sees the device key.
 
 **OAuth.** OAuth 2.1 with PKCE (S256 only) and RFC 8707 resource binding. Access tokens
 (`dbra_…`) last 1 hour and refresh tokens (`dbrr_<grant id>.<secret>`) 30 days. Refresh tokens
-rotate on every use; presenting any rotated refresh token, however old, revokes the whole grant
-while that grant is live (each refresh token names its grant, so this holds even after the relay
-has deleted the old token's record; once a grant has expired none of its tokens works anyway),
-and so does presenting an authorization code a second time, however late and whatever client
-ID, redirect URI or code verifier comes with it (the relay keeps a redeemed code's hash for as
-long as the grant it started exists).
+rotate on every use; presenting any rotated refresh token, however old and whatever client ID or
+scope comes with it, revokes the whole grant while that grant is live (each refresh token names
+its grant, so this holds even after the relay has deleted the old token's record; once a grant
+has expired none of its tokens works anyway), and so does presenting an authorization code a
+second time, however late and whatever client ID, redirect URI or code verifier comes with it
+(the relay keeps a redeemed code's hash for as long as the grant it started exists). Both need a
+well-formed token request (form-encoded, at most 16 KiB, no parameter repeated); a malformed one
+is refused before the token or code in it is looked at, and revokes nothing.
 Redirects go only to Claude's callbacks, Claude Code's loopback `http://localhost:<port>/callback`
 or `http://127.0.0.1:<port>/callback`, or URIs you list in `EXTRA_REDIRECT_URIS`. An unknown
 client or redirect URI gets an error page and is never redirected to. The consent page sends a
@@ -159,13 +162,13 @@ outcomes:
   resending), or the 413 that means "refused before delivery". A request still gets the phone's
   JSON-RPC response as the body; a notification gets an empty 200. (The phone answers 413 when
   its own re-encoding made a request longer than 256 KiB.)
-- **Invalid reply**: the phone's reply cannot be passed on: its status code is not an integer from 200 to 599, or,
-  for a request, it is not a JSON-RPC response carrying the request's id (missing, not a JSON
-  object, another id, not exactly one of `result` and `error`, or a status such as 204 that cannot
-  carry a body). A request gets HTTP 200 with a JSON-RPC error (code `-32603`) saying it may or
-  may not have run and was not retried; a notification gets an empty HTTP 200. A reply the relay
-  cannot read at all (too large, not JSON, no `request_id`) ends its request this way at once,
-  found by its shard token.
+- **Invalid reply**: the phone's reply cannot be passed on: its status code is not an integer
+  from 200 to 599, or, for a request, it is not a JSON-RPC response carrying the request's id
+  (missing, not a JSON object, another id, not exactly one of `result` and `error`, or a status
+  such as 204 that cannot carry a body). A request gets HTTP 200 with a JSON-RPC error (code
+  `-32603`) saying it may or may not have run and was not retried; a notification gets an empty
+  HTTP 200. A reply the relay cannot read at all (too large, not JSON, no `request_id`) ends its
+  request this way at once, found by its shard token.
 - **Outcome unknown**: the request was handed to the phone, but no result arrived within
   `RESPONSE_TIMEOUT_SECONDS` plus 5 seconds. Claude gets HTTP 200 with a JSON-RPC error (code
   `-32002`) saying the request may or may not have run and was not retried. HTTP 200 keeps
@@ -199,10 +202,10 @@ would drop every other request sent in the same poll response with it, so the re
 with HTTP 400 or 413 before delivery. A request's `id` is a string or an integer from -2^63 to
 2^64 - 1 written without fraction or exponent, as the phone requires (400 otherwise), and a
 message with a `result` or `error` member besides its `method` is refused with 400 too
-(DroidBridge would refuse it without running it). Phone
-responses up to 13,048,576 bytes (the phone's 12,000,000-byte MCP response limit plus 1 MiB of
-envelope; a larger reply is refused and Claude gets the invalid-reply error at once), 20 client
-registrations per hour, 100 registered clients, 50 waiting consent requests (10 per client).
+(DroidBridge would refuse it without running it). Phone responses up to 13,048,576 bytes (the
+phone's 12,000,000-byte MCP response limit plus 1 MiB of envelope; a larger reply is refused and
+Claude gets the invalid-reply error at once), 20 client registrations per hour, 100 registered
+clients, 50 waiting consent requests (10 per client).
 
 ## Costs
 

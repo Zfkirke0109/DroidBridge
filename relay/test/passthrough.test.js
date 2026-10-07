@@ -4,7 +4,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { memberSource, numberKey, valueEnd } from '../src/json.js';
-import { PHONE_NUMBER_MAX, phoneUnreadableReason, relayFailureAnswer, requestIdText } from '../src/mcp.js';
+import {
+  MCP_BODY_LIMIT_BYTES,
+  PHONE_NUMBER_MAX,
+  phoneUnreadableReason,
+  relayFailureAnswer,
+  requestIdText,
+} from '../src/mcp.js';
 import { deviceFetch, makeRelay, mcp, obtainTokens, poll, promptly, waitFor } from './helpers.js';
 
 /**
@@ -219,6 +225,33 @@ test('the relay\'s own answers echo a string id exactly as Claude wrote it, esca
   assert.ok(text.startsWith(`${prefix}{"code":-32600,`), text);
 });
 
+test('a phone 413 after its re-encoding grew the message reaches Claude as HTTP 200 with the phone\'s reply', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  // Within the relay's limit as Claude wrote it. The phone's tunnel client encodes each 1e15
+  // again as 1000000000000000.0, which takes the message past the facade's 262 144 bytes.
+  const head = '{"jsonrpc":"2.0","id":"A\\/b","method":"tools/call","params":{"name":"command","arguments":{"n":[';
+  const tail = ']}}}';
+  const count = Math.floor((MCP_BODY_LIMIT_BYTES - head.length - tail.length + 1) / 5);
+  const body = `${head}${Array(count).fill('1e15').join(',')}${tail}`;
+  assert.ok(body.length <= MCP_BODY_LIMIT_BYTES);
+  assert.ok(body.replaceAll('1e15', '1000000000000000.0').length > MCP_BODY_LIMIT_BYTES);
+  const { text, command, answer } = await deliver(t, token, body);
+  assert.ok(text.includes(`"jsonrpc":${body}}`), 'forwarded byte for byte');
+  // What the tunnel client posts when the facade answers 413 without a body: serde_json writes
+  // the members sorted by name, and the id as it read it ("A/b", the same string).
+  const reply =
+    '{"error":{"code":-32603,"data":{"tunnel_failure":{"source":"client_internal",' +
+    '"upstream_response_received":false,"version":1}},"message":"MCP request failed"},' +
+    '"id":"A/b","jsonrpc":"2.0"}';
+  assert.equal((await replyRaw(t, command, reply, 413)).status, 200);
+  const res = await answer;
+  assert.equal(res.status, 200, 'never 413 after delivery');
+  assert.equal(res.headers.get('content-type'), 'application/json');
+  assert.equal(await res.text(), reply, 'the phone\'s reply, unchanged');
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+});
+
 test('JSON whitespace of every kind (space, tab, CR, LF) between tokens is read and forwarded as is', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
@@ -350,7 +383,9 @@ test('a number the phone cannot read is refused before delivery, also inside a r
   ];
   assert.ok(Number.isFinite(Number(numbers.at(-1))));
   for (const number of numbers) {
-    for (const params of [`{"n":${number}}`, `{"n":${number},"n":1}`, `{"list":[1,${number}]}`]) {
+    // After ':', after ',' and as the first element of an array, right after '['.
+    const variants = [`{"n":${number}}`, `{"n":${number},"n":1}`, `{"list":[1,${number}]}`, `{"list":[${number}]}`];
+    for (const params of variants) {
       const res = await promptly(mcp(t, token, `{"jsonrpc":"2.0","id":"n","method":"tools/call","params":${params}}`), params);
       assert.equal(res.status, 400, params);
       const body = await res.json();
@@ -371,6 +406,8 @@ test('phoneUnreadableReason reads the text itself', () => {
   assert.equal(phoneUnreadableReason(`{"n":${PHONE_NUMBER_MAX}}`), null);
   assert.equal(phoneUnreadableReason(`{"n":-${PHONE_NUMBER_MAX}}`), null);
   assert.match(String(phoneUnreadableReason('{"n":1.791e308}')), /beyond the range/);
+  assert.match(String(phoneUnreadableReason('{"n":[1.791e308]}')), /beyond the range/);
+  assert.match(String(phoneUnreadableReason('{"n":[[-1e400],2]}')), /beyond the range/);
   // The bound applies to the number as JavaScript reads it, rounded to the nearest double: the
   // double just above 1.79e308 is refused, a longer literal that rounds to 1.79e308 is not, and
   // anything read as infinity is refused.
@@ -415,6 +452,37 @@ test('relayFailureAnswer echoes an id above 2^53 exactly', async () => {
   const note = '{"jsonrpc":"2.0","method":"x"}';
   assert.equal(await relayFailureAnswer({ text: note, message: JSON.parse(note) }, true).text(), '');
   assert.equal(JSON.parse(await relayFailureAnswer(undefined, null).text()).id, null);
+});
+
+test('relayFailureAnswer keeps the empty 200 for notifications: no id and no string method gets -32002', async () => {
+  for (const text of ['{"jsonrpc":"2.0","params":{}}', '{"jsonrpc":"2.0","method":5}', '{"method":null}', '{}']) {
+    for (const delivered of [false, true, null]) {
+      const res = relayFailureAnswer({ text, message: JSON.parse(text) }, delivered);
+      assert.equal(res.status, 200, text);
+      const body = await res.json();
+      assert.equal(body.id, null, text);
+      assert.equal(body.error.code, -32002, text);
+      assert.deepEqual(body.error.data, { droidbridge_relay: { state: 'settlement_unknown', delivered, retried: false } });
+    }
+  }
+});
+
+test('a relay failure on a body with no id and no string method is HTTP 200 -32002 with id null, not an empty 200', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  t.relay.grants.lookupAccess = async () => {
+    throw new Error('storage');
+  };
+  for (const body of ['{"jsonrpc":"2.0","params":{}}', '{"jsonrpc":"2.0","method":5}']) {
+    const res = await mcp(t, token, body);
+    assert.equal(res.status, 200, body);
+    const text = await res.text();
+    assert.ok(text.startsWith('{"jsonrpc":"2.0","id":null,"error":{"code":-32002,'), text);
+    assert.equal(JSON.parse(text).error.data.droidbridge_relay.delivered, false);
+  }
+  const note = await mcp(t, token, '{"jsonrpc":"2.0","method":"notifications/initialized"}');
+  assert.equal(note.status, 200);
+  assert.equal(await note.text(), '', 'a notification gets the empty 200');
 });
 
 test('a relay failure on a request with an id above 2^53 echoes that id exactly', async () => {

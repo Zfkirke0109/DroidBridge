@@ -29,8 +29,9 @@ import {
 export const MCP_BODY_LIMIT_BYTES = 262_144;
 /**
  * Deepest nesting of objects and arrays accepted in a message, counting the message object
- * itself as level 1. The phone's JSON parser (serde_json) refuses a poll response nested more
- * than 128 levels in all, and the poll envelope adds 3, so this keeps a wide margin.
+ * itself as level 1. The phone's JSON parser (serde_json 1.0.151) refuses a poll response nested
+ * 128 levels or more in all (it reads at most 127), and the poll envelope adds 3, so this keeps a
+ * wide margin.
  */
 export const MCP_MAX_DEPTH = 64;
 /**

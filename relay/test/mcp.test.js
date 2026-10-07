@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MAX_IN_FLIGHT } from '../src/relay.js';
-import { ORIGIN, makeRelay, mcp, obtainTokens, poll, promptly, toolsCall, waitFor } from './helpers.js';
+import { ORIGIN, makeRelay, mcp, obtainTokens, poll, promptly, respond, toolsCall, waitFor } from './helpers.js';
 
 const CHALLENGE = `Bearer resource_metadata="${ORIGIN}/.well-known/oauth-protected-resource", scope="droidbridge"`;
 
@@ -55,13 +55,24 @@ test('an expired access token is rejected', async () => {
   assert.match(res.headers.get('www-authenticate') ?? '', /error="invalid_token"$/);
 });
 
-test('GET and DELETE /mcp are 405 with Allow: POST', async () => {
+test('GET and DELETE /mcp are 405 with Allow: POST once authenticated, 401 before', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
   for (const method of ['GET', 'DELETE', 'PUT']) {
-    const res = await mcp(t, token, method === 'GET' ? undefined : toolsCall(), { method });
+    const body = method === 'GET' ? undefined : toolsCall();
+    const res = await mcp(t, token, body, { method });
     assert.equal(res.status, 405, method);
     assert.equal(res.headers.get('allow'), 'POST');
+    // The token is checked first, whatever the method (DESIGN: "Claude side: MCP endpoint").
+    for (const [presented, challenge] of [
+      [null, CHALLENGE],
+      ['dbra_not-a-real-token', `${CHALLENGE}, error="invalid_token"`],
+    ]) {
+      const refused = await mcp(t, presented, body, { method });
+      assert.equal(refused.status, 401, `${method} ${presented}`);
+      assert.equal(refused.headers.get('www-authenticate'), challenge);
+      assert.equal(refused.headers.get('allow'), null);
+    }
   }
 });
 
@@ -82,10 +93,21 @@ test('body over 262144 bytes is 413', async () => {
   const big = JSON.stringify({ ...toolsCall(), params: { pad: 'x'.repeat(262_144) } });
   const res = await mcp(t, token, big);
   assert.equal(res.status, 413);
-  const exact = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'x', pad: '' });
-  const padded = exact.replace('"pad":""', `"pad":"${'y'.repeat(262_144 - exact.length)}"`);
-  assert.equal(new TextEncoder().encode(padded).byteLength, 262_144);
-  assert.equal((await mcp(t, token, padded)).status, 503, 'exactly the limit is accepted');
+  /** A valid message of exactly `bytes` bytes, with id 5. */
+  const sized = (/** @type {number} */ bytes) => {
+    const exact = JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'x', pad: '' });
+    const padded = exact.replace('"pad":""', `"pad":"${'y'.repeat(bytes - exact.length)}"`);
+    assert.equal(new TextEncoder().encode(padded).byteLength, bytes);
+    return padded;
+  };
+  assert.equal((await mcp(t, token, sized(262_144))).status, 503, 'exactly the limit is accepted');
+  const over = await mcp(t, token, sized(262_145));
+  assert.equal(over.status, 413, 'one byte over the limit is refused');
+  // The relay stops reading at the limit and never parses the body, so even a valid id is not
+  // known: the 413 answer always carries id null.
+  const text = await over.text();
+  assert.ok(text.startsWith('{"jsonrpc":"2.0","id":null,"error":{"code":-32600,'), text);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
 });
 
 test('invalid JSON and non-request bodies are 400 JSON-RPC errors, with the id when the phone would answer it', async () => {
@@ -140,6 +162,19 @@ test('an over-long allowlisted header is refused, not truncated', async () => {
   const res = await mcp(t, token, toolsCall(9), { headers: { 'mcp-name': 'n'.repeat(4097) } });
   assert.equal(res.status, 400);
   assert.equal((await res.json()).id, 9);
+  const note = await mcp(t, token, { jsonrpc: '2.0', method: 'notifications/x' }, { headers: { 'mcp-method': 'm'.repeat(4097) } });
+  assert.equal(note.status, 400);
+  assert.equal(await note.text(), '');
+
+  // A value of exactly 4096 bytes is forwarded whole.
+  const pollPromise = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const answer = mcp(t, token, toolsCall(10), { headers: { 'mcp-name': 'n'.repeat(4096) } });
+  const polled = await promptly(pollPromise, 'the request with a 4096-byte header was handed to the poll');
+  const [command] = (await polled.json()).commands;
+  assert.deepEqual(command.headers['Mcp-Name'], ['n'.repeat(4096)]);
+  await respond(t, command);
+  assert.equal((await answer).status, 200);
 });
 
 test('in-flight cap: the 17th concurrent request is 429 and not delivered', async () => {

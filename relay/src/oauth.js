@@ -289,31 +289,9 @@ export class OAuthServer {
       };
     }
     const failure = { error: "The client's metadata document could not be loaded or is not valid." };
-    let response;
-    try {
-      // Workers implement only "follow" and "manual"; with "manual" any redirect surfaces as a
-      // 3xx status, which is refused below, so no redirect is ever followed.
-      response = await this.relay.fetchFn(clientId, {
-        method: 'GET',
-        redirect: 'manual',
-        headers: { Accept: 'application/json' },
-        signal: AbortSignal.timeout(OAUTH_LIMITS.cimdTimeoutMs),
-      });
-    } catch {
-      return failure;
-    }
-    if (response.status !== 200) {
-      await response.body?.cancel().catch(() => {});
-      return failure;
-    }
-    let bytes;
-    try {
-      bytes = await readResponseLimited(response, OAUTH_LIMITS.cimdBytes);
-    } catch {
-      return failure;
-    }
-    if (!bytes) return failure;
-    const doc = parseJson(decodeUtf8(bytes));
+    const download = await this.#downloadCimd(clientId);
+    if (!download) return failure;
+    const doc = parseJson(decodeUtf8(download.bytes));
     if (!isPlainObject(doc) || doc.client_id !== clientId) return failure;
     const uris = doc.redirect_uris;
     if (!Array.isArray(uris) || uris.length === 0 || !uris.every((uri) => typeof uri === 'string')) {
@@ -328,7 +306,7 @@ export class OAuthServer {
           : undefined,
       redirect_uris: /** @type {string[]} */ (uris),
     };
-    const ttl = cacheLifetime(response.headers.get('cache-control'));
+    const ttl = cacheLifetime(download.cacheControl);
     if (ttl > 0) {
       await this.relay.lock.run(async () => {
         const now = this.relay.now();
@@ -346,6 +324,46 @@ export class OAuthServer {
       });
     }
     return { client: { ...client, kind: 'cimd' } };
+  }
+
+  /**
+   * Downloads a client metadata document: no redirects, at most cimdBytes, and cimdTimeoutMs for
+   * the fetch and the body together. The deadline runs on the relay's timers, so tests can hold
+   * the fetch at the boundary with a fake clock. Null on any failure, a timer failure included.
+   * @param {string} clientId
+   * @returns {Promise<{ bytes: Uint8Array, cacheControl: string | null } | null>}
+   */
+  async #downloadCimd(clientId) {
+    const controller = new AbortController();
+    /** @type {unknown} */
+    let timer;
+    try {
+      timer = this.relay.timers.setTimeout(() => controller.abort(), OAUTH_LIMITS.cimdTimeoutMs);
+      // Workers implement only "follow" and "manual"; with "manual" any redirect surfaces as a
+      // 3xx status, which is refused below, so no redirect is ever followed.
+      const response = await this.relay.fetchFn(clientId, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      if (response.status !== 200) {
+        await response.body?.cancel().catch(() => {});
+        return null;
+      }
+      const bytes = await readResponseLimited(response, OAUTH_LIMITS.cimdBytes);
+      return bytes ? { bytes, cacheControl: response.headers.get('cache-control') } : null;
+    } catch {
+      return null;
+    } finally {
+      if (timer !== undefined) {
+        try {
+          this.relay.timers.clearTimeout(timer);
+        } catch {
+          // A timer left running only aborts a download that has already finished.
+        }
+      }
+    }
   }
 
   // ---------------------------------------------------------------- /authorize
@@ -612,8 +630,10 @@ export class OAuthServer {
     const record = key ? await this.storage.get(key) : undefined;
     if (key && record?.usedAt) {
       // RFC 6749 section 4.1.2: a replayed code revokes every token issued from it. This runs
-      // before every other check, so a replay revokes whatever client_id, redirect_uri or
-      // code_verifier comes with it, like a replayed refresh token.
+      // before every other parameter check, so a replay revokes whatever client_id,
+      // redirect_uri or code_verifier comes with it, like a replayed refresh token. token()
+      // has only checked that the request is well formed (form-encoded, within the size cap,
+      // no repeated parameter, a supported grant_type); one that is not is refused unread.
       await this.relay.grants.revokeFamily(record.family);
       await this.storage.put(key, { ...record, family: null });
       return tokenError(400, 'invalid_grant', 'The authorization code was already used. Tokens issued from it were revoked.');
@@ -659,22 +679,17 @@ export class OAuthServer {
   async #refresh(form) {
     const refreshToken = param(form, 'refresh_token');
     const clientId = param(form, 'client_id');
-    if (!refreshToken || !clientId) {
-      return tokenError(400, 'invalid_request', 'refresh_token and client_id are required.');
-    }
-    if (!parseScope(param(form, 'scope'))) {
-      return tokenError(400, 'invalid_scope', `Only the ${SCOPE} scope is supported.`);
-    }
+    if (!refreshToken) return tokenError(400, 'invalid_request', 'refresh_token and client_id are required.');
     const key = `rt:${await sha256Hex(refreshToken)}`;
     const record = await this.storage.get(key);
     const now = this.relay.now();
     if (!record || record.used) {
       // A rotated refresh token came back: someone holds a copy. Revoke the whole grant. Its
       // record may already be trimmed or purged, so the family id inside the token decides.
-      // This runs before the client check so a replay with any client_id still revokes. Only a
-      // live grant counts: a family past its expiry (its newest refresh token has expired, so
-      // none of its tokens is live) is just waiting for the sweep, and there is nothing to
-      // revoke.
+      // This runs before every other parameter check, so a replay revokes whatever client_id
+      // and scope come with it, or none. Only a live grant counts: a family past its expiry
+      // (its newest refresh token has expired, so none of its tokens is live) is just waiting
+      // for the sweep, and there is nothing to revoke.
       const familyId = record ? record.family : refreshTokenFamily(refreshToken);
       const family = familyId ? await this.storage.get(`family:${familyId}`) : undefined;
       if (family && typeof family.expiresAt === 'number' && family.expiresAt > now) {
@@ -682,6 +697,10 @@ export class OAuthServer {
         return tokenError(400, 'invalid_grant', 'The refresh token was already used. The grant was revoked.');
       }
       return tokenError(400, 'invalid_grant', 'The refresh token is not valid.');
+    }
+    if (!clientId) return tokenError(400, 'invalid_request', 'refresh_token and client_id are required.');
+    if (!parseScope(param(form, 'scope'))) {
+      return tokenError(400, 'invalid_scope', `Only the ${SCOPE} scope is supported.`);
     }
     if (!(await this.#clientKnown(clientId))) {
       return tokenError(401, 'invalid_client', 'The client is not known to this relay.');

@@ -14,6 +14,7 @@ import {
   requestIdFrom,
   tokenPost,
   authorizePost,
+  waitFor,
 } from './helpers.js';
 
 const CIMD_URL = 'https://claude.ai/oauth/mcp-oauth-client-metadata';
@@ -172,6 +173,62 @@ test('CIMD: redirects, errors, oversize and malformed documents are refused', as
     assert.equal(res.status, 400, name);
     assert.equal(res.headers.get('location'), null, name);
   }
+});
+
+test('CIMD: a document of exactly 16 KiB is accepted, one byte more is refused', async () => {
+  /** A valid document of exactly `bytes` bytes. */
+  const sized = (/** @type {number} */ bytes) => {
+    const base = JSON.stringify({ client_id: CIMD_URL, redirect_uris: [CLAUDE_CALLBACK], pad: '' });
+    const text = base.replace('"pad":""', `"pad":"${'x'.repeat(bytes - base.length)}"`);
+    assert.equal(new TextEncoder().encode(text).byteLength, bytes);
+    return text;
+  };
+  for (const [bytes, status] of [
+    [16 * 1024, 200],
+    [16 * 1024 + 1, 400],
+  ]) {
+    // Without a Content-Length, so the cap is applied while reading, and with one.
+    for (const declared of [false, true]) {
+      const body = sized(bytes);
+      const headers = declared ? { 'content-length': String(bytes) } : {};
+      const t = makeRelay({ fetchFn: async () => new Response(body, { headers }) });
+      const res = await authorizeGet(t, cimdParams());
+      assert.equal(res.status, status, `${bytes} bytes, declared ${declared}`);
+    }
+  }
+});
+
+test('CIMD: the document fetch gets 5 s, measured on the relay clock', async () => {
+  /** @type {{ signal: AbortSignal, release: () => void }[]} */
+  const fetches = [];
+  const fetchFn = (/** @type {string} */ url, /** @type {any} */ init) =>
+    new Promise((resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason));
+      fetches.push({
+        signal: init.signal,
+        release: () => resolve(new Response(JSON.stringify({ client_id: url, redirect_uris: [CLAUDE_CALLBACK] }))),
+      });
+    });
+
+  // An answer 1 ms before the deadline is used, and the deadline is cleared.
+  const early = makeRelay({ fetchFn });
+  const answered = authorizeGet(early, cimdParams());
+  await waitFor(() => fetches.length === 1);
+  await early.clock.advance(4999);
+  assert.equal(fetches[0].signal.aborted, false);
+  fetches[0].release();
+  assert.equal((await answered).status, 200);
+  assert.equal(early.clock.pendingTimers(), 0);
+
+  // At 5 s the fetch is aborted and the client refused.
+  const late = makeRelay({ fetchFn });
+  const timedOut = authorizeGet(late, cimdParams());
+  await waitFor(() => fetches.length === 2);
+  await late.clock.advance(5000);
+  assert.equal(fetches[1].signal.aborted, true);
+  const res = await timedOut;
+  assert.equal(res.status, 400);
+  assert.equal(res.headers.get('location'), null);
 });
 
 test('CIMD: Cache-Control no-store is honoured', async () => {
@@ -333,6 +390,11 @@ test('/authorize errors after the client is trusted go back to the redirect_uri'
   assert.equal(await errorOf({ code_challenge: 'short' }), 'invalid_request');
   assert.equal(await errorOf({ code_challenge: `${'a'.repeat(42)}!` }), 'invalid_request');
   assert.equal(await errorOf({ code_challenge: 'a'.repeat(129) }), 'invalid_request');
+  assert.equal(await errorOf({ code_challenge: 'a'.repeat(42) }), 'invalid_request');
+  // 43 to 128 unreserved characters, both ends included.
+  for (const challenge of ['a'.repeat(42) + '~', `${'-._~'.repeat(31)}aZ09`]) {
+    assert.equal((await authorizeGet(t, { ...base, code_challenge: challenge })).status, 200, `${challenge.length}`);
+  }
   assert.equal(await errorOf({ scope: 'droidbridge admin' }), 'invalid_scope');
   assert.equal(await errorOf({ scope: 'openid' }), 'invalid_scope');
   assert.equal(await errorOf({ resource: 'https://other.example/mcp' }), 'invalid_target');
@@ -412,6 +474,26 @@ test('/register evicts the oldest client without live tokens at 100 clients', as
   const full = await register(t);
   assert.equal(full.status, 400);
   assert.equal((await full.json()).error, 'invalid_client_metadata');
+});
+
+test('/register stores a 100th client and refuses a 101st when every stored client holds live tokens', async () => {
+  const t = makeRelay();
+  /** @param {string} id */
+  const holdLiveToken = (id) =>
+    t.storage.put(`at:${id}`, { family: 'f', client_id: id, resource: 'x', scope: 'droidbridge', expiresAt: t.clock.now() + 1000 });
+  for (let i = 0; i < 99; i += 1) {
+    const id = `dbrcl_${String(i).padStart(22, '0')}`;
+    await t.storage.put(`client:${id}`, { client_id: id, redirect_uris: [CLAUDE_CALLBACK], created_ms: t.clock.now() + i });
+    await holdLiveToken(id);
+  }
+  const hundredth = await register(t);
+  assert.equal(hundredth.status, 201);
+  assert.equal(t.storage.keys('client:').length, 100, 'nothing was evicted');
+  await holdLiveToken((await hundredth.json()).client_id);
+  const full = await register(t);
+  assert.equal(full.status, 400);
+  assert.equal((await full.json()).error, 'invalid_client_metadata');
+  assert.equal(t.storage.keys('client:').length, 100);
 });
 
 test('CIMD: the document cache holds at most 20 entries', async () => {

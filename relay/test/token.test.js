@@ -9,6 +9,7 @@ import {
   pkcePair,
   poll,
   respond,
+  sha256HexSync,
   tokenPost,
   mcp,
   waitFor,
@@ -55,6 +56,27 @@ test('malformed verifier and missing parameters are invalid_request', async () =
   }
   // None of those consumed the code.
   assert.equal((await tokenPost(t, codeExchange(grant))).status, 200);
+});
+
+test('code_verifier must be 43 to 128 unreserved characters, both ends included', async () => {
+  // [verifier the code was issued for, a verifier one character outside the range]
+  const cases = [
+    [`${'a'.repeat(42)}~`, 'a'.repeat(42)],
+    [`${'-._~'.repeat(31)}aZ09`, `${'-._~'.repeat(32)}a`],
+  ];
+  for (const [verifier, outside] of cases) {
+    const t = makeRelay();
+    const grant = await obtainCode(t, { verifier });
+    assert.equal(grant.verifier.length === 43 || grant.verifier.length === 128, true);
+    const refused = await tokenPost(t, codeExchange(grant, { code_verifier: outside }));
+    assert.equal(refused.status, 400, `${outside.length}`);
+    const error = await refused.json();
+    assert.equal(error.error, 'invalid_request', `${outside.length}`);
+    assert.match(error.error_description, /43 to 128/);
+    // Refused for its format, before the code was looked at, so the code still works.
+    const res = await tokenPost(t, codeExchange(grant));
+    assert.equal(res.status, 200, `${verifier.length}`);
+  }
 });
 
 test('wrong redirect_uri at /token is invalid_grant', async () => {
@@ -378,6 +400,104 @@ test('a replayed refresh token revokes even with a wrong client_id; garbage toke
   });
   assert.equal(replay.status, 400);
   assert.equal(await tokenWorks(t, rotated.access_token), false);
+});
+
+test('a replayed refresh token revokes whatever scope comes with it, or with no client_id at all', async () => {
+  /** @type {[string, Record<string, string>][]} */
+  const variants = [
+    ['another scope', { scope: 'other' }],
+    ['no client_id', { client_id: '' }],
+    ['no client_id, another scope', { client_id: '', scope: 'droidbridge admin' }],
+  ];
+  for (const [label, overrides] of variants) {
+    const t = makeRelay();
+    const tokens = await obtainTokens(t);
+    const rotated = await (
+      await tokenPost(t, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId })
+    ).json();
+    assert.ok(await tokenWorks(t, rotated.access_token), label);
+    /** @type {Record<string, string>} */
+    const form = { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId, ...overrides };
+    if (form.client_id === '') delete form.client_id;
+    const replay = await tokenPost(t, form);
+    assert.equal(replay.status, 400, label);
+    assert.equal((await replay.json()).error_description, 'The refresh token was already used. The grant was revoked.', label);
+    assert.equal(await tokenWorks(t, rotated.access_token), false, `${label}: the grant is revoked`);
+    assert.equal(t.storage.keys('family:').length, 0, label);
+  }
+
+  // The same parameters with a live, unused refresh token are refused and do not use it up.
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  const noClient = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token });
+  assert.equal(noClient.status, 400);
+  assert.equal((await noClient.json()).error, 'invalid_request');
+  const otherScope = await tokenPost(t, {
+    grant_type: 'refresh_token',
+    refresh_token: tokens.refresh_token,
+    client_id: tokens.clientId,
+    scope: 'other',
+  });
+  assert.equal(otherScope.status, 400);
+  assert.equal((await otherScope.json()).error, 'invalid_scope');
+  assert.ok(await tokenWorks(t, tokens.access_token));
+  const refreshed = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId });
+  assert.equal(refreshed.status, 200);
+});
+
+test('a malformed token request is refused before its code or refresh token is looked at, and revokes nothing', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  const rotated = await (
+    await tokenPost(t, { grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId })
+  ).json();
+  /** @param {string} type @param {string} body */
+  const post = (type, body) =>
+    t.relay.fetch(new Request(`${ORIGIN}/token`, { method: 'POST', headers: { 'content-type': type }, body }));
+  const form = 'application/x-www-form-urlencoded';
+  const code = `grant_type=authorization_code&code=${tokens.code}`;
+  const refresh = `grant_type=refresh_token&refresh_token=${tokens.refresh_token}`;
+  for (const [type, body] of [
+    [form, `${code}&client_id=${tokens.clientId}&client_id=x`],
+    [form, `${code}&code=${tokens.code}`],
+    ['application/json', JSON.stringify({ grant_type: 'authorization_code', code: tokens.code })],
+    [form, `${refresh}&client_id=${tokens.clientId}&client_id=x`],
+    [form, `${refresh}&grant_type=refresh_token`],
+    ['text/plain', refresh],
+  ]) {
+    const res = await post(type, body);
+    assert.equal(res.status, 400, body);
+    assert.equal((await res.json()).error, 'invalid_request', body);
+    assert.ok(await tokenWorks(t, rotated.access_token), `${body}: nothing revoked`);
+  }
+  // Well formed, the same replays revoke.
+  const replay = await post(form, refresh);
+  assert.equal((await replay.json()).error_description, 'The refresh token was already used. The grant was revoked.');
+  assert.equal(await tokenWorks(t, rotated.access_token), false);
+});
+
+test('each family keeps the hashes of exactly its last 8 access and 16 refresh tokens', async () => {
+  const t = makeRelay();
+  const first = await obtainTokens(t);
+  const access = [first.access_token];
+  const refresh = [first.refresh_token];
+  for (let i = 0; i < 19; i += 1) {
+    const res = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: refresh.at(-1), client_id: first.clientId });
+    assert.equal(res.status, 200);
+    const tokens = await res.json();
+    access.push(tokens.access_token);
+    refresh.push(tokens.refresh_token);
+  }
+  assert.equal(t.storage.keys('at:').length, 8);
+  assert.equal(t.storage.keys('rt:').length, 16);
+  // The newest 8 access tokens still work (none has expired); the one before them is gone.
+  for (const [i, token] of access.entries()) {
+    assert.equal(await tokenWorks(t, token), i >= access.length - 8, `access token ${i}`);
+  }
+  for (const [i, token] of refresh.entries()) {
+    const kept = (await t.storage.get(`rt:${sha256HexSync(token)}`)) !== undefined;
+    assert.equal(kept, i >= refresh.length - 16, `refresh token ${i}`);
+  }
 });
 
 test('an expired refresh token gets the same answer however often it comes, and claims no use', async () => {

@@ -39,12 +39,15 @@ changes inside the relay: an integer above 2^53 (a 64-bit inode, a nanosecond ti
 order stay as written.
 
 Byte-exactness ends at the relay. The phone's tunnel client parses each command into a
-serde_json `Value` and encodes it again before the MCP facade sees it, so on the phone a number
-written with an exponent (`1e15` becomes `1000000000000000.0`) or with more digits than a double
-holds, an integer outside the i64/u64 range, `-0` (which becomes `-0.0`) and string escapes may be
-rewritten, and the message can grow. A re-encoded message over the facade's 262 144-byte limit is
-refused by the phone with 413, which reaches Claude as HTTP 200 carrying the phone's JSON-RPC
-error (settlement rule 7).
+serde_json `Value` and encodes it again before the MCP facade sees it, so the facade does not get
+Claude's bytes: whitespace is dropped, members are sorted by name (a repeated member keeps its
+last value), a number written with a fraction or an exponent, or an integer outside the i64/u64
+range, is read as a double and written in serde_json's own form (`1e15` becomes
+`1000000000000000.0`, `1.50` becomes `1.5`, digits beyond a double's precision are lost), `-0`
+becomes `-0.0`, and string escapes are rewritten (`"A\/b"` becomes `"A/b"`). The message can
+grow on the way. A re-encoded message over the facade's 262 144-byte limit is refused by the phone
+with 413, which reaches Claude as HTTP 200 carrying the phone's JSON-RPC error (settlement
+rule 7).
 
 ### Execution settlement rules
 
@@ -53,9 +56,9 @@ with a retryable 5xx. The relay's own 4xx and 5xx statuses are kept for answers 
 not deliver the request: the pre-delivery answers under "Claude side: MCP endpoint" and rules 1
 and 2 below. Once a message has been delivered to the phone, Claude never gets a status after
 which an HTTP client may send the request again on its own (401, 407, 408, 421, 425, 429 or any
-5xx), nor 413, which is kept for a body refused before delivery, whoever chose it (rule 7). Every
-POST /mcp ends in exactly one of these outcomes, or in a valid reply from the phone (see "Device
-protocol").
+5xx), nor 413, which Claude gets only for a body the relay refused before delivery (rule 7).
+Every POST /mcp ends in exactly one of these outcomes, or in a valid reply from the phone (see
+"Device protocol").
 
 1. **Offline means not delivered.** A request that arrives while no phone poll is waiting (and no
    poll ended in the last 5 s) is answered at once with HTTP 503 and a JSON-RPC error whose
@@ -162,8 +165,8 @@ that request: a JSON object with `"jsonrpc":"2.0"`, the request's `id` (same val
 string id the same string, a number id a number of exactly the same value, compared on its digits
 rather than as a double, so an id above 2^53 matches only itself), and exactly one of `result` and
 `error` (an object with an integer `code` and a string `message`), sent with a status that can
-carry a body (not 204, 205 or 304). The response body may be up to 13 048 576 bytes (the phone's 12 000 000-byte MCP response
-limit plus 1 MiB of envelope).
+carry a body (not 204, 205 or 304). The response body may be up to 13 048 576 bytes (the phone's
+12 000 000-byte MCP response limit plus 1 MiB of envelope).
 
 **Invalid device replies.** A reply is invalid when:
 
@@ -188,16 +191,20 @@ forwarded; in particular `Authorization`, cookies and `Mcp-Session-Id` are not.
 
 ### Claude side: MCP endpoint
 
-`POST /mcp` only (GET/DELETE → 405 with `Allow: POST`). Body ≤ 262 144 bytes (413), JSON object
-(400), `Content-Type: application/json` (415). It must be a JSON-RPC 2.0 request or
-notification: `"jsonrpc":"2.0"`, a string `method`, and no `result` or `error` member (the phone
-refuses such a message before running anything); anything else is 400, JSON-RPC `-32600`. A
+`POST /mcp` only. The access token is checked first, whatever the method: a request without a
+valid one is 401 (see below), and an authenticated request with any other method (GET, DELETE,
+…) is 405 with `Allow: POST`. Body ≤ 262 144 bytes (413), JSON object (400),
+`Content-Type: application/json` (415). It must be a JSON-RPC 2.0 request or notification:
+`"jsonrpc":"2.0"`, a string `method`, and no `result` or `error` member (the phone refuses such a
+message before running anything); anything else is 400, JSON-RPC `-32600`. A
 request's `id` must be one the phone answers: a string, or an integer written without fraction or
 exponent, from -2^63 to 2^64 - 1 (the phone reads any other number, such as `1.0`, `1e0` or
 `-0`, as a float and ignores the request); anything else is 400 with `id` null. The relay's own
 JSON-RPC answers echo the request's `id` exactly as Claude wrote it, a number with its digits and
 a string with its escapes (`"A\/b"` stays `"A\/b"`), whenever the body has an `id` the phone
-would answer, including in the `-32600` answer; otherwise their `id` is null.
+would answer, including in the `-32600` answer for a message it refuses; otherwise their `id` is
+null. The 413 answer to an oversized body always has `id` null: the relay stops reading the body
+at the limit and never parses it, so it does not know the `id`.
 
 The phone gets the body text exactly as Claude sent it, never re-encoded, so a message is at most
 262 144 bytes in the poll response too. The one exception is a leading UTF-8 byte order mark,
@@ -255,11 +262,12 @@ Follows the MCP 2026-07-28 authorization spec.
   An invalid `client_id` or `redirect_uri` is shown as an error page and never redirected to.
 - **Consent requires the phone.** `GET /authorize` validates `response_type=code`, PKCE `S256`
   (`code_challenge` 43–128 chars), `resource` (if present, must be `<origin>/mcp`) and `scope`
-  (only `droidbridge`), keeps the request usable for 10 minutes and shows a page naming the client and
-  its redirect host, asking for the pairing code shown in DroidBridge. The code is 8 characters
-  of Crockford base32 (shown `XXXX-XXXX`, 40 bits), lives at most 10 minutes, is single-use, and
-  is invalidated after 5 wrong attempts across all consent requests. Each consent request is
-  discarded after 3 failed attempts, and at most 10 requests per client (50 in all) wait at once.
+  (only `droidbridge`), keeps the request usable for 10 minutes and shows a page naming the
+  client and its redirect host, asking for the pairing code shown in DroidBridge. The code is
+  8 characters of Crockford base32 (shown `XXXX-XXXX`, 40 bits), lives at most 10 minutes, is
+  single-use, and is invalidated after 5 wrong attempts across all consent requests. Each
+  consent request is discarded after 3 failed attempts, and at most 10 requests per client
+  (50 in all) wait at once.
   The page answers a wrong code and a missing or expired pairing code identically, so it never
   reveals whether a pairing is active. The phone sends the relay only the code's SHA-256 (of
   the normalized uppercase code without the dash), and that hash is all the relay stores. The
@@ -271,9 +279,12 @@ Follows the MCP 2026-07-28 authorization spec.
   consumed and the browser is redirected to `redirect_uri` with `code`, `state` and
   `iss=<origin>`. Authorization codes: 256-bit, 60 s, single use; a replayed code revokes every
   token issued from it, however late it comes and whatever `client_id`, `redirect_uri` or
-  `code_verifier` comes with it (the replay check runs before every other check at `/token`): a
-  redeemed code's hash is kept for as long as the grant it started exists (an unredeemed one for
-  10 minutes after it expires).
+  `code_verifier` comes with it, or none: a redeemed code's hash is kept for as long as the grant
+  it started exists (an unredeemed one for 10 minutes after it expires), and the replay check
+  runs before every check of those parameters. It needs only a well-formed token request: a POST,
+  `application/x-www-form-urlencoded`, at most 16 KiB of UTF-8, no parameter repeated, and a
+  supported `grant_type`. A request that is not well formed is refused (405, 413 or 400) before
+  its code or refresh token is looked at, and revokes nothing.
 - `POST /token` (form-encoded): `authorization_code` (PKCE S256 check, same `client_id`,
   `redirect_uri` and `resource`) and `refresh_token` (rotation; reusing a rotated refresh token
   revokes its whole family). `Cache-Control: no-store`. Only SHA-256 hashes of tokens and codes
@@ -286,13 +297,14 @@ Follows the MCP 2026-07-28 authorization spec.
 - **Replay detection survives trimming.** A presented refresh token with no record, or whose
   record is already used, counts as a replay when the grant it names (from its record, or else
   from the family id inside the token) is still live, that is, its family exists and has not
-  expired: the whole family is revoked, whatever `client_id` came with it. So a rotated token is
-  caught however many rotations ago its own record was trimmed or purged. A token that is
-  malformed, or whose family is gone or expired, is just `invalid_grant` and revokes nothing (a
-  family expires together with its newest refresh token, so none of its tokens is live any
-  more). A refresh token that was never used and has expired is answered as expired every time
-  it is presented, until the sweep purges it together with its family; it is never reported as
-  used.
+  expired: the whole family is revoked, whatever `client_id` and `scope` came with it, or none
+  (as for a replayed code, the check needs only a well-formed token request and runs before
+  every check of the other parameters). So a rotated token is caught however many rotations ago
+  its own record was trimmed or purged. A token that is malformed, or whose family is gone or
+  expired, is just `invalid_grant` and revokes nothing (a family expires together with its
+  newest refresh token, so none of its tokens is live any more). A refresh token that was never
+  used and has expired is answered as expired every time it is presented, until the sweep purges
+  it together with its family; it is never reported as used.
 - Compatibility: refresh tokens in the earlier `dbrr_<secret>` format carry no family id; the
   relay was never deployed with that format, so no such tokens exist.
 - **Expired records are deleted by a sweep**, which runs at most once a minute. `GET /authorize`,
