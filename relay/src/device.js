@@ -123,22 +123,22 @@ async function poll(relay, request, url) {
  * @param {Request} request
  */
 async function respond(relay, request) {
+  const shardToken = request.headers.get('x-tunnel-shard-token');
+  // A reply that cannot be read for its request_id (too large, not UTF-8 JSON, not an object,
+  // no string request_id) still names its request through the shard token header. That request
+  // is settled at once as an invalid device reply instead of waiting out its deadline. A body
+  // that fails mid-read (connection lost) settles nothing, so the phone can post it again.
   const bytes = await readBody(request, DEVICE_RESPONSE_LIMIT_BYTES);
   if (!bytes) {
-    // Too large to read, so the request_id is unknown, but the shard token header still names
-    // the request. Settle it now as an invalid device reply (resp_code 0 is outside 200..599)
-    // instead of letting Claude wait out the deadline.
-    relay.hub.settleByShardToken(request.headers.get('x-tunnel-shard-token'), {
-      resp_code: 0,
-      resp_type: 'oversize',
-    });
+    relay.hub.rejectByShardToken(shardToken);
     return json(413, { error: 'payload_too_large' });
   }
   const body = parseJson(decodeUtf8(bytes));
   if (!isPlainObject(body) || typeof body.request_id !== 'string') {
+    relay.hub.rejectByShardToken(shardToken);
     return json(400, { error: 'invalid_request' });
   }
-  const settled = relay.hub.settle(body.request_id, request.headers.get('x-tunnel-shard-token'), body);
+  const settled = relay.hub.settle(body.request_id, shardToken, body);
   // 404 (never 401/403) for unknown, settled, expired or mismatched: the tunnel client treats
   // 401/403 as "operator action needed" and would stop.
   return settled ? json(200, {}) : json(404, { error: 'not_found' });

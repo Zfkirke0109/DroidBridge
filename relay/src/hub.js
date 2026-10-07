@@ -9,6 +9,8 @@
  *   busy         too many requests in flight: not delivered
  *   unavailable  online, but no poll arrived within the hand-off window: not delivered
  *   settled      delivered, and the phone posted a response with the right shard token
+ *   invalid      delivered, and the phone posted a reply that could not be read (too large,
+ *                not JSON, or no request_id) carrying the request's shard token
  *   unknown      delivered, and no response arrived before the deadline
  *
  * A command is "delivered" the moment it is placed into a poll response body, and it is
@@ -19,11 +21,12 @@ import { constantTimeEqual } from './util.js';
 
 /**
  * @typedef {{ kind: 'offline' } | { kind: 'busy' } | { kind: 'unavailable' } | { kind: 'unknown' }
- *   | { kind: 'settled', payload: Record<string, any> }} Outcome
+ *   | { kind: 'invalid' } | { kind: 'settled', payload: Record<string, any> }} Outcome
  * @typedef {{
  *   id: string, shardToken: string, command: Record<string, any>,
  *   state: 'handoff' | 'delivered' | 'done', settleWithinMs: number,
- *   resolve: (outcome: Outcome) => void, timer: unknown, detach: () => void
+ *   resolve: (outcome: Outcome) => void, timer: unknown, detach: () => void,
+ *   onDelivered: () => void
  * }} Entry
  * @typedef {{ resolve: (commands: Record<string, any>[]) => void, timer: unknown, detach: () => void }} ParkedPoll
  * @typedef {{ setTimeout: (fn: () => void, ms: number) => unknown, clearTimeout: (id: unknown) => void }} Timers
@@ -59,12 +62,14 @@ export class DeviceHub {
   }
 
   /**
-   * Offers a command to the phone. Resolves once the request has an outcome.
+   * Offers a command to the phone. Resolves once the request has an outcome. `onDelivered` runs
+   * at the moment the command is placed into a poll response.
    * @param {Record<string, any>} command
-   * @param {{ configured: boolean, settleWithinMs: number, signal?: AbortSignal | null }} options
+   * @param {{ configured: boolean, settleWithinMs: number, signal?: AbortSignal | null,
+   *   onDelivered?: () => void }} options
    * @returns {Promise<Outcome>}
    */
-  submit(command, { configured, settleWithinMs, signal }) {
+  submit(command, { configured, settleWithinMs, signal, onDelivered = () => {} }) {
     if (!configured || !this.isOnline()) return Promise.resolve({ kind: 'offline' });
     if (this.entries.size >= this.maxInFlight) return Promise.resolve({ kind: 'busy' });
     return new Promise((resolve) => {
@@ -78,6 +83,7 @@ export class DeviceHub {
         resolve,
         timer: undefined,
         detach: () => {},
+        onDelivered,
       };
       this.entries.set(entry.id, entry);
       const poll = this.parked;
@@ -160,13 +166,12 @@ export class DeviceHub {
   }
 
   /**
-   * Settles the delivered request holding this shard token, when the phone's reply could not be
-   * read for its request_id (too large). Compares against every delivered entry in constant
-   * time per entry. False when none matches.
+   * Settles the delivered request holding this shard token as an invalid device reply, when the
+   * phone's reply could not be read for its request_id (too large, not JSON, no request_id).
+   * Compares against every delivered entry in constant time per entry. False when none matches.
    * @param {unknown} shardToken
-   * @param {Record<string, any>} payload
    */
-  settleByShardToken(shardToken, payload) {
+  rejectByShardToken(shardToken) {
     if (typeof shardToken !== 'string' || shardToken === '') return false;
     /** @type {Entry | null} */
     let match = null;
@@ -174,8 +179,26 @@ export class DeviceHub {
       if (entry.state === 'delivered' && constantTimeEqual(shardToken, entry.shardToken)) match = entry;
     }
     if (!match) return false;
-    this.#finish(match, { kind: 'settled', payload });
+    this.#finish(match, { kind: 'invalid' });
     return true;
+  }
+
+  /**
+   * Takes a request out of the hub after its MCP handler failed, so it can never be delivered
+   * later and no reply is waited for. A late reply from the phone then gets 404.
+   * @param {string} requestId
+   * @returns {boolean | null} whether it had been delivered; null when the hub no longer holds it
+   */
+  withdraw(requestId) {
+    const entry = this.entries.get(requestId);
+    if (!entry) return null;
+    const delivered = entry.state === 'delivered';
+    if (!delivered) {
+      const index = this.handoff.indexOf(entry);
+      if (index !== -1) this.handoff.splice(index, 1);
+    }
+    this.#finish(entry, delivered ? { kind: 'unknown' } : { kind: 'unavailable' });
+    return delivered;
   }
 
   /** Counters for tests and diagnostics; carries no secrets. */
@@ -208,6 +231,7 @@ export class DeviceHub {
     entry.timer = this.timers.setTimeout(() => {
       if (entry.state === 'delivered') this.#finish(entry, { kind: 'unknown' });
     }, entry.settleWithinMs);
+    entry.onDelivered();
   }
 
   /** @param {Entry} entry */

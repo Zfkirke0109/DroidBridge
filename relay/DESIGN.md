@@ -33,6 +33,13 @@ interprets, caches, queues for later, or retries an MCP request.
 
 ### Execution settlement rules
 
+A JSON-RPC request (a message with an `id`) whose execution outcome is unknown is never answered
+with a retryable 5xx. The relay's own 4xx and 5xx statuses are kept for answers that provably did
+not deliver the request: the pre-delivery answers under "Claude side: MCP endpoint" and rules 1
+and 2 below. Every POST /mcp ends in exactly one of these outcomes, or in a valid reply from the
+phone, which passes through with the phone's own status (see "Device protocol"). A notification
+has no body to carry an error, so an invalid device reply to one is answered 502.
+
 1. **Offline means not delivered.** A request that arrives while no phone poll is waiting (and no
    poll ended in the last 5 s) is answered at once with HTTP 503 and a JSON-RPC error whose
    `data.droidbridge_relay` is `{"state":"offline","delivered":false}`. Nothing is queued.
@@ -47,6 +54,26 @@ interprets, caches, queues for later, or retries an MCP request.
    "retried":false}`) saying the request may or may not have run and was not retried. HTTP 200
    keeps HTTP-layer clients from replaying it. A late response for that request gets 404.
 5. Notifications follow the same rules but get no JSON-RPC body.
+6. **A relay failure is final too, never a 5xx.** Any failure while the relay handles POST /mcp
+   (a storage error, a bug, the Durable Object being reset or unreachable) is answered HTTP 200
+   with a JSON-RPC error (`code -32002`, `data.droidbridge_relay` =
+   `{"state":"settlement_unknown","delivered":D,"retried":false}`, the request's `id` when its
+   body can be read, else `null`); a notification gets an empty HTTP 200. `D` is what is
+   actually known:
+   - `false`: the failure came before the command was placed into a poll response, or the
+     Worker could not address the Durable Object at all. A command still waiting in the
+     hand-off list is withdrawn first, so it can never be delivered later.
+   - `true`: the command had been placed into a poll response. The relay stops waiting for it,
+     so a late reply from the phone gets 404.
+   - `null`: the Worker cannot tell, because the Durable Object threw or answered with a 5xx it
+     did not mark as its own.
+
+   The Durable Object marks every POST /mcp answer it makes on purpose with the internal header
+   `X-DroidBridge-Relay-Answer`, which the Worker removes before the answer reaches Claude. The
+   Worker passes a 5xx through only when it carries that mark: the 503 of rules 1 and 2, a
+   notification's 502 for an invalid device reply, or the phone's own status on a valid reply
+   (the phone, not the relay, reports that outcome). Any other 5xx on POST /mcp, and a failed
+   call to the object, becomes the `D = null` answer above.
 
 ### Device protocol (`droidbridge-relay/1`)
 
@@ -59,7 +86,7 @@ Device key format: `dbrk_` followed by 43 base64url characters (32 random bytes)
 |---|---|---|
 | `GET /device/v1/status` | credential check for the app | 200 `{"schema_version":1,"protocol":"droidbridge-relay/1","authorized_clients":N,"pairing_active":bool}` |
 | `GET /device/v1/poll?limit=L&timeout_ms=T` | long-poll for commands (`L` ≤ 8, `T` capped at 25 000) | 200 `{"commands":[…]}` or 204 on timeout |
-| `POST /device/v1/response` | result of one command; header `x-tunnel-shard-token` | 200 accepted; 404 unknown, settled, expired or token mismatch |
+| `POST /device/v1/response` | result of one command; header `x-tunnel-shard-token` | 200 accepted; 400 unreadable body; 413 body too large; 404 unknown, settled, expired or token mismatch |
 | `POST /device/v1/pairing` | body `{"code_sha256":"<64 hex>","ttl_seconds":≤600}`; replaces any earlier code | 200 `{"expires_at":"<RFC 3339>"}` |
 | `DELETE /device/v1/pairing` | cancel the pairing code | 204 |
 | `POST /device/v1/revoke` | revoke every Claude grant: tokens, codes, pending consents, registered clients, pairing | 200 `{"revoked_tokens":N}` |
@@ -78,14 +105,30 @@ Command shape (one element of `commands`):
 ```
 
 Response body posted by the phone: `{"request_id","channel","resp_json"?,"resp_headers"?,
-"resp_code","resp_type":"jsonrpc_response"|"notify_ack"}`. The relay answers Claude with
-`resp_code` and `resp_json` as `application/json`. A `resp_code` outside 200–599 (a 1xx cannot be
-a final response) is an invalid device reply: a request with an `id` gets HTTP 200 with a
-JSON-RPC error (`code -32603`, `data.droidbridge_relay` = `{"state":"invalid_device_reply",
-"delivered":true,"retried":false}`), and a notification gets HTTP 502. The response body may be
-up to 13 048 576 bytes (the phone's 12 000 000-byte MCP response limit plus 1 MiB of envelope); a
-larger one is answered 413, and if its `x-tunnel-shard-token` matches a delivered request, that
-request is settled at once as an invalid device reply instead of waiting for its deadline.
+"resp_code","resp_type":"jsonrpc_response"|"notify_ack"}`. `resp_headers` and `resp_type` are
+neither forwarded nor interpreted. For a notification the relay answers Claude with `resp_code`
+and no body. For a request it answers with `resp_code` and `resp_json` as `application/json`,
+provided `resp_json` is a JSON-RPC 2.0 response to that request: a JSON object with
+`"jsonrpc":"2.0"`, the request's `id` (same value and type), and exactly one of `result` and
+`error` (an object with an integer `code` and a string `message`), sent with a status that can
+carry a body (not 204, 205 or 304). The response body may be up to 13 048 576 bytes (the phone's
+12 000 000-byte MCP response limit plus 1 MiB of envelope).
+
+**Invalid device replies.** A reply is invalid when:
+
+- `resp_code` is not an integer from 200 to 599 (a 1xx cannot be a final response);
+- for a request, `resp_json` is missing, is not a JSON object, or is not a JSON-RPC response to
+  that request as defined above, or `resp_code` is 204, 205 or 304;
+- the body cannot be read for its `request_id`: larger than the limit (answered 413), or not
+  UTF-8 JSON, not a JSON object, or without a string `request_id` (answered 400). The relay then
+  settles the delivered request whose shard token the `x-tunnel-shard-token` header carries at
+  once instead of letting it wait for its deadline; without a matching token nothing is settled.
+  A body whose upload fails mid-read settles nothing, so the phone can post it again.
+
+In the first two cases the phone gets 200 (its reply was accepted and settled the request). A
+request with an invalid reply gets HTTP 200 with a JSON-RPC error (`code -32603`,
+`data.droidbridge_relay` = `{"state":"invalid_device_reply","delivered":true,"retried":false}`)
+saying it may or may not have run and was not retried, and a notification gets HTTP 502.
 
 Forwarded header allowlist (case-insensitive in, canonical case out, each value ≤ 4096 bytes):
 `Content-Type`, `Accept`, `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`. Nothing else is
@@ -95,6 +138,8 @@ forwarded; in particular `Authorization`, cookies and `Mcp-Session-Id` are not.
 
 `POST /mcp` only (GET/DELETE → 405 with `Allow: POST`). Body ≤ 262 144 bytes (413), JSON object
 (400), `Content-Type: application/json` (415). At most 16 requests in flight (429, not delivered).
+These pre-delivery answers (401, 405, 413, 415, 400, 429) and the not-delivered 503 of settlement
+rules 1 and 2 keep their status codes; every other failure follows settlement rule 6.
 
 Missing/invalid/expired token → 401 with
 `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource", scope="droidbridge"`
@@ -145,8 +190,21 @@ Follows the MCP 2026-07-28 authorization spec.
   token issued from it.
 - `POST /token` (form-encoded): `authorization_code` (PKCE S256 check, same `client_id`,
   `redirect_uri` and `resource`) and `refresh_token` (rotation; reusing a rotated refresh token
-  revokes its whole family). Access tokens 256-bit opaque, 1 hour; refresh tokens 30 days.
-  `Cache-Control: no-store`. Only SHA-256 hashes of tokens and codes are stored.
+  revokes its whole family). `Cache-Control: no-store`. Only SHA-256 hashes of tokens and codes
+  are stored.
+- **Token formats.** Access tokens are `dbra_` followed by 43 base64url characters (256 random
+  bits) and last 1 hour. Refresh tokens are `dbrr_<familyId>.<secret>` and last 30 days: the
+  family id is the grant's random 128-bit id (22 base64url characters) and the secret is 256
+  random bits (43 base64url characters). Each code exchange starts a family; each family keeps
+  the hashes of only its last 8 access and 16 refresh tokens, and older ones are deleted.
+- **Replay detection survives trimming.** A presented refresh token with no live record, or whose
+  record is already used, counts as a replay when the family it names (from its record, or else
+  from the family id inside the token) still exists: the whole family is revoked, whatever
+  `client_id` came with it. So a rotated token is caught however many rotations ago its own
+  record was trimmed or purged. A token that is malformed or whose family is gone is just
+  `invalid_grant` and revokes nothing.
+- Compatibility: refresh tokens in the earlier `dbrr_<secret>` format carry no family id; the
+  relay was never deployed with that format, so no such tokens exist.
 
 ## Consequences
 

@@ -7,7 +7,7 @@
 import { handleDevice } from './device.js';
 import { GrantStore } from './grants.js';
 import { DeviceHub } from './hub.js';
-import { handleMcp } from './mcp.js';
+import { RELAY_ANSWER_HEADER, handleMcp, mcpFailure, mcpProgress } from './mcp.js';
 import { OAuthServer, parseExtraRedirectUris } from './oauth.js';
 import { json, Mutex } from './util.js';
 
@@ -107,14 +107,29 @@ export class Relay {
     this.lastSweepAt = Number.NEGATIVE_INFINITY;
   }
 
-  /** @param {Request} request */
+  /**
+   * Routes one request. A failure on POST /mcp is never a 5xx: the request may already have
+   * reached the phone, so it is answered by the unknown-settlement rule (HTTP 200, JSON-RPC
+   * -32002) with what is known about delivery. Other routes answer 500.
+   * @param {Request} request
+   */
   async fetch(request) {
+    const url = new URL(request.url);
+    const progress = url.pathname === '/mcp' && request.method === 'POST' ? mcpProgress() : null;
+    let response;
     try {
-      return await this.#route(request);
+      response = await this.#route(request, url, progress);
     } catch (error) {
-      this.onError(error);
-      return json(500, { error: 'server_error' });
+      try {
+        this.onError(error);
+      } catch {
+        // Reporting must never change the answer.
+      }
+      if (!progress) return json(500, { error: 'server_error' });
+      response = await mcpFailure(this, request, progress);
     }
+    if (progress) response.headers.set(RELAY_ANSWER_HEADER, '1');
+    return response;
   }
 
   /**
@@ -135,12 +150,15 @@ export class Relay {
     await this.lock.run(() => this.grants.sweep());
   }
 
-  /** @param {Request} request */
-  async #route(request) {
-    const url = new URL(request.url);
+  /**
+   * @param {Request} request
+   * @param {URL} url
+   * @param {import('./mcp.js').McpProgress | null} progress set for POST /mcp
+   */
+  async #route(request, url, progress) {
     const origin = this.originFor(url);
     const path = url.pathname;
-    if (path === '/mcp') return handleMcp(this, request, origin);
+    if (path === '/mcp') return handleMcp(this, request, origin, progress ?? undefined);
     if (path.startsWith('/device/')) return handleDevice(this, request, url);
     if (path.startsWith('/.well-known/')) return this.oauth.wellKnown(request, path, origin);
     if (path === '/authorize') return this.oauth.authorize(request, url, origin);

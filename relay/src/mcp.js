@@ -20,6 +20,12 @@ import {
 } from './util.js';
 
 export const MCP_BODY_LIMIT_BYTES = 262_144;
+/**
+ * Set by the Durable Object on every POST /mcp answer it makes on purpose, so the Worker can
+ * tell a deliberate status (503 offline, a notification's 502, the phone's own 5xx) from a
+ * failure. Internal: the Worker removes it before the answer reaches Claude.
+ */
+export const RELAY_ANSWER_HEADER = 'X-DroidBridge-Relay-Answer';
 const HEADER_VALUE_LIMIT_BYTES = 4096;
 /** Canonical names of the only request headers forwarded to the phone. */
 const FORWARDED_HEADERS = ['Content-Type', 'Accept', 'MCP-Protocol-Version', 'Mcp-Method', 'Mcp-Name'];
@@ -42,7 +48,14 @@ export const MESSAGES = Object.freeze({
     'DroidBridge sent an invalid reply. The request may or may not have run on the phone, and it was not retried.',
   relayFailure:
     'The DroidBridge relay failed while handling the request. It may or may not have reached the phone, and it was not retried.',
+  relayFailureDelivered:
+    'The DroidBridge relay failed after handing the request to the phone. The request may or may not have run on the phone, and it was not retried.',
+  relayFailureNotDelivered:
+    'The DroidBridge relay failed before handing the request to the phone. The request was not delivered to the phone, and it was not retried.',
 });
+
+const hasOwn = (/** @type {object} */ value, /** @type {string} */ key) =>
+  Object.prototype.hasOwnProperty.call(value, key);
 
 /**
  * @param {unknown} id
@@ -73,14 +86,24 @@ function unauthorized(origin, presented) {
 /**
  * @typedef {import('./relay.js').Relay} Relay
  * @typedef {import('./hub.js').Outcome} Outcome
+ * @typedef {{
+ *   bodyRead: boolean, message: Record<string, any> | undefined,
+ *   requestId: string | null, delivered: boolean
+ * }} McpProgress how far one POST /mcp got, so a failure can be answered with what is known
  */
+
+/** @returns {McpProgress} */
+export function mcpProgress() {
+  return { bodyRead: false, message: undefined, requestId: null, delivered: false };
+}
 
 /**
  * @param {Relay} relay
  * @param {Request} request
  * @param {string} origin
+ * @param {McpProgress} [progress] filled in as the request advances
  */
-export async function handleMcp(relay, request, origin) {
+export async function handleMcp(relay, request, origin, progress = mcpProgress()) {
   // 1. Authentication, before anything else is looked at.
   const authorization = request.headers.get('authorization');
   const presented = authorization !== null && /^bearer(?:\s|$)/i.test(authorization.trim());
@@ -100,6 +123,7 @@ export async function handleMcp(relay, request, origin) {
   if (mediaType(request) !== 'application/json') {
     return json(415, { error: 'unsupported_media_type', error_description: 'Content-Type must be application/json.' });
   }
+  progress.bodyRead = true;
   const bytes = await readBody(request, MCP_BODY_LIMIT_BYTES);
   if (!bytes) {
     return json(413, rpcError(null, -32600, `The request body is larger than ${MCP_BODY_LIMIT_BYTES} bytes.`));
@@ -120,6 +144,7 @@ export async function handleMcp(relay, request, origin) {
   ) {
     return json(400, rpcError(null, -32600, 'Invalid Request: expected a JSON-RPC 2.0 request or notification.'));
   }
+  progress.message = message;
 
   // 3. Forward only the allowlisted headers, in canonical case.
   /** @type {Record<string, string[]>} */
@@ -147,12 +172,33 @@ export async function handleMcp(relay, request, origin) {
     headers,
     jsonrpc: message,
   };
+  progress.requestId = command.request_id;
   const outcome = await relay.hub.submit(command, {
     configured: relay.config.deviceKeyConfigured,
     settleWithinMs: seconds * 1000 + relay.timings.responseGraceMs,
     signal: request.signal,
+    onDelivered: () => {
+      progress.delivered = true;
+    },
   });
   return outcomeResponse(outcome, isRequest, id);
+}
+
+/**
+ * Whether `reply` is a JSON-RPC 2.0 response to the request with this id: the same id (and
+ * type), exactly one of result and error, and an error with an integer code and a string
+ * message.
+ * @param {unknown} reply
+ * @param {unknown} id
+ */
+export function isResponseFor(reply, id) {
+  if (!isPlainObject(reply) || reply.jsonrpc !== '2.0' || reply.id !== id) return false;
+  const hasResult = hasOwn(reply, 'result');
+  const hasError = hasOwn(reply, 'error');
+  if (hasResult === hasError) return false;
+  if (hasResult) return true;
+  const error = reply.error;
+  return isPlainObject(error) && Number.isInteger(error.code) && typeof error.message === 'string';
 }
 
 /**
@@ -171,6 +217,17 @@ export function outcomeResponse(outcome, isRequest, id) {
   const relayError = (status, code, message, data, headers = {}) =>
     isRequest ? json(status, rpcError(id, code, message, data), headers) : empty(status, headers);
 
+  // The phone's reply was delivered but cannot be passed on. A request gets HTTP 200 (no
+  // HTTP-layer replay of something that may have run) with a JSON-RPC error; a notification has
+  // no body to carry that, so it gets 502.
+  const invalidReply = () =>
+    isRequest
+      ? json(
+          200,
+          rpcError(id, -32603, MESSAGES.invalid, { state: 'invalid_device_reply', delivered: true, retried: false }),
+        )
+      : empty(502);
+
   switch (outcome.kind) {
     case 'offline':
       return relayError(503, -32001, MESSAGES.offline, { state: 'offline', delivered: false });
@@ -185,32 +242,80 @@ export function outcomeResponse(outcome, isRequest, id) {
         delivered: true,
         retried: false,
       });
+    case 'invalid':
+      return invalidReply();
     case 'settled': {
       const payload = outcome.payload;
       const status = payload.resp_code;
       // 100..199 cannot be sent as a final response, so they count as invalid like 600+.
-      // A request gets HTTP 200 (no HTTP-layer replay of something that may have run) with a
-      // JSON-RPC error; a notification has no body to carry that, so it gets 502.
-      if (!Number.isInteger(status) || status < 200 || status > 599) {
-        if (!isRequest) return empty(502);
-        return json(
-          200,
-          rpcError(id, -32603, MESSAGES.invalid, { state: 'invalid_device_reply', delivered: true, retried: false }),
-        );
-      }
+      if (!Number.isInteger(status) || status < 200 || status > 599) return invalidReply();
+      if (!isRequest) return empty(status);
+      // A request needs a JSON-RPC response for its own id, in a status that can carry a body;
+      // anything else would leave Claude with an empty or wrong answer.
       const bodyless = status === 204 || status === 205 || status === 304;
-      if (
-        !isRequest ||
-        bodyless ||
-        payload.resp_type === 'notify_ack' ||
-        payload.resp_json === undefined ||
-        payload.resp_json === null
-      ) {
-        return empty(status);
-      }
+      if (bodyless || !isResponseFor(payload.resp_json, id)) return invalidReply();
       return json(status, payload.resp_json);
     }
     default:
-      return relayError(500, -32603, 'Internal relay error.', { state: 'internal', delivered: false });
+      // Unreachable; the caller's failure path answers with what is known about delivery.
+      throw new Error('unexpected hub outcome');
   }
+}
+
+/**
+ * The final answer when the relay fails while handling POST /mcp: HTTP 200 with JSON-RPC
+ * -32002 (echoing the id when the body is known), or an empty 200 for a notification, matching
+ * the unknown-settlement rule. Never a 5xx an HTTP client might replay.
+ * @param {unknown} message the parsed body; undefined when it is unknown or not JSON
+ * @param {boolean | null} delivered whether the command reached a poll response; null when unknown
+ */
+export function relayFailureAnswer(message, delivered) {
+  const data = { state: 'settlement_unknown', delivered, retried: false };
+  const text =
+    delivered === true
+      ? MESSAGES.relayFailureDelivered
+      : delivered === false
+        ? MESSAGES.relayFailureNotDelivered
+        : MESSAGES.relayFailure;
+  if (!isPlainObject(message)) return json(200, rpcError(null, -32002, text, data));
+  if (!hasOwn(message, 'id') && typeof message.method === 'string') return empty(200);
+  const id = typeof message.id === 'string' || Number.isSafeInteger(message.id) ? message.id : null;
+  return json(200, rpcError(id, -32002, text, data));
+}
+
+/**
+ * The request body as JSON; undefined when it is unreadable, too large or not JSON.
+ * @param {Request} request
+ * @returns {Promise<unknown>}
+ */
+export async function readMcpMessage(request) {
+  try {
+    const bytes = await readBody(request, MCP_BODY_LIMIT_BYTES);
+    return bytes ? parseJson(decodeUtf8(bytes)) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Answers a POST /mcp whose handling threw. The command is withdrawn from the hub first, so one
+ * still waiting for a poll can never be delivered after this answer, and a delivered one stops
+ * holding an in-flight slot (a late reply from the phone gets 404).
+ * @param {Relay} relay
+ * @param {Request} request
+ * @param {McpProgress} progress
+ */
+export async function mcpFailure(relay, request, progress) {
+  /** @type {boolean | null} */
+  let delivered = progress.delivered;
+  if (progress.requestId !== null) {
+    try {
+      if (relay.hub.withdraw(progress.requestId) === true) delivered = true;
+    } catch {
+      if (!delivered) delivered = null;
+    }
+  }
+  // Before the body was read (a failure during authentication) it can still be read for the id.
+  const message = progress.message ?? (progress.bodyRead ? undefined : await readMcpMessage(request));
+  return relayFailureAnswer(message, delivered);
 }

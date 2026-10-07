@@ -115,10 +115,11 @@ metadata, cached client ID metadata documents (at most 1 hour), and pending cons
 phone. Only `Content-Type`, `Accept`, `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` are
 forwarded. Claude never sees the device key.
 
-**OAuth.** OAuth 2.1 with PKCE (S256 only) and RFC 8707 resource binding. Access tokens last 1
-hour and refresh tokens 30 days. Refresh tokens rotate on every use; presenting any rotated refresh
-token, however old, revokes the whole grant, and so does presenting an authorization code a second
-time.
+**OAuth.** OAuth 2.1 with PKCE (S256 only) and RFC 8707 resource binding. Access tokens
+(`dbra_…`) last 1 hour and refresh tokens (`dbrr_<grant id>.<secret>`) 30 days. Refresh tokens
+rotate on every use; presenting any rotated refresh token, however old, revokes the whole grant
+(each refresh token names its grant, so this holds even after the relay has deleted the old
+token's record), and so does presenting an authorization code a second time.
 Redirects go only to Claude's callbacks, Claude Code's loopback `http://localhost:<port>/callback`
 or `http://127.0.0.1:<port>/callback`, or URIs you list in `EXTRA_REDIRECT_URIS`. An unknown
 client or redirect URI gets an error page and is never redirected to. The consent page sends a
@@ -133,27 +134,37 @@ outcomes:
   503, the request is dropped, and no later poll can receive it.
 - **Busy**: 16 requests are already in flight. Claude gets HTTP 429, and the request was not
   delivered.
-- **Answered**: the phone posted its result in time, and Claude gets it. If the phone's reply
-  carries an invalid status code, a request gets HTTP 200 with a JSON-RPC error (code `-32603`)
-  saying it may or may not have run and was not retried; a notification gets HTTP 502.
+- **Answered**: the phone posted its result in time, and Claude gets it with the phone's status
+  code.
+- **Invalid reply**: the phone's reply cannot be passed on: its status code is not 200 to 599,
+  or, for a request, it is not a JSON-RPC response carrying the request's id (missing, not a JSON
+  object, another id, not exactly one of `result` and `error`, or a status such as 204 that
+  cannot carry a body). A request gets HTTP 200 with a JSON-RPC error (code `-32603`) saying it
+  may or may not have run and was not retried; a notification gets HTTP 502. A reply the relay
+  cannot read at all (too large, not JSON, no `request_id`) ends its request this way at once,
+  found by its shard token.
 - **Outcome unknown**: the request was handed to the phone, but no result arrived within
   `RESPONSE_TIMEOUT_SECONDS` plus 5 seconds. Claude gets HTTP 200 with a JSON-RPC error (code
   `-32002`) saying the request may or may not have run and was not retried. HTTP 200 keeps
   HTTP-level clients from retrying it. A late result from the phone is discarded.
 
 A request counts as handed to the phone the moment it is placed into a poll response. If the
-phone's connection drops at that moment, the outcome is unknown, never "retried". If the relay's
-Durable Object itself fails while handling a request, Claude also gets HTTP 200 with a JSON-RPC
-`-32002` error (whether it reached the phone is unknown), never a 5xx. Whether to send the request
-again is left to you or the model.
+phone's connection drops at that moment, the outcome is unknown, never "retried". If the relay
+itself fails while handling a request (a storage error, a bug, the Durable Object being reset),
+Claude also gets HTTP 200 with a JSON-RPC `-32002` error, never a 5xx; a notification gets an
+empty HTTP 200. The error's `delivered` field says what is known: `false` means the request never
+reached the phone (one still waiting for a poll is withdrawn, so it cannot arrive later), `true`
+means it was handed to the phone and may or may not have run, and `null` means the Worker could
+not tell because the Durable Object itself failed. Whether to send the request again is left to
+you or the model.
 
 Requests in flight live only in the Durable Object's memory. If Cloudflare restarts the object,
 those requests fail and are not replayed. OAuth state lives in the object's storage and survives.
 
 **Limits.** MCP request bodies up to 256 KiB, phone responses up to 13,048,576 bytes (the
 phone's 12,000,000-byte MCP response limit plus 1 MiB of envelope; a larger reply is refused and
-Claude gets the invalid-reply error at once), 20 client
-registrations per hour, 100 registered clients, 50 waiting consent requests (10 per client).
+Claude gets the invalid-reply error at once), 20 client registrations per hour, 100 registered
+clients, 50 waiting consent requests (10 per client).
 
 ## Costs
 

@@ -16,6 +16,26 @@ async function deliverOne(t, token, message = toolsCall(1)) {
   return { answer, command };
 }
 
+/**
+ * Posts a raw body to /device/v1/response, with the shard token header unless it is undefined.
+ * @param {ReturnType<typeof makeRelay>} t
+ * @param {string | Uint8Array} body
+ * @param {string | undefined} shardToken
+ */
+function sendRaw(t, body, shardToken) {
+  return t.relay.fetch(
+    new Request('https://relay.example/device/v1/response', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${t.device.key}`,
+        'content-type': 'application/json',
+        ...(shardToken === undefined ? {} : { 'x-tunnel-shard-token': shardToken }),
+      },
+      body,
+    }),
+  );
+}
+
 test('offline: no poll ever means 503, not delivered, nothing queued', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
@@ -176,26 +196,17 @@ test('device response body limits and format', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
   const { answer, command } = await deliverOne(t, token);
-  const send = (/** @type {string | Uint8Array} */ body) =>
-    t.relay.fetch(
-      new Request('https://relay.example/device/v1/response', {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${t.device.key}`,
-          'content-type': 'application/json',
-          'x-tunnel-shard-token': command.shard_token,
-        },
-        body,
-      }),
-    );
-  assert.equal((await send('{oops')).status, 400);
-  assert.equal((await send('[]')).status, 400);
-  assert.equal((await send('{"request_id":5}')).status, 400);
-  assert.equal(t.relay.hub.inspect().delivered, 1, 'still pending after bad bodies');
+  // Unreadable bodies that do not carry the request's shard token settle nothing.
+  for (const body of ['{oops', '[]', '{"request_id":5}']) {
+    assert.equal((await sendRaw(t, body, 'A'.repeat(43))).status, 400, body);
+    assert.equal((await sendRaw(t, body, undefined)).status, 400, body);
+  }
+  assert.equal(t.relay.hub.inspect().delivered, 1, 'still pending after bad bodies with no matching token');
   // A body just under the cap (the phone's 12,000,000-byte MCP limit plus envelope) settles.
   assert.equal(DEVICE_RESPONSE_LIMIT_BYTES, 12_000_000 + 1024 * 1024);
   const result = { jsonrpc: '2.0', id: 1, result: { text: 'z'.repeat(12_000_000) } };
-  const ok = await send(
+  const ok = await sendRaw(
+    t,
     JSON.stringify({
       request_id: command.request_id,
       channel: 'main',
@@ -203,6 +214,7 @@ test('device response body limits and format', async () => {
       resp_code: 200,
       resp_type: 'jsonrpc_response',
     }),
+    command.shard_token,
   );
   assert.equal(ok.status, 200);
   const res = await answer;
@@ -210,22 +222,53 @@ test('device response body limits and format', async () => {
   assert.equal((await res.json()).result.text.length, 12_000_000);
 });
 
+test('an unreadable device reply with the request\'s shard token is 400 and settles it at once as invalid_device_reply', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const unreadable = [
+    '{oops',
+    '',
+    '[]',
+    '"text"',
+    'null',
+    '{}',
+    '{"request_id":5}',
+    '{"request_id":null,"resp_code":200}',
+    new Uint8Array([0x7b, 0xff, 0x7d]),
+  ];
+  for (const body of unreadable) {
+    const label = typeof body === 'string' ? JSON.stringify(body) : 'invalid UTF-8';
+    const { answer, command } = await deliverOne(t, token, toolsCall('bad'));
+    const startedAt = t.clock.now();
+    const ack = await sendRaw(t, body, command.shard_token);
+    assert.equal(ack.status, 400, label);
+    assert.deepEqual(await ack.json(), { error: 'invalid_request' });
+    const res = await answer;
+    assert.equal(t.clock.now(), startedAt, `${label}: no waiting for the deadline`);
+    assert.equal(res.status, 200, label);
+    const reply = await res.json();
+    assert.equal(reply.id, 'bad');
+    assert.equal(reply.error.code, -32603);
+    assert.match(reply.error.message, /not retried/);
+    assert.deepEqual(reply.error.data.droidbridge_relay, { state: 'invalid_device_reply', delivered: true, retried: false });
+    assert.equal((await respond(t, command)).status, 404, `${label}: settled, a later valid reply is 404`);
+    assert.equal(t.relay.hub.inspect().inFlight, 0);
+  }
+  assert.equal(t.clock.pendingTimers(), 0);
+
+  // A notification: 502 with no body, also at once.
+  const note = await deliverOne(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' });
+  assert.equal((await sendRaw(t, '{oops', note.command.shard_token)).status, 400);
+  const noteRes = await note.answer;
+  assert.equal(noteRes.status, 502);
+  assert.equal(await noteRes.text(), '');
+});
+
 test('an oversized device reply is 413 and settles its request at once as invalid_device_reply', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
   const tooBig = new Uint8Array(DEVICE_RESPONSE_LIMIT_BYTES + 1).fill(0x20);
-  const send = (/** @type {string | undefined} */ shardToken) =>
-    t.relay.fetch(
-      new Request('https://relay.example/device/v1/response', {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${t.device.key}`,
-          'content-type': 'application/json',
-          ...(shardToken === undefined ? {} : { 'x-tunnel-shard-token': shardToken }),
-        },
-        body: tooBig,
-      }),
-    );
+  const send = (/** @type {string | undefined} */ shardToken) => sendRaw(t, tooBig, shardToken);
 
   // A request: oversized replies with a wrong or missing shard token settle nothing.
   const { answer, command } = await deliverOne(t, token, toolsCall('big'));
@@ -343,4 +386,52 @@ test('misconfigured device secret: /mcp answers like offline', async () => {
   );
   assert.equal(res.status, 503);
   assert.equal((await res.json()).error.data.droidbridge_relay.state, 'offline');
+});
+
+test('a relay failure after the command was offered but before delivery is HTTP 200 -32002 delivered:false, and it is never delivered later', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204); // online, between polls: the command waits for a poll
+  // The hand-off timer fails right after the command joined the hand-off list.
+  const original = t.clock.api.setTimeout;
+  t.clock.api.setTimeout = () => {
+    t.clock.api.setTimeout = original;
+    throw new Error('timer failure');
+  };
+  const res = await mcp(t, token, toolsCall('offered'));
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.id, 'offered');
+  assert.equal(body.error.code, -32002);
+  assert.match(body.error.message, /not delivered/);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: false, retried: false });
+  assert.equal(t.errors.length, 1, 'the failure is reported');
+  // Withdrawn from the hand-off list: the next poll gets nothing, nothing is left in flight.
+  assert.equal((await poll(t, 0)).status, 204);
+  assert.deepEqual(t.relay.hub.inspect().inFlight, 0);
+  assert.equal(t.clock.pendingTimers(), 0);
+});
+
+test('a relay failure while answering a delivered request is HTTP 200 -32002 delivered:true, never a 5xx', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const { answer, command } = await deliverOne(t, token, toolsCall('deep'));
+  // A reply that parses but is too deeply nested to encode again for Claude.
+  const depth = 100_000;
+  const raw =
+    `{"request_id":${JSON.stringify(command.request_id)},"channel":"main","resp_code":200,` +
+    `"resp_type":"jsonrpc_response","resp_json":{"jsonrpc":"2.0","id":"deep","result":` +
+    `${'['.repeat(depth)}${']'.repeat(depth)}}}`;
+  assert.equal((await sendRaw(t, raw, command.shard_token)).status, 200);
+  const res = await answer;
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.id, 'deep');
+  assert.equal(body.error.code, -32002);
+  assert.match(body.error.message, /may or may not have run/);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: true, retried: false });
+  assert.ok(t.errors[0] instanceof RangeError, 'the failure is reported');
+  assert.equal((await respond(t, command)).status, 404, 'settled: a later reply is 404');
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal(t.clock.pendingTimers(), 0);
 });

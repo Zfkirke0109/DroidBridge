@@ -4,9 +4,9 @@
  * poll, the hand-off list and the OAuth state all live in one place.
  */
 
-import { MCP_BODY_LIMIT_BYTES, MESSAGES, rpcError } from './mcp.js';
+import { RELAY_ANSWER_HEADER, readMcpMessage, relayFailureAnswer } from './mcp.js';
 import { Relay } from './relay.js';
-import { decodeUtf8, empty, isPlainObject, json, parseJson, readBody, text } from './util.js';
+import { text } from './util.js';
 
 const EXACT_ROUTES = new Set(['/mcp', '/authorize', '/token', '/register']);
 
@@ -17,17 +17,29 @@ export function isRelayRoute(pathname) {
   );
 }
 
+/**
+ * @typedef {{ fetch: (request: Request) => Promise<Response> }} Stub
+ * @typedef {{ RELAY: { idFromName: (name: string) => unknown, get: (id: any) => Stub } }} WorkerEnv
+ */
+
+/**
+ * The single Durable Object instance every relay route goes to.
+ * @param {WorkerEnv} env
+ */
+function relayStub(env) {
+  return env.RELAY.get(env.RELAY.idFromName('relay'));
+}
+
 export default {
   /**
    * @param {Request} request
-   * @param {{ RELAY: { idFromName: (name: string) => unknown, get: (id: any) => { fetch: (request: Request) => Promise<Response> } } }} env
+   * @param {WorkerEnv} env
    */
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
     if (isRelayRoute(pathname)) {
-      const stub = env.RELAY.get(env.RELAY.idFromName('relay'));
-      if (pathname === '/mcp' && request.method === 'POST') return forwardMcp(stub, request);
-      return stub.fetch(request);
+      if (pathname === '/mcp' && request.method === 'POST') return forwardMcp(env, request);
+      return relayStub(env).fetch(request);
     }
     if (pathname === '/') {
       if (request.method === 'GET' || request.method === 'HEAD') return text(200, 'DroidBridge relay');
@@ -38,51 +50,50 @@ export default {
 };
 
 /**
- * Forwards POST /mcp to the Durable Object. If the object fails (reset, deploy, network), the
- * request may or may not have reached the phone, so Claude gets the same final, non-retryable
- * answer as an unknown settlement instead of a 5xx an HTTP client might replay.
- * @param {{ fetch: (request: Request) => Promise<Response> }} stub
+ * Forwards POST /mcp to the Durable Object. If the object fails (reset, deploy, network) or
+ * answers with a 5xx it did not mean (one without its answer marker), the request may or may
+ * not have reached the phone, so Claude gets the same final, non-retryable answer as an unknown
+ * settlement (HTTP 200, JSON-RPC -32002, delivered null) instead of a 5xx an HTTP client might
+ * replay. If the object cannot even be addressed, the request provably went nowhere (delivered
+ * false). The object's deliberate answers, including its 503 for "not delivered", pass through
+ * with the internal marker removed.
+ * @param {WorkerEnv} env
  * @param {Request} request
  */
-async function forwardMcp(stub, request) {
+async function forwardMcp(env, request) {
   const copy = request.clone();
+  let stub;
+  try {
+    stub = relayStub(env);
+  } catch {
+    return relayFailure(copy, false);
+  }
   let response;
   try {
     response = await stub.fetch(request);
   } catch {
-    return relayFailure(copy);
+    return relayFailure(copy, null);
+  }
+  const deliberate = response.headers.has(RELAY_ANSWER_HEADER);
+  if (response.status >= 500 && !deliberate) {
+    response.body?.cancel().catch(() => {});
+    return relayFailure(copy, null);
   }
   copy.body?.cancel().catch(() => {});
-  return response;
+  if (!deliberate) return response;
+  const headers = new Headers(response.headers);
+  headers.delete(RELAY_ANSWER_HEADER);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
 /**
  * HTTP 200 with JSON-RPC -32002 (echoing the id when the body parses), or an empty 200 for a
- * notification, matching the unknown-settlement rule.
+ * notification.
  * @param {Request} copy an unread clone of the request
+ * @param {false | null} delivered false when the object was never reached, else unknown (null)
  */
-async function relayFailure(copy) {
-  const message = await readJson(copy);
-  const data = { state: 'settlement_unknown', delivered: null, retried: false };
-  if (!isPlainObject(message)) return json(200, rpcError(null, -32002, MESSAGES.relayFailure, data));
-  const hasId = Object.prototype.hasOwnProperty.call(message, 'id');
-  if (!hasId && typeof message.method === 'string') return empty(200);
-  const id = typeof message.id === 'string' || Number.isSafeInteger(message.id) ? message.id : null;
-  return json(200, rpcError(id, -32002, MESSAGES.relayFailure, data));
-}
-
-/**
- * The request body as JSON, or undefined when it is unreadable, too large or not JSON.
- * @param {Request} request
- * @returns {Promise<unknown>}
- */
-async function readJson(request) {
-  try {
-    const bytes = await readBody(request, MCP_BODY_LIMIT_BYTES);
-    return bytes ? parseJson(decodeUtf8(bytes)) : undefined;
-  } catch {
-    return undefined;
-  }
+async function relayFailure(copy, delivered) {
+  return relayFailureAnswer(await readMcpMessage(copy), delivered);
 }
 
 /**

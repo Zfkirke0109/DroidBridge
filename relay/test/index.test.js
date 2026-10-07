@@ -5,8 +5,9 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import worker, { RelayObject, isRelayRoute } from '../src/index.js';
+import { RELAY_ANSWER_HEADER } from '../src/mcp.js';
 import { constantTimeEqual, normalizePairingCode, normalizeResource } from '../src/util.js';
-import { MemoryStorage, newDeviceKey } from './helpers.js';
+import { MemoryStorage, deviceFetch, mcp, newDeviceKey, obtainTokens, poll, respond, toolsCall, waitFor } from './helpers.js';
 
 /** A fake Durable Object namespace that records which object each request reached. */
 function fakeNamespace() {
@@ -171,4 +172,212 @@ test('a healthy Durable Object answer on POST /mcp passes through unchanged', as
   assert.equal(res.status, 200);
   assert.equal(await res.text(), '{"jsonrpc":"2.0","id":1,"result":{}}');
   assert.equal(bodies[0], '{"jsonrpc":"2.0","id":1,"method":"ping"}');
+});
+
+/**
+ * A namespace whose object answers with the given response.
+ * @param {() => Response} answer
+ */
+function answeringNamespace(answer) {
+  const stub = {
+    /** @param {Request} request */
+    fetch: async (request) => {
+      await request.text();
+      return answer();
+    },
+  };
+  return { RELAY: { idFromName: () => ({}), get: () => stub } };
+}
+
+test('the Worker turns an unmarked 5xx from the object on POST /mcp into -32002 and passes marked answers', async () => {
+  const unknown = { droidbridge_relay: { state: 'settlement_unknown', delivered: null, retried: false } };
+  for (const status of [500, 502, 503, 504, 599]) {
+    const env = answeringNamespace(() => new Response('internal', { status }));
+    const res = await worker.fetch(mcpPost('{"jsonrpc":"2.0","id":"u","method":"tools/call"}'), env);
+    assert.equal(res.status, 200, String(status));
+    const body = await res.json();
+    assert.equal(body.id, 'u');
+    assert.equal(body.error.code, -32002);
+    assert.deepEqual(body.error.data, unknown);
+    const note = await worker.fetch(mcpPost('{"jsonrpc":"2.0","method":"notifications/initialized"}'), env);
+    assert.equal(note.status, 200);
+    assert.equal(await note.text(), '');
+  }
+
+  // The object's own answers keep their status and lose the internal marker.
+  const offline = '{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"offline","data":{"droidbridge_relay":{"state":"offline","delivered":false}}}}';
+  for (const [status, body] of /** @type {[number, string][]} */ ([
+    [503, offline],
+    [502, ''],
+    [500, '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"from the phone"}}'],
+    [429, ''],
+    [200, '{"jsonrpc":"2.0","id":1,"result":{}}'],
+  ])) {
+    const env = answeringNamespace(
+      () =>
+        new Response(body || null, {
+          status,
+          headers: { 'content-type': 'application/json', 'retry-after': '1', [RELAY_ANSWER_HEADER]: '1' },
+        }),
+    );
+    const res = await worker.fetch(mcpPost('{"jsonrpc":"2.0","id":1,"method":"ping"}'), env);
+    assert.equal(res.status, status);
+    assert.equal(await res.text(), body);
+    assert.equal(res.headers.get(RELAY_ANSWER_HEADER), null, 'the marker never reaches Claude');
+    assert.equal(res.headers.get('retry-after'), '1', 'other headers are kept');
+  }
+
+  // An object that cannot even be addressed never received the request: delivered false.
+  for (const broken of [{}, { RELAY: { idFromName: () => ({}), get: () => { throw new Error('no such object'); } } }]) {
+    const res = await worker.fetch(mcpPost('{"jsonrpc":"2.0","id":2,"method":"ping"}'), /** @type {any} */ (broken));
+    assert.equal(res.status, 200);
+    const body = await res.json();
+    assert.equal(body.id, 2);
+    assert.equal(body.error.code, -32002);
+    assert.match(body.error.message, /not delivered/);
+    assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: false, retried: false });
+    await assert.rejects(worker.fetch(new Request('https://relay.example/token', { method: 'POST', body: 'x' }), /** @type {any} */ (broken)));
+  }
+
+  // Only POST /mcp is converted; other routes pass the object's answer through.
+  const env = answeringNamespace(() => new Response('internal', { status: 500 }));
+  assert.equal((await worker.fetch(new Request('https://relay.example/token', { method: 'POST', body: 'x' }), env)).status, 500);
+});
+
+/** Memory storage whose every operation throws while `failing` is set. */
+class FlakyStorage extends MemoryStorage {
+  failing = false;
+  #check() {
+    if (this.failing) throw new Error('storage unavailable');
+  }
+  /** @param {string} key */
+  async get(key) {
+    this.#check();
+    return super.get(key);
+  }
+  /** @param {string} key @param {unknown} value */
+  async put(key, value) {
+    this.#check();
+    return super.put(key, value);
+  }
+  /** @param {string} key */
+  async delete(key) {
+    this.#check();
+    return super.delete(key);
+  }
+  /** @param {{ prefix?: string }} [options] */
+  async list(options) {
+    this.#check();
+    return super.list(options);
+  }
+}
+
+/**
+ * A real RelayObject behind the real Worker. Returns a harness the shared helpers accept: every
+ * request goes Worker -> namespace -> RelayObject, with real timers and the real clock.
+ */
+function realDeployment() {
+  const storage = new FlakyStorage();
+  const device = newDeviceKey();
+  const object = new RelayObject({ storage }, { DEVICE_KEY_SHA256: device.hash, RESPONSE_TIMEOUT_SECONDS: '10' });
+  /** @type {unknown[]} */
+  const errors = [];
+  object.relay.onError = (error) => errors.push(error);
+  const stub = { fetch: (/** @type {Request} */ request) => object.fetch(request) };
+  const env = { RELAY: { idFromName: () => ({}), get: () => stub } };
+  const t = /** @type {any} */ ({
+    relay: { fetch: (/** @type {Request} */ request) => worker.fetch(request, env), hub: object.relay.hub },
+    storage,
+    device,
+  });
+  return { t, storage, errors };
+}
+
+/** @param {Response} res */
+async function relayData(res) {
+  assert.equal(res.headers.get(RELAY_ANSWER_HEADER), null, 'the marker never reaches Claude');
+  return res.json();
+}
+
+test('real RelayObject: storage failing before delivery answers POST /mcp with HTTP 200 -32002 delivered:false', async () => {
+  const { t, storage, errors } = realDeployment();
+  const { access_token: token } = await obtainTokens(t);
+  // The deliberate answers keep their codes through the Worker.
+  const offline = await mcp(t, token, toolsCall('o'));
+  assert.equal(offline.status, 503);
+  assert.deepEqual((await relayData(offline)).error.data.droidbridge_relay, { state: 'offline', delivered: false });
+
+  storage.failing = true;
+  const res = await mcp(t, token, toolsCall('s'));
+  assert.equal(res.status, 200);
+  const body = await relayData(res);
+  assert.equal(body.id, 's');
+  assert.equal(body.error.code, -32002);
+  assert.match(body.error.message, /not delivered/);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: false, retried: false });
+  assert.equal(errors.length, 1, 'the failure is reported');
+
+  // A notification gets an empty 200; a request without a token never touches storage: 401.
+  const note = await mcp(t, token, { jsonrpc: '2.0', method: 'notifications/initialized' });
+  assert.equal(note.status, 200);
+  assert.equal(await note.text(), '');
+  assert.equal((await mcp(t, null, toolsCall())).status, 401);
+  // The phone polls afterwards: nothing was handed off.
+  assert.equal((await poll(t, 0)).status, 204);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+
+  // Storage back: the same token works again.
+  storage.failing = false;
+  const pollPromise = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const answer = mcp(t, token, toolsCall('back'));
+  const [command] = (await (await pollPromise).json()).commands;
+  assert.equal((await respond(t, command)).status, 200);
+  const ok = await answer;
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await relayData(ok), { jsonrpc: '2.0', id: 'back', result: { ok: true } });
+});
+
+test('real RelayObject: failures after delivery answer POST /mcp with HTTP 200 -32002 delivered:true, never a 5xx', async () => {
+  const { t, storage, errors } = realDeployment();
+  const { access_token: token } = await obtainTokens(t);
+
+  // Storage failing after delivery: answering needs no storage, so the phone's reply arrives.
+  let pollPromise = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  let answer = mcp(t, token, toolsCall('kept'));
+  let [command] = (await (await pollPromise).json()).commands;
+  storage.failing = true;
+  assert.equal((await respond(t, command)).status, 200);
+  const kept = await answer;
+  assert.equal(kept.status, 200);
+  assert.deepEqual(await relayData(kept), { jsonrpc: '2.0', id: 'kept', result: { ok: true } });
+  storage.failing = false;
+
+  // The relay failing after delivery (a reply too deeply nested to encode again for Claude).
+  pollPromise = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  answer = mcp(t, token, toolsCall('deep'));
+  [command] = (await (await pollPromise).json()).commands;
+  const depth = 100_000;
+  const raw =
+    `{"request_id":${JSON.stringify(command.request_id)},"channel":"main","resp_code":200,` +
+    `"resp_type":"jsonrpc_response","resp_json":{"jsonrpc":"2.0","id":"deep","result":` +
+    `${'['.repeat(depth)}${']'.repeat(depth)}}}`;
+  const ack = await deviceFetch(t, '/device/v1/response', {
+    method: 'POST',
+    body: raw,
+    headers: { 'x-tunnel-shard-token': command.shard_token },
+  });
+  assert.equal(ack.status, 200);
+  const res = await answer;
+  assert.equal(res.status, 200);
+  const body = await relayData(res);
+  assert.equal(body.id, 'deep');
+  assert.equal(body.error.code, -32002);
+  assert.match(body.error.message, /may or may not have run/);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'settlement_unknown', delivered: true, retried: false });
+  assert.ok(errors.some((error) => error instanceof RangeError), 'the failure is reported');
+  assert.equal((await respond(t, command)).status, 404, 'settled: a later reply is 404');
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
 });
