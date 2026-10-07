@@ -5,8 +5,8 @@
     <string name="about_licenses">Licenses</string>
     <string name="about_mcp_protocol_version">MCP protocol version</string>
     <string name="about_repository">Repository</string>
-    <string name="about_support">Support DroidBridge</string>
-    <string name="about_support_summary">Buy the developer a coffee on Ko-fi</string>
+    <string name="settings_support">Support DroidBridge</string>
+    <string name="settings_support_summary">Buy the developer a coffee on Ko-fi</string>
     <string name="about_third_party_notices">Third-party notices</string>
     <string name="action_add_step">Add step</string>
     <string name="action_allow">Allow</string>

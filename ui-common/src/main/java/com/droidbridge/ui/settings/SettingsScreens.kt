@@ -108,6 +108,7 @@ fun SettingsRoute(
     open: (SettingsDestination) -> Unit,
 ) {
     var choosingTheme by rememberSaveable { mutableStateOf(false) }
+    val context = LocalContext.current
     Scaffold(
         modifier = Modifier.testTag("route:Settings"),
         topBar = { TopAppBar(title = { Text(stringResource(R.string.nav_settings)) }) },
@@ -166,6 +167,13 @@ fun SettingsRoute(
                 ) { choosingTheme = true }
             }
             group(R.string.settings_group_app) {
+                Link(
+                    R.string.settings_support,
+                    R.drawable.ic_favorite,
+                    "settings:support",
+                    stringResource(R.string.settings_support_summary),
+                ) { openLink(context, SUPPORT_URL) }
+                RowDivider()
                 if (status.offersSetupGuide) {
                     // Always reachable fallback into first-launch setup, whatever state the app is in.
                     Link(
@@ -520,16 +528,6 @@ fun AboutRoute(
                             .testTag("about:repository"),
                     )
                 }
-            }
-            item {
-                ListItem(
-                    headlineContent = { Text(stringResource(R.string.about_support)) },
-                    supportingContent = { Text(stringResource(R.string.about_support_summary)) },
-                    leadingContent = { RowIcon(R.drawable.ic_favorite) },
-                    modifier = Modifier
-                        .clickable { openLink(context, SUPPORT_URL) }
-                        .testTag("about:support"),
-                )
             }
         }
     }
