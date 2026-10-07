@@ -86,6 +86,17 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+/** Opens a web page; a phone without a browser leaves the tap without effect rather than crashing. */
+private fun openLink(context: android.content.Context, url: String) {
+    try {
+        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+    } catch (_: android.content.ActivityNotFoundException) {
+    }
+}
+
+/** Where people can support the project; one page for both editions. */
+private const val SUPPORT_URL = "https://ko-fi.com/zephyr7030"
+
 enum class SettingsDestination { Capabilities, AgentConnections, Diagnostics, Updates, Data, About, Welcome }
 
 @Composable
@@ -505,10 +516,20 @@ fun AboutRoute(
                         supportingContent = { Text(url) },
                         leadingContent = { RowIcon(R.drawable.ic_code) },
                         modifier = Modifier
-                            .clickable { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+                            .clickable { openLink(context, url) }
                             .testTag("about:repository"),
                     )
                 }
+            }
+            item {
+                ListItem(
+                    headlineContent = { Text(stringResource(R.string.about_support)) },
+                    supportingContent = { Text(stringResource(R.string.about_support_summary)) },
+                    leadingContent = { RowIcon(R.drawable.ic_favorite) },
+                    modifier = Modifier
+                        .clickable { openLink(context, SUPPORT_URL) }
+                        .testTag("about:support"),
+                )
             }
         }
     }

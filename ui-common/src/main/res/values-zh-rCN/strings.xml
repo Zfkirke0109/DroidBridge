@@ -4,6 +4,8 @@
     <string name="about_android_support">支持 Android 13-17</string>
     <string name="about_licenses">开源许可</string>
     <string name="about_mcp_protocol_version">MCP 协议版本</string>
+    <string name="about_support">支持卓爱桥</string>
+    <string name="about_support_summary">在 Ko-fi 上请开发者喝杯咖啡</string>
     <string name="about_repository">代码仓库</string>
     <string name="about_third_party_notices">第三方声明</string>
     <string name="action_add_step">添加步骤</string>
