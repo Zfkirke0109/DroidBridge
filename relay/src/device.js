@@ -53,14 +53,16 @@ async function deviceKeyMatches(request, expectedHash) {
 }
 
 /**
- * Parses a non-negative integer query parameter, clamped; the fallback when absent or invalid.
+ * Parses a non-negative integer query parameter, clamped to min..max however many digits it
+ * has; the fallback when absent or not a plain decimal integer.
  * @param {string | null} value
  * @param {number} min
  * @param {number} max
  * @param {number} fallback
  */
-function clampInt(value, min, max, fallback) {
-  if (value === null || !/^\d{1,9}$/.test(value)) return fallback;
+export function clampInt(value, min, max, fallback) {
+  if (value === null || !/^\d+$/.test(value)) return fallback;
+  // Number() of a very long digit string is Infinity, which clamps to max like any large value.
   return Math.min(max, Math.max(min, Number(value)));
 }
 
@@ -136,12 +138,14 @@ async function respond(relay, request) {
     relay.hub.rejectByShardToken(shardToken);
     return json(413, { error: 'payload_too_large' });
   }
-  const body = parseJson(decodeUtf8(bytes));
-  if (!isPlainObject(body) || typeof body.request_id !== 'string') {
+  const text = decodeUtf8(bytes);
+  const body = parseJson(text);
+  if (text === null || !isPlainObject(body) || typeof body.request_id !== 'string') {
     relay.hub.rejectByShardToken(shardToken);
     return json(400, { error: 'invalid_request' });
   }
-  const settled = relay.hub.settle(body.request_id, shardToken, body);
+  // The text goes along so that Claude gets the phone's resp_json exactly as written.
+  const settled = relay.hub.settle(body.request_id, shardToken, body, text);
   // 404 (never 401/403) for unknown, settled, expired or mismatched: the tunnel client treats
   // 401/403 as "operator action needed" and would stop.
   return settled ? json(200, {}) : json(404, { error: 'not_found' });

@@ -29,7 +29,12 @@ Claude never sees the device key, the phone never sees Claude's OAuth tokens (th
 the phone encrypted under its own Android Keystore alias.
 
 The relay is transport-only. It authenticates both sides, moves JSON-RPC bodies, and never
-interprets, caches, queues for later, or retries an MCP request.
+interprets, caches, queues for later, or retries an MCP request. It moves each message as the
+text it received: Claude's request body goes into the poll response exactly as Claude sent it,
+and the phone's `resp_json` reaches Claude exactly as the phone wrote it. The relay parses them
+only to check them and never re-encodes them, so no value changes on the way: an integer above
+2^53 (a 64-bit inode, a nanosecond timestamp, a 64-bit id), `-0` and every other number keep
+their digits, and escapes, whitespace and member order stay as written.
 
 ### Execution settlement rules
 
@@ -51,10 +56,11 @@ has no body to carry an error, so an invalid device reply to one is answered 502
 3. **Exactly one delivery.** A command is handed to exactly one poll response, then removed from
    the hand-off list. A later poll never sees it again. A command counts as delivered only
    together with the poll response body that carries it: each command is encoded when it is
-   accepted, and a poll either takes its commands with every deadline armed, or fails (HTTP 500
-   to the phone) without marking any of them delivered, leaving them in the hand-off list (or
-   the parked poll parked). A phone poll whose connection dropped, or was already gone when it
-   reached the relay, stops counting as a waiting poll and is never handed a command.
+   accepted (its fields, with the message text added as is), and a poll either takes its
+   commands with every deadline armed, or fails (HTTP 500 to the phone) without marking any of
+   them delivered, leaving them in the hand-off list (or the parked poll parked). A phone poll
+   whose connection dropped, or was already gone when it reached the relay, stops counting as a
+   waiting poll and is never handed a command.
 4. **Unknown settlement is final.** If the phone does not post a response before the command's
    deadline (`response_timeout` + 5 s grace), the relay answers HTTP 200 with a JSON-RPC error
    (`code -32002`, `data.droidbridge_relay` = `{"state":"settlement_unknown","delivered":true,
@@ -98,7 +104,7 @@ Device key format: `dbrk_` followed by 43 base64url characters (32 random bytes)
 | Route | Purpose | Answers |
 |---|---|---|
 | `GET /device/v1/status` | credential check for the app | 200 `{"schema_version":1,"protocol":"droidbridge-relay/1","authorized_clients":N,"pairing_active":bool}` |
-| `GET /device/v1/poll?limit=L&timeout_ms=T` | long-poll for commands (`L` ≤ 8, `T` capped at 25 000) | 200 `{"commands":[…]}` or 204 on timeout |
+| `GET /device/v1/poll?limit=L&timeout_ms=T` | long-poll for commands (`L` capped at 8, `T` capped at 25 000, however many digits either has; a value that is not a non-negative integer means `L` = 8, `T` = 15 000) | 200 `{"commands":[…]}` or 204 on timeout |
 | `POST /device/v1/response` | result of one command; header `x-tunnel-shard-token` | 200 accepted; 400 unreadable body; 413 body too large; 404 unknown, settled, expired or token mismatch |
 | `POST /device/v1/pairing` | body `{"code_sha256":"<64 hex>","ttl_seconds":≤600}`; replaces any earlier code | 200 `{"expires_at":"<RFC 3339>"}` |
 | `DELETE /device/v1/pairing` | cancel the pairing code | 204 |
@@ -116,18 +122,20 @@ Command shape (one element of `commands`):
  "channel":"main","created_at":"<RFC 3339>","response_timeout":"240s",
  "headers":{"Content-Type":["application/json"],"Accept":["application/json, text/event-stream"],
             "MCP-Protocol-Version":["2026-07-28"],"Mcp-Method":["tools/call"],"Mcp-Name":["command"]},
- "jsonrpc":{…the request body…}}
+ "jsonrpc":{…the request body, exactly as Claude sent it…}}
 ```
 
 Response body posted by the phone: `{"request_id","channel","resp_json"?,"resp_headers"?,
 "resp_code","resp_type":"jsonrpc_response"|"notify_ack"}`. `resp_headers` and `resp_type` are
 neither forwarded nor interpreted. For a notification the relay answers Claude with `resp_code`
-and no body. For a request it answers with `resp_code` and `resp_json` as `application/json`,
-provided `resp_json` is a JSON-RPC 2.0 response to that request: a JSON object with
-`"jsonrpc":"2.0"`, the request's `id` (same value and type), and exactly one of `result` and
-`error` (an object with an integer `code` and a string `message`), sent with a status that can
-carry a body (not 204, 205 or 304). The response body may be up to 13 048 576 bytes (the phone's
-12 000 000-byte MCP response limit plus 1 MiB of envelope).
+and no body. For a request it answers with `resp_code` and the `resp_json` text exactly as the
+phone sent it, as `application/json`, provided `resp_json` is a JSON-RPC 2.0 response to that
+request: a JSON object with `"jsonrpc":"2.0"`, the request's `id` (same value and type: a string
+id the same string, a number id a number of exactly the same value, compared on its digits
+rather than as a double, so an id above 2^53 matches only itself), and exactly one of `result`
+and `error` (an object with an integer `code` and a string `message`), sent with a status that
+can carry a body (not 204, 205 or 304). The response body may be up to 13 048 576 bytes (the
+phone's 12 000 000-byte MCP response limit plus 1 MiB of envelope).
 
 **Invalid device replies.** A reply is invalid when:
 
@@ -152,16 +160,27 @@ forwarded; in particular `Authorization`, cookies and `Mcp-Session-Id` are not.
 ### Claude side: MCP endpoint
 
 `POST /mcp` only (GET/DELETE → 405 with `Allow: POST`). Body ≤ 262 144 bytes (413), JSON object
-(400), `Content-Type: application/json` (415). The phone's JSON parser must be able to read the
-message as the relay re-encodes it into a poll response, or it would drop that whole response
-with every other command in it, so the relay also refuses, before delivery: nesting of objects
-and arrays deeper than 64 levels (the message object is level 1; the phone stops at 128 for the
-whole poll response) and any string or member name holding an unpaired UTF-16 surrogate, such as
-a cut emoji `"\ud83d"` (400, JSON-RPC `-32600` with the request's `id`, or an empty 400 for a
-notification), and a message larger than 262 144 bytes once re-encoded, which can happen to
-numbers such as `1e20` (413, same shape). At most 16 requests in flight (429, not delivered).
-These pre-delivery answers (401, 405, 413, 415, 400, 429) and the not-delivered 503 of settlement
-rules 1 and 2 keep their status codes; every other failure follows settlement rule 6.
+(400), `Content-Type: application/json` (415). A request's `id` must be one the phone answers: a
+string, or an integer written without fraction or exponent, from -2^63 to 2^64 - 1 (the phone
+reads any other number, such as `1.0`, `1e0` or `-0`, as a float and ignores the request);
+anything else is 400 with `id` null. The relay's own JSON-RPC answers echo the request's `id`
+exactly as Claude wrote it.
+
+The phone gets the body text exactly as Claude sent it, never re-encoded, so a message is at
+most 262 144 bytes in the poll response too. The phone's JSON parser must be able to read that
+text, or it would drop the whole poll response with every other command in it, so the relay
+refuses, before delivery, anything in it that the phone cannot parse: nesting of objects and
+arrays deeper than 64 levels (the message object is level 1; the phone stops at 128 for the
+whole poll response), any string or member name holding an unpaired UTF-16 surrogate escape,
+such as a cut emoji `"\ud83d"`, and any number whose magnitude is above 1.79 × 10^308 (the
+phone's parser refuses a number beyond the double range, such as `1e400`, and can overflow just
+below the largest double). The check covers the whole text, including a member that JSON
+parsing would drop because a later member repeats its name. Such a message is answered 400,
+JSON-RPC `-32600` with the request's `id`, or an empty 400 for a notification.
+
+At most 16 requests in flight (429, not delivered). These pre-delivery answers (401, 405, 413,
+415, 400, 429) and the not-delivered 503 of settlement rules 1 and 2 keep their status codes;
+every other failure follows settlement rule 6.
 
 Missing/invalid/expired token → 401 with
 `WWW-Authenticate: Bearer resource_metadata="<origin>/.well-known/oauth-protected-resource", scope="droidbridge"`
@@ -225,12 +244,16 @@ Follows the MCP 2026-07-28 authorization spec.
   family id is the grant's random 128-bit id (22 base64url characters) and the secret is 256
   random bits (43 base64url characters). Each code exchange starts a family; each family keeps
   the hashes of only its last 8 access and 16 refresh tokens, and older ones are deleted.
-- **Replay detection survives trimming.** A presented refresh token with no live record, or whose
-  record is already used, counts as a replay when the family it names (from its record, or else
-  from the family id inside the token) still exists: the whole family is revoked, whatever
-  `client_id` came with it. So a rotated token is caught however many rotations ago its own
-  record was trimmed or purged. A token that is malformed or whose family is gone is just
-  `invalid_grant` and revokes nothing.
+- **Replay detection survives trimming.** A presented refresh token with no record, or whose
+  record is already used, counts as a replay when the grant it names (from its record, or else
+  from the family id inside the token) is still live, that is, its family exists and has not
+  expired: the whole family is revoked, whatever `client_id` came with it. So a rotated token is
+  caught however many rotations ago its own record was trimmed or purged. A token that is
+  malformed, or whose family is gone or expired, is just `invalid_grant` and revokes nothing (a
+  family expires together with its newest refresh token, so none of its tokens is live any
+  more). A refresh token that was never used and has expired is answered as expired every time
+  it is presented, until the sweep purges it together with its family; it is never reported as
+  used.
 - Compatibility: refresh tokens in the earlier `dbrr_<secret>` format carry no family id; the
   relay was never deployed with that format, so no such tokens exist.
 

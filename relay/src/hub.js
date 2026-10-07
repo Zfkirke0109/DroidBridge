@@ -19,18 +19,20 @@
  *
  * Delivery is all or nothing. Each command is encoded to its wire form (JSON text) when it is
  * submitted, so a poll response body is only joined strings and cannot fail to build after its
- * commands were marked delivered. Every deadline timer a poll needs is armed before anything
- * changes: if arming one fails, no command of that poll is marked delivered, every one of them
- * stays in the hand-off list (or the parked poll stays parked), and the failure surfaces to the
- * caller. So a delivered command always has a deadline, and a command is never reported as
- * delivered unless its poll response body exists.
+ * commands were marked delivered. The wire form carries the JSON-RPC message as the text Claude
+ * sent, never re-encoded (see encodeCommand). Every deadline timer a poll needs is armed before
+ * anything changes: if arming one fails, no command of that poll is marked delivered, every one
+ * of them stays in the hand-off list (or the parked poll stays parked), and the failure surfaces
+ * to the caller. So a delivered command always has a deadline, and a command is never reported
+ * as delivered unless its poll response body exists.
  */
 
 import { constantTimeEqual } from './util.js';
 
 /**
  * @typedef {{ kind: 'offline' } | { kind: 'busy' } | { kind: 'unavailable' } | { kind: 'unknown' }
- *   | { kind: 'invalid' } | { kind: 'settled', payload: Record<string, any> }} Outcome
+ *   | { kind: 'invalid' } | { kind: 'settled', payload: Record<string, any>, source: string }} Outcome
+ *   a settled outcome carries the phone's reply parsed (payload) and as JSON text (source)
  * @typedef {{
  *   id: string, shardToken: string, command: Record<string, any>, wire: string,
  *   state: 'handoff' | 'delivered' | 'done', settleWithinMs: number,
@@ -40,6 +42,20 @@ import { constantTimeEqual } from './util.js';
  * @typedef {{ resolve: (commands: string[]) => void, timer: unknown, detach: () => void }} ParkedPoll
  * @typedef {{ setTimeout: (fn: () => void, ms: number) => unknown, clearTimeout: (id: unknown) => void }} Timers
  */
+
+/**
+ * The wire form of a command: its fields as JSON, with the JSON-RPC message added as the member
+ * `jsonrpc` exactly as the given JSON text. Throws when the fields cannot be encoded.
+ * @param {Record<string, any>} command the fields, without `jsonrpc`
+ * @param {string} jsonrpc the message as JSON text, already validated
+ */
+export function encodeCommand(command, jsonrpc) {
+  if (typeof jsonrpc !== 'string') throw new TypeError('the message must be JSON text');
+  if (Object.prototype.hasOwnProperty.call(command, 'jsonrpc')) throw new TypeError('jsonrpc is added here');
+  const fields = JSON.stringify(command);
+  if (typeof fields !== 'string' || !fields.startsWith('{')) throw new TypeError('a command must be an object');
+  return `${fields === '{}' ? '{' : `${fields.slice(0, -1)},`}"jsonrpc":${jsonrpc}}`;
+}
 
 export class DeviceHub {
   /**
@@ -74,18 +90,21 @@ export class DeviceHub {
    * Offers a command to the phone. Resolves once the request has an outcome. `onDelivered` runs
    * at the moment the command is placed into a poll response. Throws (leaving the hub
    * unchanged) when the command cannot be encoded or a timer cannot be armed.
-   * @param {Record<string, any>} command
+   * @param {Record<string, any>} command the command's fields, without `jsonrpc`
+   * @param {string} jsonrpc the JSON-RPC message as JSON text, sent to the phone as it is
    * @param {{ configured: boolean, settleWithinMs: number, signal?: AbortSignal | null,
    *   onDelivered?: () => void }} options
    * @returns {Promise<Outcome>}
    */
-  submit(command, { configured, settleWithinMs, signal, onDelivered = () => {} }) {
+  submit(command, jsonrpc, { configured, settleWithinMs, signal, onDelivered = () => {} }) {
     if (!configured || !this.isOnline()) return Promise.resolve({ kind: 'offline' });
     // Claude already gave up (its request was aborted while it was authenticated or read):
     // the command is never offered to the phone.
     if (signal?.aborted) return Promise.resolve({ kind: 'unavailable' });
     if (this.entries.size >= this.maxInFlight) return Promise.resolve({ kind: 'busy' });
-    const wire = JSON.stringify(command);
+    // Encoded before anything changes, on either path, so a command that cannot be encoded is
+    // never held.
+    const wire = encodeCommand(command, jsonrpc);
     /** @type {(outcome: Outcome) => void} */
     let resolve = () => {};
     /** @type {Promise<Outcome>} */
@@ -184,14 +203,15 @@ export class DeviceHub {
    * request is unknown, not delivered, already settled or expired, or the shard token differs.
    * @param {unknown} requestId
    * @param {unknown} shardToken
-   * @param {Record<string, any>} payload
+   * @param {Record<string, any>} payload the reply, parsed
+   * @param {string} source the same reply as JSON text
    */
-  settle(requestId, shardToken, payload) {
+  settle(requestId, shardToken, payload, source) {
     if (typeof requestId !== 'string' || typeof shardToken !== 'string') return false;
     const entry = this.entries.get(requestId);
     if (!entry || entry.state !== 'delivered') return false;
     if (!constantTimeEqual(shardToken, entry.shardToken)) return false;
-    this.#finish(entry, { kind: 'settled', payload });
+    this.#finish(entry, { kind: 'settled', payload, source });
     return true;
   }
 

@@ -355,21 +355,17 @@ test('real RelayObject: failures after delivery answer POST /mcp with HTTP 200 -
   assert.deepEqual(await relayData(kept), { jsonrpc: '2.0', id: 'kept', result: { ok: true } });
   storage.failing = false;
 
-  // The relay failing after delivery (a reply too deeply nested to encode again for Claude).
+  // The relay failing after delivery: the handler throws once the phone's reply settled it.
+  const submit = t.relay.hub.submit.bind(t.relay.hub);
+  t.relay.hub.submit = (...args) =>
+    submit(...args).then(() => {
+      throw new RangeError('answer failure');
+    });
   pollPromise = poll(t);
   await waitFor(() => t.relay.hub.inspect().parked);
   answer = mcp(t, token, toolsCall('deep'));
   [command] = (await (await pollPromise).json()).commands;
-  const depth = 100_000;
-  const raw =
-    `{"request_id":${JSON.stringify(command.request_id)},"channel":"main","resp_code":200,` +
-    `"resp_type":"jsonrpc_response","resp_json":{"jsonrpc":"2.0","id":"deep","result":` +
-    `${'['.repeat(depth)}${']'.repeat(depth)}}}`;
-  const ack = await deviceFetch(t, '/device/v1/response', {
-    method: 'POST',
-    body: raw,
-    headers: { 'x-tunnel-shard-token': command.shard_token },
-  });
+  const ack = await respond(t, command);
   assert.equal(ack.status, 200);
   const res = await answer;
   assert.equal(res.status, 200);
@@ -383,12 +379,80 @@ test('real RelayObject: failures after delivery answer POST /mcp with HTTP 200 -
   assert.equal(t.relay.hub.inspect().inFlight, 0);
 });
 
+/**
+ * The keys of a TOML document's root table, with their raw values: the key/value lines before
+ * the first table header (`[name]` or `[[name]]`). A key below a header belongs to that table,
+ * so it is not a root key however it is written. Enough of TOML for wrangler.toml: comments,
+ * blank lines and arrays spread over several lines.
+ * @param {string} toml
+ */
+function rootTomlKeys(toml) {
+  /** @type {Map<string, string>} */
+  const keys = new Map();
+  const lines = toml.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].replace(/^\s+/, '');
+    if (line === '' || line.startsWith('#')) continue;
+    if (line.startsWith('[')) break;
+    const match = /^([A-Za-z0-9_-]+)\s*=\s*(.*)$/.exec(line);
+    assert.ok(match, `a key/value line: ${line}`);
+    let value = match[2].replace(/\s+#[^"]*$/, '').trim();
+    while (value.startsWith('[') && !value.endsWith(']') && i + 1 < lines.length) {
+      i += 1;
+      value += lines[i].replace(/\s+#[^"]*$/, '').trim();
+    }
+    keys.set(match[1], value);
+  }
+  return keys;
+}
+
 test('wrangler.toml enables request.signal, which Cloudflare aborts on a client disconnect only with that flag', () => {
   const toml = readFileSync(fileURLToPath(new URL('../wrangler.toml', import.meta.url)), 'utf8');
-  const line = /^compatibility_flags\s*=\s*\[([^\]]*)\]\s*$/m.exec(toml);
-  assert.ok(line, 'compatibility_flags is set');
-  const flags = line[1].split(',').map((flag) => flag.trim().replace(/^"|"$/g, ''));
-  assert.ok(flags.includes('enable_request_signal'), flags.join(','));
+  // Only a root key is a compatibility flag. Below [vars] the same line would be a Worker
+  // variable, and below [[durable_objects.bindings]] a field of the binding: Cloudflare would
+  // leave request.signal unaborted on a disconnect.
+  const value = rootTomlKeys(toml).get('compatibility_flags');
+  assert.ok(value, 'compatibility_flags is a root key of wrangler.toml');
+  const flags = JSON.parse(value.replace(/,\s*]$/, ']'));
+  assert.ok(Array.isArray(flags) && flags.includes('enable_request_signal'), value);
+  const elsewhere = toml.split(/\r?\n/).filter((line) => /^\s*compatibility_flags\s*=/.test(line));
+  assert.equal(elsewhere.length, 1, 'set once, nowhere else');
+});
+
+test('rootTomlKeys reads only the root table', () => {
+  const toml = [
+    '# comment',
+    'name = "x" # trailing comment',
+    'compatibility_flags = [',
+    '  "a",',
+    '  "enable_request_signal",',
+    ']',
+    '',
+    '[[durable_objects.bindings]]',
+    'name = "RELAY"',
+    'compatibility_flags = ["nope"]',
+    '[vars]',
+    'compatibility_flags = ["nope"]',
+  ].join('\n');
+  const keys = rootTomlKeys(toml);
+  assert.deepEqual([...keys.keys()], ['name', 'compatibility_flags']);
+  assert.equal(keys.get('name'), '"x"');
+  assert.deepEqual(JSON.parse(String(keys.get('compatibility_flags')).replace(/,\s*]$/, ']')), ['a', 'enable_request_signal']);
+  assert.equal(rootTomlKeys('[vars]\ncompatibility_flags = ["enable_request_signal"]\n').get('compatibility_flags'), undefined);
+});
+
+test('README asks for the Node.js version that Wrangler 4 needs, as package.json does', () => {
+  // wrangler@4 declares engines.node ">=22.0.0" and exits below it (bin/wrangler.js,
+  // MIN_NODE_VERSION = "22.0.0"), and every deploy step runs `npx wrangler@4`.
+  const WRANGLER_4_MIN_NODE = 22;
+  const readme = readFileSync(fileURLToPath(new URL('../README.md', import.meta.url)), 'utf8');
+  const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
+  const required = /Node\.js (\d+) or newer/.exec(readme);
+  assert.ok(required, 'README names a minimum Node.js version');
+  assert.ok(Number(required[1]) >= WRANGLER_4_MIN_NODE, `README asks for Node.js ${required[1]}`);
+  assert.equal(pkg.engines?.node, `>=${required[1]}`, 'package.json engines agree with the README');
+  const majors = new Set([...`${readme}\n${JSON.stringify(pkg.scripts)}`.matchAll(/wrangler@(\d+)/g)].map((m) => m[1]));
+  assert.deepEqual([...majors], ['4'], 'every command runs Wrangler 4');
 });
 
 test('the Worker hands the object the request itself, so its abort signal reaches the object', async () => {
@@ -483,7 +547,7 @@ test('real RelayObject: the phone\'s own 5xx and a notification\'s 502 pass thro
 });
 
 test('real RelayObject: an unexpected hub outcome is HTTP 200 -32002 delivered:false, never a 5xx', async () => {
-  assert.throws(() => outcomeResponse(/** @type {any} */ ({ kind: 'bogus' }), true, 1), /unexpected hub outcome/);
+  assert.throws(() => outcomeResponse(/** @type {any} */ ({ kind: 'bogus' }), true, '1'), /unexpected hub outcome/);
   const { t, errors } = realDeployment();
   const { access_token: token } = await obtainTokens(t);
   t.relay.hub.submit = async () => ({ kind: 'bogus' });

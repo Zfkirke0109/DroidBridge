@@ -18,7 +18,9 @@ import {
   sha256HexSync,
   tokenPost,
   toolsCall,
+  waitFor,
 } from './helpers.js';
+import { clampInt } from '../src/device.js';
 
 const DEVICE_ROUTES = [
   ['GET', '/device/v1/status'],
@@ -312,4 +314,71 @@ test('revoke: tokens stop working, clients are removed, status shows 0 authorize
   assert.equal(late.status, 400);
   // Revoking again is harmless.
   assert.deepEqual(await (await deviceFetch(t, '/device/v1/revoke', { method: 'POST' })).json(), { revoked_tokens: 0 });
+});
+
+/**
+ * How long a poll with this query stays parked, in fake-clock milliseconds, and its status.
+ * @param {ReturnType<typeof makeRelay>} t
+ * @param {string} query
+ */
+async function parkedFor(t, query) {
+  const startedAt = t.clock.now();
+  /** @type {number | null} */
+  let endedAt = null;
+  const pending = deviceFetch(t, `/device/v1/poll?${query}`).then((res) => {
+    endedAt = t.clock.now();
+    return res;
+  });
+  await waitFor(() => t.relay.hub.inspect().parked || endedAt !== null);
+  for (let i = 0; i < 40 && endedAt === null; i += 1) await t.clock.advance(1000);
+  const res = await pending;
+  return { ms: /** @type {number} */ (endedAt) - startedAt, status: res.status };
+}
+
+test('poll: timeout_ms of any size is capped at 25 000; a value that is not a number means 15 000', async () => {
+  const t = makeRelay();
+  /** @type {[string, number][]} */
+  const cases = [
+    ['25000', 25_000],
+    ['30000', 25_000],
+    ['999999999', 25_000],
+    ['1000000000', 25_000],
+    ['99999999999', 25_000],
+    ['9'.repeat(400), 25_000],
+    ['00000000000000000000001000', 1000],
+    ['1000', 1000],
+    ['0', 0],
+    ['-1', 15_000],
+    ['1.5', 15_000],
+    ['1e5', 15_000],
+    ['abc', 15_000],
+    ['', 15_000],
+  ];
+  for (const [value, expected] of cases) {
+    const { ms, status } = await parkedFor(t, `limit=8&timeout_ms=${value}`);
+    assert.equal(status, 204, value);
+    assert.equal(ms, expected, `timeout_ms=${value.length > 20 ? `${value.length} digits` : value}`);
+  }
+  assert.equal((await parkedFor(t, 'limit=8')).ms, 15_000, 'absent');
+});
+
+test('poll: limit of any size is capped at 8', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  for (const [limit, expected] of [['1000000000', 8], ['9'.repeat(50), 8], ['0', 1], ['3', 3], ['x', 8]]) {
+    assert.equal((await deviceFetch(t, '/device/v1/poll?limit=8&timeout_ms=0')).status, 204);
+    const answers = [];
+    for (let i = 0; i < 9; i += 1) {
+      answers.push(mcp(t, token, toolsCall(`${limit}-${i}`)));
+      await waitFor(() => t.relay.hub.inspect().handoff === answers.length);
+    }
+    const res = await deviceFetch(t, `/device/v1/poll?limit=${limit}&timeout_ms=0`);
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).commands.length, expected, `limit=${limit.length > 20 ? 'long' : limit}`);
+    // Everything else waits out the hand-off window or its deadline.
+    await t.clock.advance(250_000);
+    await Promise.all(answers);
+  }
+  assert.equal(clampInt('123456789012345678901234567890', 0, 25_000, 15_000), 25_000);
+  assert.equal(clampInt(null, 0, 25_000, 15_000), 15_000);
 });

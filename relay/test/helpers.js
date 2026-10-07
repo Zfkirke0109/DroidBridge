@@ -48,15 +48,44 @@ export function tick() {
 
 /**
  * Waits until `condition()` holds, yielding to the event loop between checks. No wall-clock
- * sleeps: it only lets already-queued work finish.
+ * sleeps: it only lets already-queued work finish. Work off the main thread (WebCrypto digests)
+ * can take many turns when the machine is busy running other test files, so it gives up after a
+ * span of real time rather than after a number of turns.
  * @param {() => boolean} condition
  */
-export async function waitFor(condition, attempts = 2000) {
-  for (let i = 0; i < attempts; i += 1) {
-    if (condition()) return;
+export async function waitFor(condition, timeoutMs = 10_000) {
+  const giveUpAt = performance.now() + timeoutMs;
+  while (!condition()) {
+    if (performance.now() > giveUpAt) assert.fail('condition was not reached');
     await tick();
   }
-  assert.fail('condition was not reached');
+}
+
+/**
+ * The value of `promise`, which must settle without the fake clock moving: an answer that
+ * would wait for a timer (a request accepted instead of refused) fails the test at once
+ * instead of leaving it pending.
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {string} [label]
+ * @returns {Promise<T>}
+ */
+export async function promptly(promise, label = 'the answer came without waiting for the clock') {
+  let settled = false;
+  promise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  const giveUpAt = performance.now() + 5000;
+  while (!settled) {
+    if (performance.now() > giveUpAt) assert.fail(label);
+    await tick();
+  }
+  return promise;
 }
 
 /** A clock whose timers only fire when the test advances it. */

@@ -4,6 +4,9 @@
   "private": true,
   "description": "Claude connector relay for DroidBridge: a Cloudflare Worker + Durable Object you deploy to your own account.",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "test": "node --test",
     "deploy": "npx wrangler@4 deploy"

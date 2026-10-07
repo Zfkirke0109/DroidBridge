@@ -340,3 +340,73 @@ test('a replayed refresh token revokes even with a wrong client_id; garbage toke
   assert.equal(replay.status, 400);
   assert.equal(await tokenWorks(t, rotated.access_token), false);
 });
+
+test('an expired refresh token gets the same answer however often it comes, and claims no use', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  const day = 24 * 60 * 60 * 1000;
+  /** @param {string} token */
+  const refresh = async (token) => {
+    const res = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: token, client_id: tokens.clientId });
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.equal(body.error, 'invalid_grant');
+    return body.error_description;
+  };
+  // A sweep runs 30 s before the grant expires, so the next one is due only after it expired.
+  await t.clock.advance(30 * day - 30_000);
+  await refresh('garbage');
+  await t.clock.advance(31_000);
+  assert.equal(t.storage.keys('family:').length, 1, 'the expired grant is not swept yet');
+
+  // Never used, now expired: the same answer every time, never "already used".
+  for (let i = 0; i < 3; i += 1) {
+    assert.equal(await refresh(tokens.refresh_token), 'The refresh token has expired.');
+  }
+  // Once the sweep has purged the grant the token is simply unknown.
+  await t.clock.advance(60_000);
+  assert.equal(await refresh(tokens.refresh_token), 'The refresh token is not valid.');
+  assert.equal(t.storage.keys('family:').length + t.storage.keys('rt:').length, 0);
+});
+
+test('a rotated refresh token that comes back after its grant expired revokes nothing and claims no revocation', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  const day = 24 * 60 * 60 * 1000;
+  /** @param {string} token */
+  const refresh = (token) =>
+    tokenPost(t, { grant_type: 'refresh_token', refresh_token: token, client_id: tokens.clientId });
+  const rotated = await (await refresh(tokens.refresh_token)).json();
+  assert.ok(rotated.refresh_token);
+  await t.clock.advance(30 * day - 30_000);
+  await refresh('garbage'); // runs the sweep
+  await t.clock.advance(31_000);
+
+  const replay = await refresh(tokens.refresh_token);
+  assert.equal(replay.status, 400);
+  assert.equal((await replay.json()).error_description, 'The refresh token is not valid.');
+  assert.equal(t.storage.keys('family:').length, 1, 'nothing revoked; the sweep purges it');
+  const latest = await refresh(rotated.refresh_token);
+  assert.equal((await latest.json()).error_description, 'The refresh token has expired.');
+
+  // While the grant is live, the same replay revokes it (see the tests above).
+  const live = makeRelay();
+  const liveTokens = await obtainTokens(live);
+  const liveRotated = await (
+    await tokenPost(live, { grant_type: 'refresh_token', refresh_token: liveTokens.refresh_token, client_id: liveTokens.clientId })
+  ).json();
+  await live.clock.advance(30 * day - 1000);
+  const liveReplay = await tokenPost(live, {
+    grant_type: 'refresh_token',
+    refresh_token: liveTokens.refresh_token,
+    client_id: liveTokens.clientId,
+  });
+  assert.equal((await liveReplay.json()).error_description, 'The refresh token was already used. The grant was revoked.');
+  assert.equal(live.storage.keys('family:').length, 0);
+  const afterRevoke = await tokenPost(live, {
+    grant_type: 'refresh_token',
+    refresh_token: liveRotated.refresh_token,
+    client_id: liveTokens.clientId,
+  });
+  assert.equal(afterRevoke.status, 400);
+});

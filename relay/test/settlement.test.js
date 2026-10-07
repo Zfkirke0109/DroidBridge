@@ -3,9 +3,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { DEVICE_RESPONSE_LIMIT_BYTES } from '../src/device.js';
+import { encodeCommand } from '../src/hub.js';
 import { MCP_BODY_LIMIT_BYTES, MCP_MAX_DEPTH } from '../src/mcp.js';
 import { readConfig } from '../src/relay.js';
-import { makeRelay, mcp, obtainTokens, poll, respond, toolsCall, waitFor } from './helpers.js';
+import { makeRelay, mcp, obtainTokens, poll, promptly, respond, tick, toolsCall, waitFor } from './helpers.js';
 
 /** @param {ReturnType<typeof makeRelay>} t */
 async function deliverOne(t, token, message = toolsCall(1)) {
@@ -212,7 +213,7 @@ test('a response for a command still in the hand-off list (never delivered) is 4
   const answer = mcp(t, token, toolsCall());
   await waitFor(() => t.relay.hub.inspect().handoff === 1);
   const entry = [...t.relay.hub.entries.values()][0];
-  assert.equal((await respond(t, entry.command)).status, 404);
+  assert.equal((await respond(t, JSON.parse(entry.wire))).status, 404);
   await t.clock.advance(5000);
   assert.equal((await answer).status, 503);
 });
@@ -437,17 +438,25 @@ test('a relay failure after the command was offered but before delivery is HTTP 
   assert.equal(t.clock.pendingTimers(), 0);
 });
 
+/**
+ * Makes the MCP handler fail once its request has an outcome, the way a bug or a reset while
+ * answering would: after the phone's reply settled the delivered request.
+ * @param {ReturnType<typeof makeRelay>} t
+ */
+function failAfterOutcome(t) {
+  const submit = t.relay.hub.submit.bind(t.relay.hub);
+  t.relay.hub.submit = (...args) =>
+    submit(...args).then(() => {
+      throw new RangeError('answer failure');
+    });
+}
+
 test('a relay failure while answering a delivered request is HTTP 200 -32002 delivered:true, never a 5xx', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
+  failAfterOutcome(t);
   const { answer, command } = await deliverOne(t, token, toolsCall('deep'));
-  // A reply that parses but is too deeply nested to encode again for Claude.
-  const depth = 100_000;
-  const raw =
-    `{"request_id":${JSON.stringify(command.request_id)},"channel":"main","resp_code":200,` +
-    `"resp_type":"jsonrpc_response","resp_json":{"jsonrpc":"2.0","id":"deep","result":` +
-    `${'['.repeat(depth)}${']'.repeat(depth)}}}`;
-  assert.equal((await sendRaw(t, raw, command.shard_token)).status, 200);
+  assert.equal((await respond(t, command)).status, 200);
   const res = await answer;
   assert.equal(res.status, 200);
   const body = await res.json();
@@ -495,6 +504,21 @@ function nestedCall(/** @type {string} */ id, /** @type {number} */ depth) {
     `"arguments":{"x":${'['.repeat(arrays)}${']'.repeat(arrays)}}}}`;
 }
 
+/** The same, nesting objects instead of arrays: `{"a":{"a":…{}}}` from level 4 on. */
+function nestedObjectCall(/** @type {string} */ id, /** @type {number} */ depth) {
+  const objects = depth - 3;
+  return `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"method":"tools/call","params":{"name":"command",` +
+    `"arguments":${'{"a":'.repeat(objects)}{}${'}'.repeat(objects)}}}`;
+}
+
+/** Alternating objects and arrays: `{"a":[{"a":[…]}]}`, `depth` levels in all. */
+function nestedMixedCall(/** @type {string} */ id, /** @type {number} */ depth) {
+  let inner = '0';
+  for (let level = depth; level > 3; level -= 1) inner = level % 2 === 0 ? `{"a":${inner}}` : `[${inner}]`;
+  return `{"jsonrpc":"2.0","id":${JSON.stringify(id)},"method":"tools/call","params":{"name":"command",` +
+    `"arguments":{"x":${inner}}}}`;
+}
+
 test('a request the phone could not parse is refused with 400 before delivery, and never spoils a poll for others', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
@@ -510,12 +534,22 @@ test('a request the phone could not parse is refused with 400 before delivery, a
     ['surrogate in a member name', '{"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"\\ud800":1}}', /member name contains an unpaired/],
     ['surrogate in the method', '{"jsonrpc":"2.0","id":"e","method":"tools/\\udbff"}', /unpaired UTF-16 surrogate/],
     ['one level too deep', nestedCall('e', MCP_MAX_DEPTH + 1), /nested more than 64 levels/],
+    ['objects one level too deep', nestedObjectCall('e', MCP_MAX_DEPTH + 1), /nested more than 64 levels/],
+    ['objects and arrays one level too deep', nestedMixedCall('e', MCP_MAX_DEPTH + 1), /nested more than 64 levels/],
+    ['5,000 levels of objects', nestedObjectCall('e', 5000), /nested more than 64 levels/],
     ['the phone parser limit', nestedCall('e', 124), /nested more than 64 levels/],
+    // JSON.parse keeps only the last of repeated members, but the phone reads the whole text.
+    ['a cut emoji in a repeated member', '{"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"t":"\\ud83d","t":"ok"}}', /unpaired UTF-16 surrogate/],
+    [
+      'deep nesting in a repeated member',
+      `{"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"name":"command","arguments":{"x":${'['.repeat(67)}${']'.repeat(67)}},"arguments":{}}}`,
+      /nested more than 64 levels/,
+    ],
     ['5,000 levels', nestedCall('e', 5000), /nested more than 64 levels/],
     ['100,000 levels', nestedCall('e', 100_000), /nested more than 64 levels/],
   ];
   for (const [label, body, message] of refused) {
-    const res = await mcp(t, token, body);
+    const res = await promptly(mcp(t, token, body), `${label}: refused at once`);
     assert.equal(res.status, 400, label);
     const reply = await res.json();
     assert.equal(reply.id, 'e', label);
@@ -523,7 +557,7 @@ test('a request the phone could not parse is refused with 400 before delivery, a
     assert.match(reply.error.message, message, label);
     assert.equal(reply.error.data, undefined, label);
     // A notification gets the status only.
-    const note = await mcp(t, token, body.replace('"id":"e",', ''));
+    const note = await promptly(mcp(t, token, body.replace('"id":"e",', '')), `${label} (notification)`);
     assert.equal(note.status, 400, `${label} (notification)`);
     assert.equal(await note.text(), '');
   }
@@ -531,59 +565,127 @@ test('a request the phone could not parse is refused with 400 before delivery, a
 
   // At the limit, and a correctly paired emoji, are accepted. The poll response the phone gets
   // stays well inside serde_json's 128-level limit and carries no lone surrogate escape.
-  const deepest = mcp(t, token, nestedCall('deepest', MCP_MAX_DEPTH));
-  const emoji = mcp(t, token, '{"jsonrpc":"2.0","id":"emoji","method":"tools/call","params":{"text":"\\ud83d\\ude00 ok"}}');
-  await waitFor(() => t.relay.hub.inspect().handoff === 3);
+  /** @type {Promise<Response>[]} */
+  const accepted = [];
+  for (const body of [
+    nestedCall('deepest', MCP_MAX_DEPTH),
+    '{"jsonrpc":"2.0","id":"emoji","method":"tools/call","params":{"text":"\\ud83d\\ude00 ok"}}',
+    nestedObjectCall('objects', MCP_MAX_DEPTH),
+    nestedMixedCall('mixed', MCP_MAX_DEPTH),
+  ]) {
+    accepted.push(mcp(t, token, body));
+    await waitFor(() => t.relay.hub.inspect().handoff === accepted.length + 1);
+  }
   const pollRes = await poll(t, 0);
   assert.equal(pollRes.status, 200);
   const text = await pollRes.text();
   assert.doesNotMatch(text, /\\ud[89ab][0-9a-f]{2}(?!\\ud[c-f])/i, 'no unpaired high surrogate escape');
   const { commands } = JSON.parse(text);
-  assert.deepEqual(commands.map((command) => command.jsonrpc.id), ['innocent', 'deepest', 'emoji']);
+  assert.deepEqual(commands.map((command) => command.jsonrpc.id), ['innocent', 'deepest', 'emoji', 'objects', 'mixed']);
   assert.equal(depthOf(commands[1].jsonrpc), MCP_MAX_DEPTH);
+  assert.equal(depthOf(commands[3].jsonrpc), MCP_MAX_DEPTH);
+  assert.equal(depthOf(commands[4].jsonrpc), MCP_MAX_DEPTH);
   assert.equal(depthOf(JSON.parse(text)), MCP_MAX_DEPTH + 3);
   assert.equal(commands[2].jsonrpc.params.text, '\u{1F600} ok');
   for (const command of commands) assert.equal((await respond(t, command)).status, 200);
-  for (const answer of [innocent, deepest, emoji]) assert.equal((await answer).status, 200);
+  for (const answer of [innocent, ...accepted]) assert.equal((await answer).status, 200);
   assert.equal(t.relay.hub.inspect().inFlight, 0);
 });
 
-test('a request larger than the limit once encoded for the phone is refused with 413 before delivery', async () => {
+test('the phone gets each request as the text Claude sent: eight at the body limit fit one poll response', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);
   assert.equal((await poll(t, 0)).status, 204);
-  // "1e20" (4 bytes) is encoded as 100000000000000000000 (21 bytes): under the body limit as
-  // sent, more than four times over it once encoded.
-  const count = Math.floor((MCP_BODY_LIMIT_BYTES - 200) / 5);
-  const body = `{"jsonrpc":"2.0","id":"big","method":"tools/call","params":{"n":[${Array(count).fill('1e20').join(',')}]}}`;
-  assert.ok(new TextEncoder().encode(body).byteLength <= MCP_BODY_LIMIT_BYTES);
-  const res = await mcp(t, token, body);
+  const encoder = new TextEncoder();
+  /**
+   * A tools/call of exactly MCP_BODY_LIMIT_BYTES bytes: CJK text (3 bytes per character in
+   * UTF-8, one UTF-16 unit) and the number 1e20 (4 bytes as written, 21 if it were re-encoded
+   * as 100000000000000000000).
+   * @param {number} id
+   */
+  function atLimit(id) {
+    const head = `{"jsonrpc":"2.0","id":${id},"method":"tools/call","params":{"name":"command","arguments":{"t":"`;
+    const middle = `${'\u4e2d'.repeat(20_000)}","n":[`;
+    const tail = ']}}}';
+    const room = MCP_BODY_LIMIT_BYTES - encoder.encode(head + middle + tail).byteLength;
+    const count = Math.floor((room + 1) / 5);
+    const numbers = Array(count).fill('1e20').join(',');
+    const pad = ' '.repeat(room - numbers.length);
+    const body = head + middle + numbers + tail + pad;
+    assert.equal(encoder.encode(body).byteLength, MCP_BODY_LIMIT_BYTES);
+    return body;
+  }
+  const bodies = Array.from({ length: 8 }, (_, i) => atLimit(i + 1));
+  /** @type {Promise<Response>[]} */
+  const answers = [];
+  for (const body of bodies) {
+    answers.push(mcp(t, token, body));
+    await waitFor(() => t.relay.hub.inspect().handoff === answers.length);
+  }
+
+  const pollRes = await poll(t, 0);
+  assert.equal(pollRes.status, 200);
+  const bytes = new Uint8Array(await pollRes.arrayBuffer());
+  // The phone drops a whole poll response above MAX_POLL_BODY_BYTES
+  // (rust/crates/app_native/src/tunnel.rs: MCP_BODY_LIMIT_BYTES * 25 + 64 KiB).
+  assert.ok(bytes.byteLength <= MCP_BODY_LIMIT_BYTES * 25 + 64 * 1024, `poll body of ${bytes.byteLength} bytes`);
+  assert.ok(bytes.byteLength < MCP_BODY_LIMIT_BYTES * 8 + 8 * 1024, 'nothing was re-encoded larger');
+  const text = new TextDecoder().decode(bytes);
+  for (const body of bodies) assert.ok(text.includes(`"jsonrpc":${body}}`), 'the message text is forwarded as sent');
+  const { commands } = JSON.parse(text);
+  assert.deepEqual(commands.map((command) => command.jsonrpc.id), [1, 2, 3, 4, 5, 6, 7, 8]);
+  for (const command of commands) assert.equal((await respond(t, command)).status, 200);
+  for (const answer of answers) assert.equal((await answer).status, 200);
+
+  // One byte more is refused, counted in UTF-8 bytes: this body has far fewer UTF-16 units
+  // (characters as JavaScript counts them) than the limit.
+  const over = `${atLimit(9)} `;
+  assert.ok(over.length < MCP_BODY_LIMIT_BYTES);
+  assert.equal(encoder.encode(over).byteLength, MCP_BODY_LIMIT_BYTES + 1);
+  const res = await mcp(t, token, over);
   assert.equal(res.status, 413);
-  const reply = await res.json();
-  assert.equal(reply.id, 'big');
-  assert.equal(reply.error.code, -32600);
-  assert.match(reply.error.message, /larger than 262144 bytes once encoded/);
-  const note = await mcp(t, token, body.replace('"id":"big",', ''));
-  assert.equal(note.status, 413);
-  assert.equal(await note.text(), '');
+  assert.equal((await res.json()).error.code, -32600);
   assert.equal(t.relay.hub.inspect().inFlight, 0);
   assert.equal((await poll(t, 0)).status, 204, 'nothing was handed off');
 });
 
 test('the hub encodes a command when it is submitted: one that cannot be encoded changes nothing', async () => {
   const t = makeRelay();
+  const options = { configured: true, settleWithinMs: 1000 };
+  const unencodable = { request_id: 'r', shard_token: 's', n: 1n };
+
+  // Between polls (online, nothing parked): it never joins the hand-off list.
+  assert.equal((await poll(t, 0)).status, 204);
+  const before = t.relay.hub.inspect();
+  assert.throws(() => t.relay.hub.submit(unencodable, '{}', options), TypeError);
+  assert.deepEqual(t.relay.hub.inspect(), before);
+  assert.equal(t.clock.pendingTimers(), 0, 'no hand-off timer was armed');
+  assert.equal((await poll(t, 0)).status, 204, 'the next poll gets nothing');
+
+  // A parked poll: it stays parked and still gets the next command.
   const parked = poll(t);
   await waitFor(() => t.relay.hub.inspect().parked);
-  const options = { configured: true, settleWithinMs: 1000 };
-  assert.throws(() => t.relay.hub.submit({ request_id: 'r', shard_token: 's', jsonrpc: { n: 1n } }, options), TypeError);
-  assert.deepEqual(t.relay.hub.inspect(), { parked: true, handoff: 0, delivered: 0, inFlight: 0, lastPollEndedAt: null });
-  // The poll stays parked and still gets the next command.
-  const outcome = t.relay.hub.submit({ request_id: 'ok', shard_token: 's', jsonrpc: { jsonrpc: '2.0', method: 'x' } }, options);
+  assert.throws(() => t.relay.hub.submit(unencodable, '{}', options), TypeError);
+  assert.equal(t.relay.hub.inspect().parked, true);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  const outcome = t.relay.hub.submit({ request_id: 'ok', shard_token: 's' }, '{"jsonrpc":"2.0","method":"x"}', options);
   const res = await parked;
   assert.equal(res.status, 200);
-  assert.equal((await res.json()).commands[0].request_id, 'ok');
+  assert.equal(await res.text(), '{"commands":[{"request_id":"ok","shard_token":"s","jsonrpc":{"jsonrpc":"2.0","method":"x"}}]}');
   await t.clock.advance(1000);
   assert.deepEqual(await outcome, { kind: 'unknown' });
+});
+
+test('encodeCommand adds the message text as the jsonrpc member, unchanged', () => {
+  const message = '{"jsonrpc":"2.0","id":9007199254740993,"method":"x","params":{"n":1e400,"z":-0}}';
+  assert.equal(
+    encodeCommand({ request_id: 'r', headers: { A: ['b'] } }, message),
+    `{"request_id":"r","headers":{"A":["b"]},"jsonrpc":${message}}`,
+  );
+  assert.equal(encodeCommand({}, '{}'), '{"jsonrpc":{}}');
+  assert.throws(() => encodeCommand({ jsonrpc: {} }, '{}'), TypeError);
+  assert.throws(() => encodeCommand({ request_id: 'r' }, /** @type {any} */ ({ jsonrpc: '2.0' })), TypeError);
+  assert.throws(() => encodeCommand(/** @type {any} */ ([]), '{}'), TypeError);
 });
 
 test('a timer failure while handing a command to a parked poll delivers nothing and leaves the poll parked', async () => {
@@ -660,6 +762,122 @@ test('a timer failure on a poll with no later poll ends every waiting request as
     assert.deepEqual((await res.json()).error.data.droidbridge_relay, { state: 'unavailable', delivered: false });
   }
   assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal(t.clock.pendingTimers(), 0);
+});
+
+/**
+ * Makes the next clearTimeout call throw once.
+ * @param {ReturnType<typeof makeRelay>} t
+ */
+function failNextClear(t) {
+  const original = t.clock.api.clearTimeout;
+  t.clock.api.clearTimeout = () => {
+    t.clock.api.clearTimeout = original;
+    throw new Error('clearTimeout failure');
+  };
+}
+
+/**
+ * Whether `promise` settles within a few turns of the event loop (no clock time passes).
+ * @param {Promise<unknown>} promise
+ */
+async function settlesSoon(promise, turns = 200) {
+  let done = false;
+  promise.then(
+    () => {
+      done = true;
+    },
+    () => {
+      done = true;
+    },
+  );
+  for (let i = 0; i < turns && !done; i += 1) await tick();
+  return done;
+}
+
+test('a timer that cannot be cleared never strands a request, and does nothing when it fires later', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+
+  // The deadline of a request the phone answers.
+  const { answer, command } = await deliverOne(t, token, toolsCall('settle'));
+  failNextClear(t);
+  assert.equal((await respond(t, command)).status, 200, 'the phone\'s reply is accepted');
+  assert.ok(await settlesSoon(answer), 'Claude is answered');
+  const res = await answer;
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { jsonrpc: '2.0', id: 'settle', result: { ok: true } });
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+
+  // The timeout of a parked poll that a request ends. Its stale timer later fires while a newer
+  // poll is parked, and leaves that poll alone.
+  const parked = poll(t, 15_000);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  failNextClear(t);
+  const second = mcp(t, token, toolsCall('parked'));
+  const pollRes = await parked;
+  assert.equal(pollRes.status, 200);
+  const [parkedCommand] = (await pollRes.json()).commands;
+  assert.equal(parkedCommand.jsonrpc.id, 'parked');
+  await t.clock.advance(1000);
+  const next = poll(t, 15_000);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  await t.clock.advance(14_500); // past the first poll's timeout, not the second's
+  assert.equal(t.relay.hub.inspect().parked, true, 'the newer poll is still parked');
+  assert.equal((await respond(t, parkedCommand)).status, 200);
+  assert.equal((await second).status, 200);
+
+  // The hand-off timer of a request a poll takes. It fires after the request was delivered and
+  // does not end it as unavailable.
+  await t.clock.advance(1000);
+  assert.equal((await next).status, 204);
+  const third = mcp(t, token, toolsCall('handoff'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+  failNextClear(t);
+  const taken = await poll(t, 0);
+  assert.equal(taken.status, 200);
+  const [handoffCommand] = (await taken.json()).commands;
+  await t.clock.advance(5000);
+  assert.equal(await settlesSoon(third, 20), false, 'still waiting for the phone');
+  assert.equal((await respond(t, handoffCommand)).status, 200);
+  assert.equal((await third).status, 200);
+
+  // Every stale timer has fired by now and changed nothing.
+  await t.clock.advance(250_000);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal(t.clock.pendingTimers(), 0);
+});
+
+test('a deadline left over from a failed poll never ends the request that a later poll delivered', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204);
+  const first = mcp(t, token, toolsCall('b1'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+  const second = mcp(t, token, toolsCall('b2'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 2);
+  // The poll arms b1's deadline, fails to arm b2's, and cannot clear b1's: that timer stays.
+  failNthTimer(t, 2);
+  failNextClear(t);
+  assert.equal((await poll(t, 0)).status, 500);
+  assert.equal(t.relay.hub.inspect().delivered, 0);
+
+  // 3 s later a poll delivers both with fresh deadlines (245 s from now).
+  await t.clock.advance(3000);
+  const pollRes = await poll(t, 0);
+  assert.equal(pollRes.status, 200);
+  const { commands } = await pollRes.json();
+  assert.deepEqual(commands.map((command) => command.jsonrpc.id), ['b1', 'b2']);
+
+  // The stale deadline fires (245 s after the failed poll), 3 s before b1's real one.
+  await t.clock.advance(244_000);
+  assert.equal(await settlesSoon(first, 20), false, 'b1 is not ended before its deadline');
+  assert.equal((await respond(t, commands[0])).status, 200, 'the phone\'s reply is still accepted');
+  const res = await first;
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { jsonrpc: '2.0', id: 'b1', result: { ok: true } });
+  assert.equal((await respond(t, commands[1])).status, 200);
+  assert.equal((await second).status, 200);
   assert.equal(t.clock.pendingTimers(), 0);
 });
 

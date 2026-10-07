@@ -665,12 +665,17 @@ export class OAuthServer {
     }
     const key = `rt:${await sha256Hex(refreshToken)}`;
     const record = await this.storage.get(key);
+    const now = this.relay.now();
     if (!record || record.used) {
       // A rotated refresh token came back: someone holds a copy. Revoke the whole grant. Its
       // record may already be trimmed or purged, so the family id inside the token decides.
-      // This runs before the client check so a replay with any client_id still revokes.
+      // This runs before the client check so a replay with any client_id still revokes. Only a
+      // live grant counts: a family past its expiry (its newest refresh token has expired, so
+      // none of its tokens is live) is just waiting for the sweep, and there is nothing to
+      // revoke.
       const familyId = record ? record.family : refreshTokenFamily(refreshToken);
-      if (familyId && (await this.storage.get(`family:${familyId}`))) {
+      const family = familyId ? await this.storage.get(`family:${familyId}`) : undefined;
+      if (family && typeof family.expiresAt === 'number' && family.expiresAt > now) {
         await this.relay.grants.revokeFamily(familyId);
         return tokenError(400, 'invalid_grant', 'The refresh token was already used. The grant was revoked.');
       }
@@ -679,8 +684,9 @@ export class OAuthServer {
     if (!(await this.#clientKnown(clientId))) {
       return tokenError(401, 'invalid_client', 'The client is not known to this relay.');
     }
-    if (record.expiresAt <= this.relay.now()) {
-      await this.storage.delete(key);
+    if (record.expiresAt <= now) {
+      // The record stays until the sweep purges it with its family, so presenting the token
+      // again gets this same answer, never one that claims it was used.
       return tokenError(400, 'invalid_grant', 'The refresh token has expired.');
     }
     if (record.client_id !== clientId) {
