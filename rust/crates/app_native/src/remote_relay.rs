@@ -474,10 +474,18 @@ pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime
 #[cfg(test)]
 mod tests {
     use super::*;
+    use contract::ErrorCode;
+    use domain::DomainError;
+    use runtime::{MCP_DEBUG_PORT, McpArtifactReply, PortFuture};
     use std::{
         io::{Read, Write},
-        net::{TcpListener, TcpStream},
+        net::{SocketAddr, TcpListener, TcpStream},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
         thread,
+        time::Instant,
     };
 
     const DEVICE_KEY: &str = "dbrk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -535,18 +543,43 @@ mod tests {
 
     #[test]
     fn relay_requires_https_origin_and_a_device_key() {
-        assert!(RelayEndpoint::parse("https://relay.example.com").is_some());
+        for valid in [
+            "https://relay.example.com",
+            "https://relay.example.com/",
+            "https://relay.example.com:8443",
+        ] {
+            assert_eq!(
+                RelayEndpoint::parse(valid)
+                    .unwrap()
+                    .route("device/v1/poll")
+                    .unwrap()
+                    .path(),
+                "/device/v1/poll",
+            );
+        }
         for invalid in [
+            "",
+            "http://relay.example.com",
             "http://127.0.0.1:8765",
             "https://user:secret@relay.example.com",
             "https://relay.example.com/?key=secret",
+            "https://relay.example.com/#fragment",
             "https://relay.example.com/mcp",
+            "ftp://relay.example.com",
+            "relay.example.com",
+            &format!("https://{}.example.com", "a".repeat(250)),
         ] {
             assert!(RelayEndpoint::parse(invalid).is_none(), "{invalid}");
         }
+        assert!(RelayEndpoint::parse_with("http://127.0.0.1:9/", true).is_some());
+        assert!(RelayEndpoint::parse_with("http://example.com/", true).is_none());
         assert!(valid_device_key(DEVICE_KEY));
         assert!(!valid_device_key("dbrk_short"));
+        assert!(!valid_device_key(
+            "dbrk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+"
+        ));
         assert!(valid_code_hash(CODE_HASH));
+        assert!(!valid_code_hash(&CODE_HASH.to_uppercase()));
     }
 
     #[test]
@@ -604,5 +637,208 @@ mod tests {
                 .unwrap()
                 .starts_with("POST /device/v1/revoke ")
         );
+
+        let endpoint = loopback("http://127.0.0.1:9/");
+        for (hash, ttl, key) in [
+            ("invalid", 600, DEVICE_KEY),
+            (CODE_HASH, 0, DEVICE_KEY),
+            (CODE_HASH, 601, DEVICE_KEY),
+            (CODE_HASH, 600, "dbrk_bad"),
+        ] {
+            assert_eq!(pair(&endpoint, key, hash, ttl, "0.5.1"), CALL_UNAVAILABLE);
+        }
+    }
+
+    #[test]
+    fn malformed_origin_and_device_key_are_refused_before_network_io() {
+        assert_eq!(
+            with_endpoint("http://127.0.0.1:9/", |_| unreachable!()),
+            CALL_INVALID_RELAY,
+        );
+        let facade =
+            McpFacade::new(CountingHost::default(), MCP_DEBUG_PORT, "0.5.1".to_owned()).unwrap();
+        assert!(matches!(
+            relay_client(
+                facade,
+                &loopback("http://127.0.0.1:9/"),
+                "sk-not-a-device-key",
+                "0.5.1",
+            ),
+            Err(TunnelError::InvalidConfig(_)),
+        ));
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingHost(Arc<AtomicUsize>);
+
+    impl McpHost for CountingHost {
+        fn submit<'a>(&'a self, envelope: Vec<u8>) -> PortFuture<'a, Result<Vec<u8>, DomainError>> {
+            Box::pin(async move {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                let request: Value = serde_json::from_slice(&envelope).unwrap();
+                Ok(serde_json::to_vec(&json!({
+                    "protocol_version": 1,
+                    "request_id": request["request_id"],
+                    "outcome": "success",
+                    "result": {"tasks": []},
+                }))
+                .unwrap())
+            })
+        }
+
+        fn artifact_query<'a>(
+            &'a self,
+            _query: Value,
+        ) -> PortFuture<'a, Result<McpArtifactReply, DomainError>> {
+            Box::pin(async { Err(DomainError::new(ErrorCode::IoError, "no artifacts here")) })
+        }
+    }
+
+    struct ScriptedRelay {
+        base_url: String,
+        address: SocketAddr,
+        captured: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ScriptedRelay {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let requests = Arc::clone(&captured);
+            let stop = Arc::new(AtomicBool::new(false));
+            let halted = Arc::clone(&stop);
+            let handle = thread::spawn(move || {
+                let mut polls = 0;
+                loop {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    if halted.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let request = read_request(&mut stream);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split(' ').nth(1))
+                        .unwrap_or_default()
+                        .to_owned();
+                    requests.lock().unwrap().push(request);
+                    let (status, body) = if path.starts_with("/device/v1/poll?limit=") {
+                        polls += 1;
+                        if polls == 1 {
+                            (200, json!({"commands": [relay_tools_call()]}).to_string())
+                        } else {
+                            thread::sleep(Duration::from_millis(10));
+                            (204, String::new())
+                        }
+                    } else if path == "/device/v1/response" {
+                        (200, "{}".to_owned())
+                    } else {
+                        panic!("unexpected relay route: {path}");
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} Result\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                }
+            });
+            Self {
+                base_url: format!("http://{address}/"),
+                address,
+                captured,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn response_count(&self) -> usize {
+            self.captured
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.starts_with("POST /device/v1/response "))
+                .count()
+        }
+
+        fn finish(mut self) -> Vec<String> {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            self.handle.take().unwrap().join().unwrap();
+            self.captured.lock().unwrap().clone()
+        }
+    }
+
+    fn relay_tools_call() -> Value {
+        json!({
+            "request_id": "req_relay",
+            "shard_token": "shard-secret",
+            "command_type": "jsonrpc",
+            "channel": "main",
+            "created_at": "2026-09-15T00:00:00Z",
+            "headers": {
+                "MCP-Protocol-Version": ["2026-07-28"],
+                "Mcp-Method": ["tools/call"],
+                "Mcp-Name": ["task_control"],
+            },
+            "jsonrpc": {
+                "jsonrpc": "2.0",
+                "id": "rpc_relay",
+                "method": "tools/call",
+                "params": {
+                    "name": "task_control",
+                    "arguments": {"action": "list", "input": {}},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn relay_client_authenticates_poll_and_response_and_runs_once() {
+        let host = CountingHost::default();
+        let relay = ScriptedRelay::start();
+        let client = relay_client(
+            McpFacade::new(host.clone(), MCP_DEBUG_PORT, "0.5.1".to_owned()).unwrap(),
+            &loopback(&relay.base_url),
+            DEVICE_KEY,
+            "0.5.1",
+        )
+        .unwrap();
+        let running = TunnelRuntime::start(client).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while relay.response_count() < 1 {
+            assert!(Instant::now() < deadline, "relay response was never sent");
+            thread::sleep(Duration::from_millis(10));
+        }
+        running.stop();
+        let requests = relay.finish();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.starts_with("GET /device/v1/poll?limit="))
+        );
+        let responses: Vec<&String> = requests
+            .iter()
+            .filter(|request| request.starts_with("POST /device/v1/response "))
+            .collect();
+        assert_eq!(responses.len(), 1);
+        assert!(requests.iter().all(|request| request.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization")
+                    && value.trim() == format!("Bearer {DEVICE_KEY}")
+            })
+        })));
+        let body: Value =
+            serde_json::from_str(responses[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["request_id"], "req_relay");
+        assert_eq!(body["resp_type"], "jsonrpc_response");
+        assert_eq!(body["resp_json"]["id"], "rpc_relay");
+        assert_eq!(host.0.load(Ordering::SeqCst), 1);
     }
 }
