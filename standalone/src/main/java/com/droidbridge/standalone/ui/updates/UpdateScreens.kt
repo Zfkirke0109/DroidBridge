@@ -249,4 +249,3 @@ private fun Action(@StringRes text: Int, tag: String, enabled: Boolean, onClick:
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).heightIn(min = 56.dp).testTag("updates:$tag"),
     ) { Text(stringResource(text)) }
 }
-

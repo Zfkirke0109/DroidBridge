@@ -39,17 +39,22 @@ impl KotlinMcpHost {
         &self,
         call: impl FnOnce() -> Result<T, DomainError> + Send + 'static,
     ) -> Result<T, DomainError> {
-        let _permit = self.permits.acquire().await.map_err(|_| {
-            DomainError::new(ErrorCode::CapabilityUnavailable, "MCP host is closed")
-        })?;
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                DomainError::new(ErrorCode::CapabilityUnavailable, "MCP host is closed")
+            })?;
         let (sender, receiver) = oneshot::channel();
         // A plain thread rather than `spawn_blocking`: the host call can block on the APK
         // Runtime's own executor, which refuses to start inside another Tokio runtime context.
         std::thread::Builder::new()
             .name("droidbridge-mcp-host".to_owned())
             .spawn(move || {
-                // A departed client drops the receiver; the reply and any descriptor close here.
-                let _ = sender.send(call());
+                // Keep capacity until the host thread actually exits. The async waiter can be
+                // cancelled at a relay deadline while a JNI call is still running.
+                let _permit = permit;
+                complete_host_call(sender, call);
             })
             .map_err(|_| DomainError::new(ErrorCode::ResourceLimit, "MCP host thread failed"))?;
         receiver.await.map_err(|_| {
@@ -59,6 +64,19 @@ impl KotlinMcpHost {
             )
         })?
     }
+}
+
+fn complete_host_call<T>(
+    sender: oneshot::Sender<Result<T, DomainError>>,
+    call: impl FnOnce() -> Result<T, DomainError>,
+) {
+    // A thread scheduled after its client departed must not begin a new JNI call. Once the
+    // call has begun, its result may still be unknown to the departed client.
+    if sender.is_closed() {
+        return;
+    }
+    // A departed client drops the receiver; the reply and any descriptor close here.
+    let _ = sender.send(call());
 }
 
 pub(crate) fn initialize_host_bridge(env: &mut jni::Env<'_>) -> jni::errors::Result<()> {
@@ -231,6 +249,98 @@ fn listener_slot() -> Result<std::sync::MutexGuard<'static, Option<McpListener>>
     LISTENER
         .lock()
         .map_err(|_| DomainError::new(ErrorCode::InternalError, "MCP listener slot is unavailable"))
+}
+
+#[cfg(test)]
+mod host_call_tests {
+    use super::*;
+    use std::sync::{Condvar, Mutex as StdMutex};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    struct ReleaseOnDrop(Arc<(StdMutex<bool>, Condvar)>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let (released, signal) = &*self.0;
+            *released.lock().unwrap() = true;
+            signal.notify_all();
+        }
+    }
+
+    #[test]
+    fn cancelled_waiter_does_not_begin_a_queued_host_call() {
+        let (sender, receiver) = oneshot::channel();
+        drop(receiver);
+        let mut called = false;
+        complete_host_call(sender, || {
+            called = true;
+            Ok(())
+        });
+        assert!(!called);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_host_calls_hold_capacity_until_their_threads_exit() {
+        let host = Arc::new(KotlinMcpHost::new());
+        let gate = ReleaseOnDrop(Arc::new((StdMutex::new(false), Condvar::new())));
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let mut calls = Vec::new();
+
+        for _ in 0..MAX_HOST_CALLS {
+            let host = Arc::clone(&host);
+            let gate = Arc::clone(&gate.0);
+            let started = started.clone();
+            calls.push(tokio::spawn(async move {
+                host.on_host_thread(move || {
+                    started.send(()).unwrap();
+                    let (released, signal) = &*gate;
+                    let mut open = released.lock().unwrap();
+                    while !*open {
+                        open = signal.wait(open).unwrap();
+                    }
+                    Ok(())
+                })
+                .await
+            }));
+        }
+        for _ in 0..MAX_HOST_CALLS {
+            tokio::time::timeout(Duration::from_secs(5), starts.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        for call in calls {
+            call.abort();
+            let _ = call.await;
+        }
+
+        let permits_while_blocked = host.permits.available_permits();
+        let extra = tokio::spawn({
+            let host = Arc::clone(&host);
+            let started = started.clone();
+            async move {
+                host.on_host_thread(move || {
+                    started.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+            }
+        });
+        let extra_started_while_blocked =
+            tokio::time::timeout(Duration::from_millis(100), starts.recv())
+                .await
+                .is_ok();
+
+        drop(gate);
+        tokio::time::timeout(Duration::from_secs(5), extra)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(permits_while_blocked, 0);
+        assert!(!extra_started_while_blocked);
+    }
 }
 
 fn start_listener(port: jint, token: String, product_version: String) -> Result<(), DomainError> {

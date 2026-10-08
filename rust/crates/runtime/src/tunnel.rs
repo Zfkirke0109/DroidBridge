@@ -48,7 +48,7 @@ const HEADER_SHARD_TOKEN: &str = "x-tunnel-shard-token";
 /// instead of reqwest's default policy. The default is the Android platform verifier, whose
 /// revocation pass reports genuine public chains without OCSP responders as revoked and refuses
 /// to connect, which is why the tunnel must not fall back to it.
-fn transport() -> reqwest::ClientBuilder {
+pub fn tunnel_transport() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
@@ -239,7 +239,7 @@ pub fn validate_tunnel_credentials(
         else {
             return "unavailable";
         };
-        let Ok(client) = transport().build() else {
+        let Ok(client) = tunnel_transport().build() else {
             return "unavailable";
         };
         let response = client
@@ -352,11 +352,31 @@ impl<H: McpHost + 'static> TunnelClient<H> {
         let response_url = base
             .join(&format!("v1/tunnels/{tunnel_id}/response"))
             .map_err(|_| TunnelError::InvalidConfig("response URL is invalid"))?;
+        Self::from_urls(facade, poll_url, response_url, api_key, product_version)
+    }
 
+    /// A client for an authenticated control plane using the tunnel's MCP wire format.
+    /// The caller validates the endpoint before passing its poll and response URLs.
+    pub fn from_urls(
+        facade: McpFacade<H>,
+        poll_url: Url,
+        response_url: Url,
+        bearer: &str,
+        product_version: &str,
+    ) -> Result<Self, TunnelError> {
+        if bearer.is_empty() || !bearer.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(TunnelError::InvalidConfig("bearer is invalid"));
+        }
+        if product_version.is_empty()
+            || product_version.len() > 64
+            || !product_version.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(TunnelError::InvalidConfig("product version is invalid"));
+        }
         let instance_id = Uuid::new_v4();
         let mut common_headers = HeaderMap::new();
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
-            .map_err(|_| TunnelError::InvalidConfig("API key is invalid"))?;
+        let mut authorization = HeaderValue::from_str(&format!("Bearer {bearer}"))
+            .map_err(|_| TunnelError::InvalidConfig("bearer is invalid"))?;
         authorization.set_sensitive(true);
         common_headers.insert(header::AUTHORIZATION, authorization);
         common_headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
@@ -380,7 +400,7 @@ impl<H: McpHost + 'static> TunnelClient<H> {
         insert_static_header(&mut common_headers, HEADER_SERVER_INFO, SERVER_INFO)?;
 
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = transport().build()?;
+        let http = tunnel_transport().build()?;
         Ok(Self {
             http,
             facade: Arc::new(facade),
@@ -1007,7 +1027,7 @@ fn insert_header(
     Ok(())
 }
 
-async fn read_bounded(
+pub async fn read_bounded(
     response: &mut reqwest::Response,
     limit: usize,
 ) -> Result<Vec<u8>, TunnelError> {

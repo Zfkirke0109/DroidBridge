@@ -1,5 +1,9 @@
 use crate::app_guard_recovery::{AppCleanupVerification, reconcile_app_recovery};
 use crate::automation_wake::ApkAlarmWake;
+use crate::host_health::{
+    HostHealthClass, bridge_fault_latched, classify_deep_probe, probe_descriptor_class,
+    probe_store_writable, with_try_canonical_lock,
+};
 use crate::{
     AndroidFrameworkFilesystemDispatcher, AndroidFrameworkFilesystemPort,
     AndroidShizukuFilesystemPort, ApkCommandProcessPort, ApkCore, ApkNetworkPort, ApkVisualPort,
@@ -100,11 +104,9 @@ impl HostControlPort for AppHostControl {
     }
 
     fn task_activity_changed(&self, active_tasks: usize, canonical_revision: u64) {
-        if let Err(error) = crate::publish_task_activity(
-            active_tasks,
-            canonical_revision,
-            &self.lease.live().runtime_epoch,
-        ) {
+        if let Err(error) =
+            crate::publish_task_activity(active_tasks, canonical_revision, self.lease.live())
+        {
             eprintln!(
                 "DroidBridge task activity projection failed: {:?}",
                 error.code
@@ -284,11 +286,7 @@ fn activate_app_host(
             )
         })
         .count();
-    crate::publish_task_activity(
-        active_tasks,
-        committed.store_revision,
-        &lease.live().runtime_epoch,
-    )?;
+    crate::publish_task_activity(active_tasks, committed.store_revision, lease.live())?;
     publish_ready_host(
         slot,
         base,
@@ -327,7 +325,7 @@ fn publish_ready_host(
         AndroidFrameworkFilesystemDispatcher,
         runtime.capability_port(runtime_instance_id.clone()),
     ));
-    spawn_automation_scheduler(
+    let automation_scheduler = spawn_automation_scheduler(
         &async_runtime,
         core.clone(),
         Arc::clone(&automation_wake),
@@ -352,7 +350,9 @@ fn publish_ready_host(
         runtime_instance_id: runtime_instance_id.clone(),
         product_version,
         admission_open: AtomicBool::new(admission_open),
+        quarantined: AtomicBool::new(false),
         automation_wake,
+        automation_scheduler,
     }));
     Ok(StartResult {
         ready: true,
@@ -363,21 +363,190 @@ fn publish_ready_host(
 }
 
 fn existing_host_result(host: &NativeHost) -> Result<StartResult, DomainError> {
-    host.store.validate_lease(&host._lease)?;
-    let capability = host
-        .runtime
-        .capability_port(host.runtime_instance_id.clone())
-        .current()?;
-    if crate::guard::is_quarantined()
-        || !host.admission_open.load(Ordering::SeqCst)
-        || capability.context.readiness != RuntimeReadiness::Ready
-    {
+    validate_host_instance(host, None)?;
+    if !host.admission_open.load(Ordering::SeqCst) {
         return Err(DomainError::new(
             ErrorCode::CapabilityUnavailable,
             "APK Runtime is not ready",
         ));
     }
     Ok(start_result(host._lease.live()))
+}
+
+/// Revalidates a cached App session without changing the native slot or closing read-only
+/// requests during planned maintenance. The lease and native capability fence must still name
+/// precisely the instance Kotlin previously adopted.
+pub(super) fn validate_existing_host(expected: &AdmissionFence) -> Result<(), DomainError> {
+    let host = host_slot()
+        .lock()
+        .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?
+        .clone()
+        .ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::CapabilityUnavailable,
+                "APK Runtime is not started",
+            )
+        })?;
+    validate_host_instance(&host, Some(expected))
+}
+
+/// A deep probe reads the canonical state, proves this instance's private directory can take a
+/// synced write, and checks the framework executor through the actual JNI bridge. It never runs
+/// an executor or changes canonical state.
+pub(super) fn probe_existing_host(expected: &AdmissionFence) -> HostHealthClass {
+    let Some(host) = host_slot().lock().ok().and_then(|slot| slot.clone()) else {
+        return HostHealthClass::HostMissing;
+    };
+    if !fence_names_live(expected, host._lease.live()) {
+        return HostHealthClass::FenceMismatch;
+    }
+    if let Err(error) = host.store.validate_lease(&host._lease) {
+        return if error.code == ErrorCode::StaleAuthority {
+            HostHealthClass::LeaseStale
+        } else {
+            HostHealthClass::StoreUnreadable
+        };
+    }
+    if probe_descriptor_class() != HostHealthClass::Healthy {
+        return HostHealthClass::ResourceExhausted;
+    }
+    if bridge_fault_latched(&host.runtime_instance_id) {
+        return HostHealthClass::BridgeFault;
+    }
+    match validate_host_instance(&host, Some(expected)) {
+        Ok(()) => {}
+        Err(error) if error.code == ErrorCode::StaleAuthority => {
+            return HostHealthClass::FenceMismatch;
+        }
+        Err(error) if error.code == ErrorCode::IoError => {
+            return if bridge_fault_latched(&host.runtime_instance_id) {
+                HostHealthClass::BridgeFault
+            } else {
+                HostHealthClass::StoreUnreadable
+            };
+        }
+        Err(error) if error.code == ErrorCode::CapabilityUnavailable => {
+            return HostHealthClass::NotReady;
+        }
+        Err(error) if error.code == ErrorCode::ResourceLimit => {
+            return HostHealthClass::ResourceExhausted;
+        }
+        Err(_) => return HostHealthClass::ProbeFailed,
+    }
+    classify_deep_probe(
+        || {
+            with_try_canonical_lock(&host.base, || {
+                host.store.validate_lease(&host._lease)?;
+                let bytes = fs::read(host.base.join("runtime-state.json")).map_err(io_error)?;
+                persistence::decode_canonical_state(&bytes).map(|_| ())
+            })
+        },
+        || probe_store_writable(&host.base, &host.runtime_instance_id),
+        || crate::probe_execution_bridge(&host, expected.host_generation),
+    )
+}
+
+/// Remove only the exact unhealthy instance. Existing request Arcs keep its lease until they
+/// finish; the release worker holds that lease through shutdown of the instance's reactor.
+pub(super) fn quarantine_existing_host(expected: &AdmissionFence) -> Result<bool, DomainError> {
+    let mut slot = host_slot()
+        .lock()
+        .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?;
+    let Some(host) = slot.as_ref() else {
+        return Ok(false);
+    };
+    if !fence_names_live(expected, host._lease.live()) {
+        return Ok(false);
+    }
+    host.quarantined.store(true, Ordering::SeqCst);
+    host.admission_open.store(false, Ordering::SeqCst);
+    host.automation_scheduler.abort();
+    let host = slot.take().expect("matching slot exists");
+    drop(slot);
+
+    let release_copy = Arc::clone(&host);
+    if std::thread::Builder::new()
+        .name("droidbridge-host-release".to_owned())
+        .spawn(move || release_quarantined_host(release_copy))
+        .is_err()
+    {
+        release_quarantined_host(host);
+    }
+    Ok(true)
+}
+
+fn release_quarantined_host(host: Arc<NativeHost>) {
+    let owned = await_unshared(host);
+    let lease = Arc::clone(&owned._lease);
+    drop(owned);
+    drop(lease);
+}
+
+fn await_unshared<T>(mut value: Arc<T>) -> T {
+    loop {
+        match Arc::try_unwrap(value) {
+            Ok(owned) => return owned,
+            Err(shared) => {
+                value = shared;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+pub(super) fn validate_host_instance(
+    host: &NativeHost,
+    expected: Option<&AdmissionFence>,
+) -> Result<(), DomainError> {
+    if host.quarantined.load(Ordering::Acquire) {
+        return Err(DomainError::new(
+            ErrorCode::CapabilityUnavailable,
+            "APK Runtime instance is quarantined",
+        ));
+    }
+    host.store.validate_lease(&host._lease)?;
+    let live = host._lease.live();
+    if expected.is_some_and(|fence| !fence_names_live(fence, live)) {
+        return Err(DomainError::new(
+            ErrorCode::StaleAuthority,
+            "APK Runtime fence changed",
+        ));
+    }
+    if probe_descriptor_class() != HostHealthClass::Healthy {
+        return Err(DomainError::new(
+            ErrorCode::ResourceLimit,
+            "APK Runtime has insufficient file descriptors",
+        ));
+    }
+    let capability = host
+        .runtime
+        .capability_port(host.runtime_instance_id.clone())
+        .current()?;
+    if expected.is_some_and(|fence| capability.fence != *fence) {
+        return Err(DomainError::new(
+            ErrorCode::StaleAuthority,
+            "APK Runtime capability fence changed",
+        ));
+    }
+    if crate::guard::is_quarantined() || capability.context.readiness != RuntimeReadiness::Ready {
+        return Err(DomainError::new(
+            ErrorCode::CapabilityUnavailable,
+            "APK Runtime is not ready",
+        ));
+    }
+    if bridge_fault_latched(&host.runtime_instance_id) {
+        return Err(DomainError::new(
+            ErrorCode::IoError,
+            "Android execution bridge failed",
+        ));
+    }
+    Ok(())
+}
+
+fn fence_names_live(fence: &AdmissionFence, live: &RuntimeLive) -> bool {
+    fence.runtime_epoch == live.runtime_epoch
+        && fence.host_generation == live.host_generation
+        && fence.runtime_instance_id == live.runtime_instance_id
 }
 
 fn start_result(live: &RuntimeLive) -> StartResult {
@@ -406,7 +575,7 @@ fn spawn_automation_scheduler(
     core: ApkCore,
     wake: Arc<crate::ApkAutomationWake>,
     fault: AutomationFaultContext,
-) {
+) -> tokio::task::JoinHandle<()> {
     let fault = Arc::new(fault);
     let pass_fault = Arc::clone(&fault);
     // A failed pass is retried by the loop itself; the fault file keeps the record of it.
@@ -426,7 +595,7 @@ fn spawn_automation_scheduler(
             // written either, the stopped scheduler still leaves persisted dues unchanged.
             let _recorded = record_scheduler_fault(&fault, &error, "automation_scheduler_run");
         }
-    });
+    })
 }
 
 fn record_scheduler_fault(
@@ -455,4 +624,162 @@ fn record_scheduler_fault(
         now_ms,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host_health::{HostHealthClass, classify_deep_probe, probe_store_writable};
+
+    fn id(number: u64) -> UuidV4 {
+        UuidV4::parse(format!("00000000-0000-4000-8000-{number:012x}")).unwrap()
+    }
+
+    #[test]
+    fn cached_session_fence_must_name_the_exact_live_instance() {
+        let live = RuntimeLive {
+            runtime_epoch: id(1),
+            host: RuntimeHost::ApkRuntime,
+            host_generation: 7,
+            runtime_instance_id: id(2),
+            boot_id: id(3),
+            pid: 42,
+            start_ticks: 99,
+        };
+        let expected = AdmissionFence {
+            runtime_epoch: id(1),
+            host_generation: 7,
+            runtime_instance_id: id(2),
+        };
+        assert!(fence_names_live(&expected, &live));
+        assert!(!fence_names_live(
+            &AdmissionFence {
+                runtime_epoch: id(4),
+                ..expected.clone()
+            },
+            &live
+        ));
+        assert!(!fence_names_live(
+            &AdmissionFence {
+                host_generation: 8,
+                ..expected.clone()
+            },
+            &live
+        ));
+        assert!(!fence_names_live(
+            &AdmissionFence {
+                runtime_instance_id: id(5),
+                ..expected
+            },
+            &live
+        ));
+    }
+
+    #[test]
+    fn deep_probe_keeps_canonical_bytes_untouched_and_cleans_its_private_scratch_file() {
+        let base = std::env::temp_dir().join(format!("droidbridge-probe-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&base).unwrap();
+        let canonical = base.join("runtime-state.json");
+        fs::write(&canonical, b"canonical-before-probe").unwrap();
+
+        probe_store_writable(&base, &id(2)).unwrap();
+        probe_store_writable(&base, &id(2)).unwrap();
+
+        assert_eq!(fs::read(&canonical).unwrap(), b"canonical-before-probe");
+        let names: Vec<_> = fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["runtime-state.json"]);
+        assert!(probe_store_writable(&base.join("missing"), &id(2)).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn deep_probe_reports_the_first_failed_source_without_running_an_executor() {
+        let executor_was_called = std::cell::Cell::new(false);
+        assert_eq!(
+            classify_deep_probe(
+                || HostHealthClass::StoreUnreadable,
+                || Err(std::io::Error::other("scratch sync failed")),
+                || {
+                    executor_was_called.set(true);
+                    HostHealthClass::ExecutorMissing
+                },
+            ),
+            HostHealthClass::StoreUnreadable,
+        );
+        assert!(!executor_was_called.get());
+        assert_eq!(
+            classify_deep_probe(
+                || HostHealthClass::LeaseStale,
+                || Ok(()),
+                || HostHealthClass::Healthy,
+            ),
+            HostHealthClass::LeaseStale,
+        );
+        assert_eq!(
+            classify_deep_probe(
+                || HostHealthClass::Healthy,
+                || Err(std::io::Error::other("disk full")),
+                || {
+                    executor_was_called.set(true);
+                    HostHealthClass::Healthy
+                },
+            ),
+            HostHealthClass::StoreUnwritable,
+        );
+        assert!(!executor_was_called.get());
+        assert_eq!(
+            classify_deep_probe(
+                || HostHealthClass::Healthy,
+                || Ok(()),
+                || {
+                    executor_was_called.set(true);
+                    HostHealthClass::ExecutorMissing
+                }
+            ),
+            HostHealthClass::ExecutorMissing,
+        );
+        assert!(executor_was_called.get());
+    }
+
+    #[test]
+    fn quarantine_release_waits_for_the_last_in_flight_owner() {
+        let directory =
+            std::env::temp_dir().join(format!("droidbridge-lease-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let lock_path = directory.join("runtime-live.lock");
+        let owned = Arc::new(persistence::FileLock::acquire(&lock_path).unwrap());
+        let in_flight = Arc::clone(&owned);
+        let (started, ready) = std::sync::mpsc::channel();
+        let (released, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            drop(await_unshared(owned));
+            released.send(()).unwrap();
+        });
+        ready.recv().unwrap();
+        assert!(
+            persistence::FileLock::try_acquire(&lock_path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        drop(in_flight);
+        finished
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            persistence::FileLock::try_acquire(&lock_path)
+                .unwrap()
+                .is_some()
+        );
+        worker.join().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

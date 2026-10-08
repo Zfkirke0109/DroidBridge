@@ -2,7 +2,24 @@ package com.droidbridge.standalone.runtimehost
 
 internal object NativeRuntime {
     external fun nativeStart(canonicalBase: String, environmentJson: String): String
-    external fun nativeSubmit(envelope: ByteArray): ByteArray
+    external fun nativeValidateHost(runtimeEpoch: String, hostGeneration: Long, runtimeInstanceId: String): String?
+    external fun nativeProbeHost(runtimeEpoch: String, hostGeneration: Long, runtimeInstanceId: String): String?
+    external fun nativeRecordHostHealthFault(
+        canonicalBase: String,
+        productVersion: String,
+        runtimeInstanceId: String,
+        hostGeneration: Long,
+        healthClass: String,
+        phase: String,
+    ): Boolean
+    external fun nativeQuarantineHost(runtimeEpoch: String, hostGeneration: Long, runtimeInstanceId: String): Boolean
+    external fun nativeLifetimeReleased(canonicalBase: String): Boolean
+    external fun nativeSubmit(
+        envelope: ByteArray,
+        runtimeEpoch: String,
+        hostGeneration: Long,
+        runtimeInstanceId: String,
+    ): ByteArray
     external fun nativeQueryArtifacts(query: ByteArray, descriptor: IntArray): ByteArray?
     external fun nativeMcpStart(port: Int, token: String, productVersion: String): Boolean
     external fun nativeMcpSetToken(token: String): Boolean
@@ -20,6 +37,20 @@ internal object NativeRuntime {
     external fun nativeTunnelState(): String?
     external fun nativeTunnelLastCall(): Long
     external fun nativeTunnelLastError(): String?
+    external fun nativeRelayValidate(relayUrl: String, deviceKey: String, productVersion: String): String?
+    external fun nativeRelayStart(port: Int, relayUrl: String, deviceKey: String, productVersion: String): Boolean
+    external fun nativeRelayStop(): Boolean
+    external fun nativeRelayState(): String?
+    external fun nativeRelayLastCall(): Long
+    external fun nativeRelayLastError(): String?
+    external fun nativeRelayPair(
+        relayUrl: String,
+        deviceKey: String,
+        codeSha256: String,
+        ttlSeconds: Int,
+        productVersion: String,
+    ): String?
+    external fun nativeRelayRevoke(relayUrl: String, deviceKey: String, productVersion: String): String?
     external fun nativeMaintenanceState(canonicalBase: String): String?
     external fun nativeResetRuntimeHostToApk(canonicalBase: String): String?
     external fun nativeResetRuntimeData(canonicalBase: String): String?

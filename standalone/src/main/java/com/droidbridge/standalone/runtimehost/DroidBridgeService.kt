@@ -41,6 +41,9 @@ class DroidBridgeService : Service() {
     private lateinit var mediaProjection: MediaProjectionVisualController
     private lateinit var mcpSettings: McpSettingsController
     private lateinit var tunnelSettings: TunnelSettingsController
+    private lateinit var claudeRelaySettings: ClaudeRelaySettingsController
+    @Volatile private var tunnelWanted = false
+    @Volatile private var claudeRelayWanted = false
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var activeTaskCount = 0L
     @Volatile private var latestStartId = 0
@@ -161,6 +164,40 @@ class DroidBridgeService : Service() {
             return this@DroidBridgeService.tunnelSettings.clear(::setTunnelForeground)
         }
 
+        override fun getClaudeRelaySettings(): String {
+            verifyCaller()
+            return this@DroidBridgeService.claudeRelaySettings.settings()
+        }
+
+        override fun configureClaudeRelay(relayUrl: String?, deviceKey: String?): String {
+            verifyCaller()
+            return this@DroidBridgeService.claudeRelaySettings.configure(
+                requireNotNull(relayUrl),
+                requireNotNull(deviceKey),
+                ::setClaudeRelayForeground,
+            )
+        }
+
+        override fun setClaudeRelayEnabled(enabled: Boolean): String {
+            verifyCaller()
+            return this@DroidBridgeService.claudeRelaySettings.setEnabled(enabled, ::setClaudeRelayForeground)
+        }
+
+        override fun clearClaudeRelay(): String {
+            verifyCaller()
+            return this@DroidBridgeService.claudeRelaySettings.clear(::setClaudeRelayForeground)
+        }
+
+        override fun pairClaudeRelay(): String {
+            verifyCaller()
+            return this@DroidBridgeService.claudeRelaySettings.pair()
+        }
+
+        override fun revokeClaudeRelayClients(): String {
+            verifyCaller()
+            return this@DroidBridgeService.claudeRelaySettings.revokeClaude()
+        }
+
         override fun getMaintenanceState(): String {
             verifyCaller()
             return hostController.maintenanceState()
@@ -214,6 +251,7 @@ class DroidBridgeService : Service() {
         hostController = graph.hostController
         mcpSettings = graph.mcpSettings
         tunnelSettings = graph.tunnelSettings
+        claudeRelaySettings = graph.claudeRelaySettings
         hostController.setHintSink(::publishHint)
         foregroundReasons = ForegroundReasonRegistry(
             service = this,
@@ -225,6 +263,7 @@ class DroidBridgeService : Service() {
             foregroundReasons.set(ForegroundReason.SpecialUse, active)
         }
         tunnelSettings.restore(::setTunnelForeground)
+        claudeRelaySettings.restore(::setClaudeRelayForeground)
         mediaProjection = MediaProjectionVisualController(
             service = this,
             registry = graph.androidExecutionRegistry,
@@ -246,7 +285,14 @@ class DroidBridgeService : Service() {
         )
         graph.setShizukuPrimitiveBridge(shizukuController.primitiveBridge())
         shizukuController.start()
-        tunnelSettings.enabledObserver = shizukuController::setKeepAliveWanted
+        tunnelSettings.enabledObserver = { wanted ->
+            tunnelWanted = wanted
+            shizukuController.setKeepAliveWanted(tunnelWanted || claudeRelayWanted)
+        }
+        claudeRelaySettings.enabledObserver = { wanted ->
+            claudeRelayWanted = wanted
+            shizukuController.setKeepAliveWanted(tunnelWanted || claudeRelayWanted)
+        }
         hostController.setGuardScopeSink(shizukuController::onGuardScopeReplaced)
         startRuntime()
     }
@@ -307,6 +353,7 @@ class DroidBridgeService : Service() {
             return
         }
         tunnelSettings.restore(::setTunnelForeground)
+        claudeRelaySettings.restore(::setClaudeRelayForeground)
         // The wake follows a Runtime the system ended, so restoring returns a listener it ran;
         // a boot still never opens one.
         mcpSettings.restore(::setMcpForeground)
@@ -316,6 +363,11 @@ class DroidBridgeService : Service() {
     private fun setTunnelForeground(active: Boolean) {
         if (active) startService(Intent(this, DroidBridgeService::class.java))
         foregroundReasons.set(ForegroundReason.SpecialUse, active, TUNNEL_FOREGROUND_OWNER)
+    }
+
+    private fun setClaudeRelayForeground(active: Boolean) {
+        if (active) startService(Intent(this, DroidBridgeService::class.java))
+        foregroundReasons.set(ForegroundReason.SpecialUse, active, CLAUDE_RELAY_FOREGROUND_OWNER)
     }
 
     private fun setTaskActivity(activeTasks: Long) {
@@ -407,6 +459,8 @@ class DroidBridgeService : Service() {
         mcpSettings.suspendListener()
         tunnelSettings.enabledObserver = null
         tunnelSettings.suspendRuntime(::setTunnelForeground)
+        claudeRelaySettings.enabledObserver = null
+        claudeRelaySettings.suspendRuntime(::setClaudeRelayForeground)
         mediaProjection.stop()
         shizukuController.stop()
         (application as DroidBridgeApplication).requireRuntimeGraph().let { graph ->
@@ -466,6 +520,7 @@ class DroidBridgeService : Service() {
         private const val KEEPALIVE_WAKE_OWNER = "keepalive_wake"
         private const val MCP_FOREGROUND_OWNER = "mcp"
         private const val TUNNEL_FOREGROUND_OWNER = "tunnel"
+        private const val CLAUDE_RELAY_FOREGROUND_OWNER = "claude_relay"
         private const val TASK_FOREGROUND_OWNER = "task"
         private const val AUTOMATION_WAKE_OWNER = "automation_wake"
         private const val EXTRA_RESULT_CODE = "result_code"

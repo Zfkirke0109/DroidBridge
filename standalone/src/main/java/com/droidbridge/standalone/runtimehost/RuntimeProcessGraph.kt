@@ -35,6 +35,7 @@ internal class RuntimeProcessGraph(application: Application) {
     val hostController: RuntimeHostController
     val mcpSettings: McpSettingsController
     val tunnelSettings: TunnelSettingsController
+    val claudeRelaySettings: ClaudeRelaySettingsController
     val androidExecutionRegistry: AndroidExecutionRegistry
     val visualDisplay: VisualDisplayTracker
     val visualEncoder: VisualImageEncoder
@@ -65,6 +66,13 @@ internal class RuntimeProcessGraph(application: Application) {
             AndroidTunnelCredentialCipher(),
             AndroidMcpSettingsFileSystem(),
         )
+        claudeRelaySettings = ClaudeRelaySettingsController(
+            settingsDirectory,
+            NativeClaudeRelayRuntime(mcpPort, BuildConfig.VERSION_NAME),
+            AndroidTunnelNetworkMonitor(application.getSystemService(ConnectivityManager::class.java)),
+            AndroidTunnelCredentialCipher(CLAUDE_RELAY_KEY_ALIAS),
+            AndroidMcpSettingsFileSystem(),
+        )
         visualDisplay = VisualDisplayTracker(application)
         visualEncoder = VisualImageEncoder(application)
         androidExecutionRegistry = AndroidExecutionRegistry { key, state, reason, generation, hasExecutor ->
@@ -91,6 +99,12 @@ internal class RuntimeProcessGraph(application: Application) {
         )
         val exactAlarms = AndroidExactAlarmAccess(application, ExactAlarmReceiver::class.java)
         hostController.setApkProjectionReleasedSink(exactAlarms::cancel)
+        hostController.setAutomationRetrySink { delayMillis ->
+            if (exactAlarms.canScheduleExactAlarms()) {
+                exactAlarms.setExactAndAllowWhileIdle(System.currentTimeMillis() + delayMillis)
+            }
+        }
+        hostController.setHostWithdrawnSink { networkDefault.close() }
         val framework = RoutedAndroidExecution(
             ContentResolverFilesystemAdapter(
                 AndroidContentResolverAccess(application.contentResolver),

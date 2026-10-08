@@ -14,6 +14,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import com.droidbridge.standalone.client.BackgroundFacts
+import com.droidbridge.standalone.execution.shizuku.ShizukuManager
 import java.io.File
 
 /**
@@ -36,7 +37,11 @@ object DeviceSetup {
         context.getSystemService(NotificationManager::class.java).isNotificationListenerAccessGranted(listener)
 
     /** The Shizuku app is installed; whether it runs and authorizes this App is a Runtime fact. */
-    fun shizukuInstalled(context: Context): Boolean = installed(context, SHIZUKU_MANAGER)
+    fun shizukuInstalled(context: Context): Boolean = shizukuManager(context) != null
+
+    /** Prefer Shizuku+ when its compatibility app also exposes the stock package name. */
+    internal fun shizukuManager(context: Context): ShizukuManager? =
+        ShizukuManager.installed { packageName -> installed(context, packageName) }
 
     /** Installed from a file or browser rather than a store, so Android restricts its accessibility switch. */
     fun restrictedSettingsApply(context: Context): Boolean = Build.VERSION.SDK_INT >= 33 && runCatching {
@@ -125,8 +130,6 @@ object DeviceSetup {
         ApplicationExitInfo.REASON_OTHER,
         REASON_FREEZER,
     )
-
-    private const val SHIZUKU_MANAGER = "moe.shizuku.privileged.api"
 
     /** Known autostart managers, after the list the AutoStarter project maintains; order is preference. */
     private val VENDOR_AUTOSTART: Map<List<String>, List<String>> = mapOf(

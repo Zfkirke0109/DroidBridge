@@ -591,4 +591,3 @@ fun BackButton(tag: String, @StringRes description: Int, back: () -> Unit) {
         Icon(painterResource(R.drawable.ic_arrow_back), stringResource(description))
     }
 }
-

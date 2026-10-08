@@ -6,8 +6,10 @@ import android.app.Application
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import com.droidbridge.standalone.BuildConfig
 import com.droidbridge.standalone.execution.android.NetworkDefaultObservation
+import com.droidbridge.standalone.execution.android.NativeAndroidExecutionDispatcher
 import com.droidbridge.standalone.product.release.ReleaseConfig
 import com.droidbridge.ui.product.deviceName
 import java.io.File
@@ -56,6 +58,25 @@ internal data class RuntimeSessionState(
     } == true
 }
 
+/** A cached Kotlin session is usable only while native still names the same ready host. */
+internal fun RuntimeSessionState.validatedByNativeHealth(verdict: String?): RuntimeSessionState {
+    if (!started) return this
+    if (verdict == "READY") return this
+    return RuntimeSessionState(startFailure = verdict?.let(::runtimeErrorToken) ?: ErrorToken.InternalError.wire)
+}
+
+/** A status read only proves the same session healthy if it answered before authority moved. */
+internal fun diagnosticSession(
+    observed: RuntimeSessionState,
+    current: RuntimeSessionState,
+    statusAvailable: Boolean,
+): RuntimeSessionState {
+    if (!observed.started) return observed
+    if (statusAvailable && current === observed) return observed
+    val failure = if (current.started) ErrorToken.CapabilityUnavailable.wire else current.startFailure
+    return RuntimeSessionState(startFailure = failure)
+}
+
 /**
  * The App's one Runtime host: it starts the native Runtime in this process, publishes the App's
  * platform facts to it and owns every maintenance operation on its canonical store.
@@ -65,14 +86,40 @@ internal class RuntimeHostController(
 ) {
     private val runtimeSession = AtomicReference(RuntimeSessionState())
     private val hintSink = AtomicReference<((String) -> Unit)?>(null)
+    private val automationRetrySink = AtomicReference<((Long) -> Unit)?>(null)
+    private val hostWithdrawnSink = AtomicReference<(() -> Unit)?>(null)
     private val frameworkReadySink = AtomicReference<((Long) -> Unit)?>(null)
     private val guardScopeSink = AtomicReference<(() -> Unit)?>(null)
     private val apkProjectionReleasedSink = AtomicReference<(() -> Unit)?>(null)
     private val platformGeneration = AtomicLong(0)
+    private var completedStartupFence: RuntimeFence? = null
     private val capabilityFacts = CapabilityFacts()
+    private val deepProbeBudget = RuntimeDeepProbeBudget()
     private val maintenanceExecutor = AtomicReference<ExecutorService?>(null)
     private val deviceContext = application.createDeviceProtectedStorageContext()
     private val canonicalBase = File(deviceContext.filesDir, "droidbridge")
+    private val healthGate = RuntimeHostHealthGate(
+        runtimeSession,
+        this,
+        object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase): Boolean =
+                NativeRuntime.nativeRecordHostHealthFault(
+                    canonicalBase.absolutePath,
+                    BuildConfig.VERSION_NAME,
+                    fence.runtimeInstanceId,
+                    fence.hostGeneration,
+                    health.wire,
+                    phase.wire,
+                )
+
+            override fun quarantine(fence: RuntimeFence): Boolean =
+                NativeRuntime.nativeQuarantineHost(fence.runtimeEpoch, fence.hostGeneration, fence.runtimeInstanceId)
+
+            override fun lifetimeReleased(): Boolean = NativeRuntime.nativeLifetimeReleased(canonicalBase.absolutePath)
+        },
+        nowMillis = SystemClock::elapsedRealtime,
+        onWithdrawn = this::onHealthWithdrawn,
+    )
 
     /** One bounded worker for S-UI-017 status reads; a timed-out read never blocks the next caller. */
     private val diagnosticsReads = Executors.newSingleThreadExecutor { task ->
@@ -82,7 +129,57 @@ internal class RuntimeHostController(
     @Synchronized
     fun start(): Boolean {
         val observedSession = runtimeSession.get()
-        if (observedSession.started) return true
+        if (observedSession.started) {
+            // Keep status and TaskControl available during planned maintenance: this validates
+            // the instance and its readiness, leaving business admission to the native Runtime.
+            val fence = requireNotNull(observedSession.activeFence)
+            val verdict = runCatching {
+                NativeRuntime.nativeValidateHost(
+                    fence.runtimeEpoch,
+                    fence.hostGeneration,
+                    fence.runtimeInstanceId,
+                )
+            }.getOrNull()
+            val validated = observedSession.validatedByNativeHealth(verdict)
+            if (validated !== observedSession) {
+                val deep = probeDeep(fence)
+                if (deep == NativeHostHealth.Healthy) {
+                    val retried = runCatching {
+                        NativeRuntime.nativeValidateHost(
+                            fence.runtimeEpoch,
+                            fence.hostGeneration,
+                            fence.runtimeInstanceId,
+                        )
+                    }.getOrNull()
+                    if (retried == "READY") {
+                        healthGate.markInitialProbeHealthy(fence)
+                        return completeStart(observedSession)
+                    }
+                }
+                val failure = if (deep == NativeHostHealth.Healthy) NativeHostHealth.NotReady else deep
+                if (failure.defersAdmission) {
+                    healthGate.requireDeepProbe(fence)
+                    return false
+                }
+                healthGate.withdraw(
+                    observedSession,
+                    failure,
+                    HostHealthPhase.Admission,
+                )
+                return false
+            }
+            if (healthGate.initialProbePending(fence)) {
+                val health = probeDeep(fence)
+                if (health.defersAdmission) return false
+                if (health != NativeHostHealth.Healthy) {
+                    healthGate.withdraw(observedSession, health, HostHealthPhase.Admission)
+                    return false
+                }
+                healthGate.markInitialProbeHealthy(fence)
+            }
+            return completeStart(observedSession)
+        }
+        if (!healthGate.mayEstablish()) return false
         // A reset in progress owns the store until it activates the fresh instance itself.
         if (observedSession.startFailure == ErrorToken.HostTransitionPending.wire) return false
         val packageInfo = application.packageManager.getPackageInfo(application.packageName, 0)
@@ -130,18 +227,41 @@ internal class RuntimeHostController(
         )
         if (!runtimeSession.compareAndSet(observedSession, activated)) {
             NativeRuntime.nativeRecordHostFault(ErrorToken.StaleAuthority.wire, "host_start_projection")
-            return runtimeSession.get().started
+            return false
         }
+        healthGate.requireDeepProbe(requireNotNull(activated.activeFence))
         replayFacts()
         registerPlatformFacts()
         frameworkReadySink.get()?.invoke(generation)
-        recoverMaintenance()
-        val guard = File(application.applicationInfo.nativeLibraryDir, "libdroidbridge_exec_guard.so")
-        if (!NativeRuntime.nativeProbeAppGuard(guard.absolutePath)) {
-            NativeRuntime.nativeRecordHostFault("CLEANUP_UNVERIFIED", "app_guard_probe")
+        val health = probeDeep(requireNotNull(activated.activeFence))
+        if (health.defersAdmission) return false
+        if (health != NativeHostHealth.Healthy) {
+            healthGate.withdraw(activated, health, HostHealthPhase.Admission)
+            return false
         }
-        guardScopeSink.get()?.invoke()
-        return true
+        healthGate.markInitialProbeHealthy(requireNotNull(activated.activeFence))
+        return completeStart(activated)
+    }
+
+    /** An initially deferred deep probe must still perform the once-per-instance guard setup. */
+    private fun completeStart(session: RuntimeSessionState): Boolean {
+        if (!healthGate.admissionCompleted(session)) return false
+        val fence = requireNotNull(session.activeFence)
+        if (completedStartupFence != fence) {
+            recoverMaintenance()
+            val guard = File(application.applicationInfo.nativeLibraryDir, "libdroidbridge_exec_guard.so")
+            val guardReady = NativeRuntime.nativeProbeAppGuard(guard.absolutePath)
+            if (!guardReady) {
+                NativeRuntime.nativeRecordHostFault("CLEANUP_UNVERIFIED", "app_guard_probe")
+            }
+            guardScopeSink.get()?.invoke()
+            if (!guardReady) {
+                healthGate.withdraw(session, NativeHostHealth.ProbeFailed, HostHealthPhase.Admission)
+                return false
+            }
+            completedStartupFence = fence
+        }
+        return healthGate.admissionCompleted(session)
     }
 
     /**
@@ -211,11 +331,45 @@ internal class RuntimeHostController(
     }
 
     fun submit(envelope: ByteArray): ByteArray {
-        if (!start()) throw RuntimeStartException(runtimeSession.get().startFailure)
-        val fence = runtimeSession.get().activeFence ?: throw RuntimeStartException(runtimeSession.get().startFailure)
+        if (!start()) throw RuntimeStartException(
+            runtimeSession.get().startFailure.ifEmpty { ErrorToken.CapabilityUnavailable.wire },
+        )
+        val observed = runtimeSession.get()
+        val fence = observed.activeFence ?: throw RuntimeStartException(observed.startFailure)
         frameworkReadySink.get()?.invoke(fence.hostGeneration)
         registerPlatformFacts()
-        return NativeRuntime.nativeSubmit(envelope)
+        val response = try {
+            NativeRuntime.nativeSubmit(
+                envelope,
+                fence.runtimeEpoch,
+                fence.hostGeneration,
+                fence.runtimeInstanceId,
+            )
+        } catch (failure: Throwable) {
+            maybeProbeAfterSuspicious(observed, fence)
+            throw failure
+        }
+        if (suspiciousRuntimeReply(response)) maybeProbeAfterSuspicious(observed, fence)
+        if (businessReplyProvesExecution(envelope, response)) healthGate.businessResponseServed(observed)
+        return response
+    }
+
+    private fun probeDeep(fence: RuntimeFence): NativeHostHealth = runCatching {
+        NativeHostHealth.decode(
+            NativeRuntime.nativeProbeHost(fence.runtimeEpoch, fence.hostGeneration, fence.runtimeInstanceId),
+        )
+    }.getOrDefault(NativeHostHealth.ProbeFailed)
+
+    /** Preserve the already returned response; probing cannot replay an ambiguous operation. */
+    private fun maybeProbeAfterSuspicious(observed: RuntimeSessionState, fence: RuntimeFence) {
+        if (runtimeSession.get() !== observed) return
+        if (!deepProbeBudget.claim(fence, SystemClock.elapsedRealtime())) return
+        val health = probeDeep(fence)
+        if (health.defersAdmission) {
+            healthGate.requireDeepProbeIfCurrent(observed)
+        } else if (health != NativeHostHealth.Healthy) {
+            healthGate.withdraw(observed, health, HostHealthPhase.Settlement)
+        }
     }
 
     /** Answers one S-MCP-006 internal artifact query from this host's own artifact store. */
@@ -323,14 +477,16 @@ internal class RuntimeHostController(
         } else {
             null
         }
+        val displayedSession = diagnosticSession(session, runtimeSession.get(), status != null)
         return buildJsonObject {
             put("schema_version", 1)
             put("session", buildJsonObject {
-                put("started", session.started)
+                put("started", displayedSession.started)
                 put("host", "apk_runtime")
-                if (!session.started) put("start_failure", session.startFailure)
+                if (!displayedSession.started) put("start_failure", displayedSession.startFailure)
             })
-            status?.let { put("status", it) }
+            put("health", healthGate.snapshot())
+            status?.takeIf { displayedSession.started }?.let { put("status", it) }
         }.toString()
     }
 
@@ -389,6 +545,7 @@ internal class RuntimeHostController(
     }
 
     private fun activateAfterMaintenance(): String {
+        healthGate.clearBreaker()
         runtimeSession.updateAndGet { current ->
             if (current.started) current else inactiveSession("RUNTIME_UNAVAILABLE")
         }
@@ -401,6 +558,13 @@ internal class RuntimeHostController(
                 // A retained alarm reaches only a released instance and delivers nothing there.
                 NativeRuntime.nativeRecordHostFault(ErrorToken.IoError.wire, "automation_alarm_release")
             }
+    }
+
+    /** A health withdrawal clears host-owned process projections while retaining its exact alarm. */
+    private fun onHealthWithdrawn(fence: RuntimeFence) {
+        runCatching { hostWithdrawnSink.get()?.invoke() }
+        runCatching { NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity(fence) }
+        runCatching { hintSink.get()?.invoke("context.status") }
     }
 
     private fun onMaintenanceExecutor(action: () -> String): String =
@@ -422,7 +586,13 @@ internal class RuntimeHostController(
      */
     fun wakeAutomation(): Boolean {
         registerPlatformFacts()
-        if (!start()) return false
+        if (!start()) {
+            healthGate.establishmentRetryMillis()?.let { delay ->
+                runCatching { automationRetrySink.get()?.invoke(delay) }
+                    .onFailure { NativeRuntime.nativeRecordHostFault(ErrorToken.IoError.wire, "automation_retry") }
+            }
+            return false
+        }
         return NativeRuntime.nativeAutomationWake()
     }
 
@@ -447,6 +617,15 @@ internal class RuntimeHostController(
 
     fun setHintSink(sink: ((String) -> Unit)?) {
         hintSink.set(sink)
+    }
+
+    /** Arms a replacement wake when the exact alarm was spent during a held-off admission. */
+    fun setAutomationRetrySink(sink: ((Long) -> Unit)?) {
+        automationRetrySink.set(sink)
+    }
+
+    fun setHostWithdrawnSink(sink: (() -> Unit)?) {
+        hostWithdrawnSink.set(sink)
     }
 
     fun setFrameworkReadySink(sink: ((Long) -> Unit)?) {

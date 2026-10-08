@@ -24,10 +24,11 @@ adb shell dumpsys activity exit-info com.droidbridge.standalone
 | `root-frontend/` | The DroidBridge Root app, which shows and configures the root daemon, and the module build |
 | `ui-common/` | Screens and product models both apps share |
 | `rust/crates/runtime` | The Runtime core and the MCP facade shared by both editions |
-| `rust/crates/app_native` | JNI library for the App-hosted Runtime and the ChatGPT tunnel client |
+| `rust/crates/app_native` | JNI library for the App-hosted Runtime, ChatGPT tunnel, and standalone Claude relay client |
 | `rust/crates/daemon`, `supervisor` | The root daemon and its supervisor shipped in the Magisk module |
 | `rust/crates/contract`, `domain`, `persistence` | Public contract, admission rules and the canonical store |
 | `magisk/` | Magisk module scripts and the framework helper sources |
+| `relay/` | Self-hosted Claude MCP relay Worker, deployment guide, and protocol tests |
 | `tools/` | Release tooling, notice generation and toolchain checks |
 
 ## Building

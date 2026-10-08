@@ -1,6 +1,7 @@
 package com.droidbridge.standalone.execution.android
 
 import android.os.ParcelFileDescriptor
+import com.droidbridge.standalone.runtimehost.RuntimeFence
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
@@ -9,9 +10,10 @@ import kotlinx.coroutines.runBlocking
 internal object NativeAndroidExecutionDispatcher {
     private val registry = AtomicReference<AndroidExecutionRegistry?>(null)
     private var taskActivitySink: ((Long) -> Unit)? = null
-    private var taskActivityEpoch: String? = null
+    private var taskActivityFence: RuntimeFence? = null
     private var taskActivityRevision = -1L
     private var activeTaskCount = 0L
+    private val withdrawnTaskSources = HashSet<RuntimeFence>()
 
     fun install(value: AndroidExecutionRegistry) {
         check(registry.compareAndSet(null, value) || registry.get() === value)
@@ -21,6 +23,11 @@ internal object NativeAndroidExecutionDispatcher {
         registry.compareAndSet(value, null)
     }
 
+    /** Reads the framework executor registry through JNI without invoking an executor. */
+    @JvmStatic
+    fun probeExecutor(key: String, generation: Long): Boolean =
+        key == "android.framework" && generation > 0 && registry.get()?.executor(key, generation) != null
+
     @Synchronized
     fun installTaskActivitySink(value: ((Long) -> Unit)?) {
         taskActivitySink = value
@@ -29,18 +36,39 @@ internal object NativeAndroidExecutionDispatcher {
 
     @JvmStatic
     @Synchronized
-    fun taskActivityChanged(runtimeEpoch: String, activeTasks: Long, canonicalRevision: Long) {
-        if (runtimeEpoch.isEmpty() || activeTasks < 0 || canonicalRevision < 0) return
-        val epochChanged = runtimeEpoch != taskActivityEpoch
-        if (epochChanged) {
-            taskActivityEpoch = runtimeEpoch
+    fun taskActivityChanged(
+        runtimeEpoch: String,
+        hostGeneration: Long,
+        runtimeInstanceId: String,
+        activeTasks: Long,
+        canonicalRevision: Long,
+    ) {
+        if (runtimeEpoch.isEmpty() || hostGeneration <= 0 || runtimeInstanceId.isEmpty() ||
+            activeTasks < 0 || canonicalRevision < 0
+        ) return
+        val source = RuntimeFence(runtimeEpoch, hostGeneration, runtimeInstanceId)
+        if (source in withdrawnTaskSources) return
+        val sourceChanged = source != taskActivityFence
+        if (sourceChanged) {
+            taskActivityFence = source
             taskActivityRevision = -1L
         }
         if (canonicalRevision <= taskActivityRevision) return
         taskActivityRevision = canonicalRevision
-        if (!epochChanged && activeTasks == activeTaskCount) return
+        if (!sourceChanged && activeTasks == activeTaskCount) return
         activeTaskCount = activeTasks
         taskActivitySink?.invoke(activeTasks)
+    }
+
+    /** Retire the exact JNI source before clearing its foreground hold. */
+    @Synchronized
+    fun forgetRuntimeTaskActivity(fence: RuntimeFence) {
+        withdrawnTaskSources += fence
+        taskActivityFence = null
+        taskActivityRevision = -1L
+        if (activeTaskCount == 0L) return
+        activeTaskCount = 0L
+        taskActivitySink?.invoke(0L)
     }
 
     @JvmStatic
@@ -168,5 +196,9 @@ internal object NativeAndroidExecutionDispatcher {
         AndroidExecutionResult(byteArrayOf(), errorCode = "TIMEOUT")
     } catch (_: CancellationException) {
         AndroidExecutionResult(byteArrayOf(), errorCode = "CANCELLED")
+    } catch (_: Exception) {
+        // An executor's own exception is an operation failure, not a failure of the shared JNI
+        // bridge that every Android primitive uses.
+        AndroidExecutionResult(byteArrayOf(), errorCode = "INTERNAL_ERROR")
     }
 }

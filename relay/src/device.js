@@ -1,0 +1,190 @@
+// @ts-check
+/**
+ * Device routes (protocol droidbridge-relay/1). The phone authenticates with its device key;
+ * the relay holds only the key's SHA-256 (secret DEVICE_KEY_SHA256) and compares in constant
+ * time. The poll/response shape is the OpenAI tunnel long-poll shape the phone already speaks.
+ */
+
+import {
+  constantTimeEqual,
+  decodeUtf8,
+  empty,
+  isPlainObject,
+  json,
+  jsonText,
+  methodNotAllowed,
+  parseJson,
+  readBody,
+  sha256Hex,
+} from './util.js';
+
+export const PROTOCOL = 'droidbridge-relay/1';
+/** The phone's MCP_RESPONSE_LIMIT_BYTES (12,000,000) plus 1 MiB for the tunnel envelope. */
+export const DEVICE_RESPONSE_LIMIT_BYTES = 12_000_000 + 1024 * 1024;
+const SMALL_BODY_LIMIT_BYTES = 4096;
+const POLL_LIMIT_MAX = 8;
+const POLL_DEFAULT_TIMEOUT_MS = 15_000;
+const PAIRING_TTL_MAX_SECONDS = 600;
+const HEX64 = /^[0-9a-f]{64}$/;
+
+/** @type {Map<string, string[]>} */
+const ROUTES = new Map([
+  ['/device/v1/status', ['GET']],
+  ['/device/v1/poll', ['GET']],
+  ['/device/v1/response', ['POST']],
+  ['/device/v1/pairing', ['POST', 'DELETE']],
+  ['/device/v1/revoke', ['POST']],
+]);
+
+/**
+ * @typedef {import('./relay.js').Relay} Relay
+ */
+
+/**
+ * @param {Request} request
+ * @param {string} expectedHash
+ */
+async function deviceKeyMatches(request, expectedHash) {
+  const header = request.headers.get('authorization') ?? '';
+  const match = /^Bearer +(\S{1,512}) *$/i.exec(header);
+  // Hash even when the header is missing, so both paths take the same work.
+  const digest = await sha256Hex(match ? match[1] : '');
+  return constantTimeEqual(digest, expectedHash) && match !== null;
+}
+
+/**
+ * Parses a non-negative integer query parameter, clamped to min..max however many digits it
+ * has; the fallback when absent or not a plain decimal integer.
+ * @param {string | null} value
+ * @param {number} min
+ * @param {number} max
+ * @param {number} fallback
+ */
+export function clampInt(value, min, max, fallback) {
+  if (value === null || !/^\d+$/.test(value)) return fallback;
+  // Number() of a very long digit string is Infinity, which clamps to max like any large value.
+  return Math.min(max, Math.max(min, Number(value)));
+}
+
+/**
+ * @param {Relay} relay
+ * @param {Request} request
+ * @param {URL} url
+ */
+export async function handleDevice(relay, request, url) {
+  const methods = ROUTES.get(url.pathname);
+  if (!methods) return json(404, { error: 'not_found' });
+  if (!relay.config.deviceKeyConfigured) return json(503, { error: 'relay_not_configured' });
+  if (!(await deviceKeyMatches(request, relay.config.deviceKeyHash))) {
+    return json(401, { error: 'unauthorized' }, { 'WWW-Authenticate': 'Bearer realm="droidbridge-relay-device"' });
+  }
+  if (!methods.includes(request.method)) return methodNotAllowed(methods);
+
+  switch (url.pathname) {
+    case '/device/v1/status':
+      return status(relay);
+    case '/device/v1/poll':
+      return poll(relay, request, url);
+    case '/device/v1/response':
+      return respond(relay, request);
+    case '/device/v1/pairing':
+      return request.method === 'DELETE' ? cancelPairing(relay) : startPairing(relay, request);
+    case '/device/v1/revoke':
+      return revoke(relay);
+    default:
+      return json(404, { error: 'not_found' });
+  }
+}
+
+/** @param {Relay} relay */
+async function status(relay) {
+  const clients = await relay.grants.liveClientIds();
+  const pairing = await relay.storage.get('pairing');
+  return json(200, {
+    schema_version: 1,
+    protocol: PROTOCOL,
+    authorized_clients: clients.size,
+    pairing_active: Boolean(pairing && pairing.expiresAt > relay.now()),
+  });
+}
+
+/**
+ * @param {Relay} relay
+ * @param {Request} request
+ * @param {URL} url
+ */
+async function poll(relay, request, url) {
+  const limit = clampInt(url.searchParams.get('limit'), 1, POLL_LIMIT_MAX, POLL_LIMIT_MAX);
+  const cap = relay.timings.pollCapMs;
+  const timeout = clampInt(url.searchParams.get('timeout_ms'), 0, cap, Math.min(POLL_DEFAULT_TIMEOUT_MS, cap));
+  // The phone polls around the clock, so its polls also keep expired OAuth records from
+  // lingering in storage; the poll does not wait for that.
+  relay.sweepInBackground();
+  // Each command arrives already encoded (it was encoded when Claude's request was accepted),
+  // so the body is only joined text and cannot fail after the commands were marked delivered.
+  const commands = await relay.hub.poll(limit, timeout, request.signal);
+  return commands.length > 0 ? jsonText(200, `{"commands":[${commands.join(',')}]}`) : empty(204);
+}
+
+/**
+ * @param {Relay} relay
+ * @param {Request} request
+ */
+async function respond(relay, request) {
+  const shardToken = request.headers.get('x-tunnel-shard-token');
+  // A reply that cannot be read for its request_id (too large, not UTF-8 JSON, not an object,
+  // no string request_id) still names its request through the shard token header. That request
+  // is settled at once as an invalid device reply instead of waiting out its deadline. A body
+  // that fails mid-read (connection lost) settles nothing, so the phone can post it again.
+  const bytes = await readBody(request, DEVICE_RESPONSE_LIMIT_BYTES);
+  if (!bytes) {
+    relay.hub.rejectByShardToken(shardToken);
+    return json(413, { error: 'payload_too_large' });
+  }
+  const text = decodeUtf8(bytes);
+  const body = parseJson(text);
+  if (text === null || !isPlainObject(body) || typeof body.request_id !== 'string') {
+    relay.hub.rejectByShardToken(shardToken);
+    return json(400, { error: 'invalid_request' });
+  }
+  // The text goes along so that Claude gets the phone's resp_json exactly as written.
+  const settled = relay.hub.settle(body.request_id, shardToken, body, text);
+  // 404 (never 401/403) for unknown, settled, expired or mismatched: the tunnel client treats
+  // 401/403 as "operator action needed" and would stop.
+  return settled ? json(200, {}) : json(404, { error: 'not_found' });
+}
+
+/**
+ * @param {Relay} relay
+ * @param {Request} request
+ */
+async function startPairing(relay, request) {
+  const bytes = await readBody(request, SMALL_BODY_LIMIT_BYTES);
+  if (!bytes) return json(413, { error: 'payload_too_large' });
+  const body = parseJson(decodeUtf8(bytes));
+  if (!isPlainObject(body) || typeof body.code_sha256 !== 'string' || !HEX64.test(body.code_sha256)) {
+    return json(400, { error: 'invalid_request', error_description: 'code_sha256 must be 64 lowercase hex characters.' });
+  }
+  const ttl = body.ttl_seconds === undefined ? PAIRING_TTL_MAX_SECONDS : body.ttl_seconds;
+  if (!Number.isInteger(ttl) || ttl < 1 || ttl > PAIRING_TTL_MAX_SECONDS) {
+    return json(400, { error: 'invalid_request', error_description: 'ttl_seconds must be an integer from 1 to 600.' });
+  }
+  const expiresAt = relay.now() + ttl * 1000;
+  await relay.lock.run(() => relay.storage.put('pairing', { hash: body.code_sha256, expiresAt }));
+  return json(200, { expires_at: new Date(expiresAt).toISOString() });
+}
+
+/** @param {Relay} relay */
+async function cancelPairing(relay) {
+  await relay.lock.run(() => relay.storage.delete('pairing'));
+  return empty(204);
+}
+
+/** @param {Relay} relay */
+async function revoke(relay) {
+  const revoked = await relay.lock.run(() => {
+    relay.hub.revokeAll();
+    return relay.grants.revokeAll();
+  });
+  return json(200, { revoked_tokens: revoked });
+}

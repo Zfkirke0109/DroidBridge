@@ -6,7 +6,7 @@ import com.droidbridge.ui.product.mcp.McpSettingsView
 enum class HomeMcpRow { Off, Running, EnabledNotRunning }
 
 /** An agent a live connection serves; the declaration order is the display order. */
-enum class ConnectedAgent { LocalMcp, ChatGpt }
+enum class ConnectedAgent { LocalMcp, ChatGpt, Claude }
 
 /**
  * What the one agent-connection entry states: every agent currently connected, or, with none
@@ -48,10 +48,16 @@ object HomeProjection {
      * The one agent-connection entry: Local MCP, the ChatGPT tunnel and later agents are peers
      * under it, so it names each one that is connected. A failed read hides nothing that was read.
      */
-    fun agentConnections(mcp: HomeMcpRow, tunnelRunning: Boolean, readFailed: Boolean): AgentConnectionSummary {
+    fun agentConnections(
+        mcp: HomeMcpRow,
+        tunnelRunning: Boolean,
+        readFailed: Boolean,
+        claudeRelayRunning: Boolean = false,
+    ): AgentConnectionSummary {
         val connected = buildList {
             if (mcp == HomeMcpRow.Running) add(ConnectedAgent.LocalMcp)
             if (tunnelRunning) add(ConnectedAgent.ChatGpt)
+            if (claudeRelayRunning) add(ConnectedAgent.Claude)
         }
         return AgentConnectionSummary(connected, unreadable = readFailed && connected.isEmpty())
     }

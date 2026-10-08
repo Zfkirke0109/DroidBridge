@@ -6,12 +6,17 @@ mod app_host;
 mod automation_wake;
 mod command;
 mod guard;
+mod host_health;
 mod mcp_listener;
 mod network;
+mod remote_relay;
 mod tunnel;
 mod visual;
 
-use app_host::{AppHostControl, start_host};
+use app_host::{
+    AppHostControl, probe_existing_host, quarantine_existing_host, start_host,
+    validate_existing_host, validate_host_instance,
+};
 
 #[cfg(target_os = "android")]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -194,7 +199,9 @@ struct NativeHost {
     runtime_instance_id: UuidV4,
     product_version: String,
     admission_open: AtomicBool,
+    quarantined: AtomicBool,
     automation_wake: Arc<ApkAutomationWake>,
+    automation_scheduler: tokio::task::JoinHandle<()>,
 }
 
 type ApkAutomationWake =
@@ -959,10 +966,62 @@ fn initialize_android_execution_dispatcher(env: &mut Env<'_>) -> jni::errors::Re
 }
 
 #[cfg(target_os = "android")]
+const BRIDGE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Use the host's blocking pool so this check crosses the same JNI attach path as a real Android
+/// primitive. The check only reads the Kotlin executor registry.
+#[cfg(target_os = "android")]
+fn probe_execution_bridge(host: &NativeHost, generation: u64) -> host_health::HostHealthClass {
+    use host_health::HostHealthClass;
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    host.async_runtime.spawn_blocking(move || {
+        let _ = reply.send(probe_execution_bridge_here(generation));
+    });
+    let class = host_health::classify_bridge_reply(result.recv_timeout(BRIDGE_PROBE_TIMEOUT));
+    if class == HostHealthClass::BridgeFault {
+        host_health::latch_bridge_fault(&host.runtime_instance_id);
+    }
+    class
+}
+
+#[cfg(target_os = "android")]
+fn probe_execution_bridge_here(generation: u64) -> host_health::HostHealthClass {
+    use host_health::HostHealthClass;
+    let Some(dispatcher) = ANDROID_EXECUTION_DISPATCHER.get() else {
+        return HostHealthClass::BridgeFault;
+    };
+    let Ok(generation) = i64::try_from(generation) else {
+        return HostHealthClass::ExecutorMissing;
+    };
+    let Ok(vm) = JavaVM::singleton() else {
+        return HostHealthClass::BridgeFault;
+    };
+    match vm.attach_current_thread(|env| -> jni::errors::Result<bool> {
+        let key = env.new_string("android.framework")?;
+        env.call_static_method(
+            &**dispatcher,
+            jni_str!("probeExecutor"),
+            jni_sig!("(Ljava/lang/String;J)Z"),
+            &[JValue::Object(key.as_ref()), JValue::Long(generation)],
+        )?
+        .z()
+    }) {
+        Ok(true) => HostHealthClass::Healthy,
+        Ok(false) => HostHealthClass::ExecutorMissing,
+        Err(_) => HostHealthClass::BridgeFault,
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn probe_execution_bridge(_host: &NativeHost, _generation: u64) -> host_health::HostHealthClass {
+    host_health::HostHealthClass::Healthy
+}
+
+#[cfg(target_os = "android")]
 pub(crate) fn publish_task_activity(
     active_tasks: usize,
     canonical_revision: u64,
-    runtime_epoch: &UuidV4,
+    live: &RuntimeLive,
 ) -> Result<(), DomainError> {
     let dispatcher = ANDROID_EXECUTION_DISPATCHER.get().ok_or_else(|| {
         DomainError::new(
@@ -974,16 +1033,21 @@ pub(crate) fn publish_task_activity(
         .map_err(|_| DomainError::new(ErrorCode::ResourceLimit, "active Task count overflow"))?;
     let canonical_revision = i64::try_from(canonical_revision)
         .map_err(|_| DomainError::new(ErrorCode::ResourceLimit, "canonical revision overflow"))?;
+    let host_generation = i64::try_from(live.host_generation)
+        .map_err(|_| DomainError::new(ErrorCode::ResourceLimit, "host generation overflow"))?;
     let vm = JavaVM::singleton()
         .map_err(|_| DomainError::new(ErrorCode::InternalError, "Java VM is unavailable"))?;
     vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-        let runtime_epoch = env.new_string(runtime_epoch.as_str())?;
+        let runtime_epoch = env.new_string(live.runtime_epoch.as_str())?;
+        let runtime_instance_id = env.new_string(live.runtime_instance_id.as_str())?;
         env.call_static_method(
             &**dispatcher,
             jni_str!("taskActivityChanged"),
-            jni_sig!("(Ljava/lang/String;JJ)V"),
+            jni_sig!("(Ljava/lang/String;JLjava/lang/String;JJ)V"),
             &[
                 JValue::Object(runtime_epoch.as_ref()),
+                JValue::Long(host_generation),
+                JValue::Object(runtime_instance_id.as_ref()),
                 JValue::Long(active_tasks),
                 JValue::Long(canonical_revision),
             ],
@@ -997,7 +1061,7 @@ pub(crate) fn publish_task_activity(
 pub(crate) fn publish_task_activity(
     _active_tasks: usize,
     _canonical_revision: u64,
-    _runtime_epoch: &UuidV4,
+    _live: &RuntimeLive,
 ) -> Result<(), DomainError> {
     Ok(())
 }
@@ -1043,20 +1107,26 @@ fn dispatch_android_execution_for_with_descriptor(
     descriptor: Option<(&str, i32)>,
 ) -> Result<AndroidPrimitiveResult, DomainError> {
     let dispatcher = ANDROID_EXECUTION_DISPATCHER.get().ok_or_else(|| {
+        host_health::latch_bridge_fault(&execution.executor.fence.runtime_instance_id);
         DomainError::new(
             ErrorCode::CapabilityUnavailable,
             "Android execution dispatcher is unavailable",
         )
     })?;
-    let vm = JavaVM::singleton()
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "Java VM is unavailable"))?;
+    let vm = JavaVM::singleton().map_err(|_| {
+        host_health::latch_bridge_fault(&execution.executor.fence.runtime_instance_id);
+        DomainError::new(ErrorCode::InternalError, "Java VM is unavailable")
+    })?;
     let (error_code, result) = vm
         .attach_current_thread(|env| {
             dispatch_android_execution_jni(
                 env, dispatcher, key, primitive, payload, execution, descriptor,
             )
         })
-        .map_err(|_| DomainError::new(ErrorCode::IoError, "Android execution bridge failed"))?;
+        .map_err(|_| {
+            host_health::latch_bridge_fault(&execution.executor.fence.runtime_instance_id);
+            DomainError::new(ErrorCode::IoError, "Android execution bridge failed")
+        })?;
     if let Some((error_code, error_reason)) = error_code {
         return Err(DomainError {
             peer_reason: error_reason,
@@ -1293,17 +1363,223 @@ pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime
     }
 }
 
+/// Answers one cached-session health check. This does not test the planned-maintenance business
+/// barrier, which intentionally leaves status and TaskControl available.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeValidateHost(
+    mut env: EnvUnowned,
+    _class: JClass,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+) -> jstring {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jstring> {
+            let epoch = runtime_epoch.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let verdict = (|| -> Result<(), DomainError> {
+                let fence = AdmissionFence {
+                    runtime_epoch: UuidV4::parse(epoch).map_err(DomainError::invalid)?,
+                    host_generation: u64::try_from(host_generation)
+                        .map_err(|_| DomainError::invalid("invalid host generation"))?,
+                    runtime_instance_id: UuidV4::parse(instance).map_err(DomainError::invalid)?,
+                };
+                validate_existing_host(&fence)
+            })();
+            let token = match verdict {
+                Ok(()) => "READY",
+                Err(error) => error_code_token(error.code),
+            };
+            Ok(owned.new_string(token)?.into_raw())
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
+    }
+}
+
+/// Side-effect-free deep health evidence for the exact APK instance Kotlin admitted. This does
+/// not execute a public tool or change canonical state.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeProbeHost(
+    mut env: EnvUnowned,
+    _class: JClass,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+) -> jstring {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jstring> {
+            let epoch = runtime_epoch.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let class = match (
+                UuidV4::parse(epoch),
+                u64::try_from(host_generation),
+                UuidV4::parse(instance),
+            ) {
+                (Ok(runtime_epoch), Ok(host_generation), Ok(runtime_instance_id)) => {
+                    probe_existing_host(&AdmissionFence {
+                        runtime_epoch,
+                        host_generation,
+                        runtime_instance_id,
+                    })
+                }
+                _ => host_health::HostHealthClass::FenceMismatch,
+            };
+            Ok(owned.new_string(class.token())?.into_raw())
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeRecordHostHealthFault(
+    mut env: EnvUnowned,
+    _class: JClass,
+    canonical_base: JString,
+    product_version: JString,
+    runtime_instance_id: JString,
+    host_generation: jlong,
+    health_class: JString,
+    phase: JString,
+) -> jboolean {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jboolean> {
+            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
+            let version = product_version.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let class = health_class.mutf8_chars(owned)?.to_str().into_owned();
+            let phase = phase.mutf8_chars(owned)?.to_str().into_owned();
+            let recorded = (|| {
+                let instance = UuidV4::parse(instance).ok()?;
+                let generation = u64::try_from(host_generation).ok()?;
+                let class = host_health::HostHealthClass::from_token(&class)?;
+                let phase = host_health::HostHealthPhase::from_token(&phase)?;
+                let boot_id = read_boot_id().ok()?;
+                host_health::record_host_health_fault(
+                    Path::new(&base),
+                    &version,
+                    &boot_id,
+                    &instance,
+                    class,
+                    phase,
+                    generation,
+                )
+                .ok()
+            })()
+            .is_some();
+            Ok(if recorded { JNI_TRUE } else { JNI_FALSE })
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeQuarantineHost(
+    mut env: EnvUnowned,
+    _class: JClass,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+) -> jboolean {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jboolean> {
+            let epoch = runtime_epoch.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let removed = match (
+                UuidV4::parse(epoch),
+                u64::try_from(host_generation),
+                UuidV4::parse(instance),
+            ) {
+                (Ok(runtime_epoch), Ok(host_generation), Ok(runtime_instance_id)) => {
+                    quarantine_existing_host(&AdmissionFence {
+                        runtime_epoch,
+                        host_generation,
+                        runtime_instance_id,
+                    })
+                    .unwrap_or(false)
+                }
+                _ => false,
+            };
+            Ok(if removed { JNI_TRUE } else { JNI_FALSE })
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeLifetimeReleased(
+    mut env: EnvUnowned,
+    _class: JClass,
+    canonical_base: JString,
+) -> jboolean {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jboolean> {
+            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
+            let released =
+                persistence::FileLock::try_acquire(&Path::new(&base).join("runtime-live.lock"))
+                    .is_ok_and(|lock| lock.is_some());
+            Ok(if released { JNI_TRUE } else { JNI_FALSE })
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeSubmit(
     mut env: EnvUnowned,
     _class: JClass,
     envelope: JByteArray,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
 ) -> jbyteArray {
     match env
         .with_env(|owned| -> jni::errors::Result<jbyteArray> {
             let bytes = owned.convert_byte_array(&envelope)?;
-            let response = with_host(|host| submit_apk_public(host, &bytes))
-                .unwrap_or_else(|error| native_error_envelope(error.code, &bytes));
+            let epoch = runtime_epoch.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let response = (|| -> Result<Vec<u8>, DomainError> {
+                let fence = AdmissionFence {
+                    runtime_epoch: UuidV4::parse(epoch).map_err(DomainError::invalid)?,
+                    host_generation: u64::try_from(host_generation)
+                        .map_err(|_| DomainError::invalid("invalid host generation"))?,
+                    runtime_instance_id: UuidV4::parse(instance).map_err(DomainError::invalid)?,
+                };
+                with_host(|host| {
+                    validate_host_instance(host, Some(&fence))?;
+                    submit_apk_public(host, &bytes)
+                })
+            })()
+            .unwrap_or_else(|error| native_error_envelope(error.code, &bytes));
             Ok(owned.byte_array_from_slice(&response)?.into_raw())
         })
         .into_outcome()

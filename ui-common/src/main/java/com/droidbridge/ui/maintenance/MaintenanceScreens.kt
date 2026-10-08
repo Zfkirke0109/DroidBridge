@@ -180,4 +180,3 @@ internal fun reason(maintenance: MaintenanceState): Int = when {
     maintenance.blocker == MaintenanceBlocker.StoreCorrupt -> R.string.reason_store_unavailable
     else -> R.string.reason_runtime_unavailable
 }
-

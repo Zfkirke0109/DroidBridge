@@ -40,7 +40,7 @@ class I8_FsAndroidAdapterTest {
 
             override fun openRead(uri: String) = throw AssertionError("unexpected")
         }
-       
+
         val adapter = ContentResolverFilesystemAdapter(access) { epoch, generation, instance ->
             epoch == "10000000-0000-4000-8000-000000000001" &&
                 generation == 4L &&

@@ -58,6 +58,7 @@ import com.droidbridge.ui.product.tasks.TaskSummary
 import com.droidbridge.ui.tasks.TaskRow
 import com.droidbridge.ui.common.RowIcon
 import com.droidbridge.ui.client.CapabilityRow
+import com.droidbridge.ui.client.CapabilityRowKey
 import com.droidbridge.ui.client.ClientState
 import com.droidbridge.ui.client.RuntimeConnection
 import com.droidbridge.ui.client.RuntimeReadiness
@@ -65,6 +66,8 @@ import com.droidbridge.ui.product.home.HomeMcpRow
 import com.droidbridge.ui.product.home.HomeProjection
 import com.droidbridge.ui.product.home.HomeUsability
 import com.droidbridge.ui.product.mcp.McpSettingsReplies
+import com.droidbridge.ui.product.mcp.ClaudeRelaySettingsReplies
+import com.droidbridge.ui.product.mcp.ClaudeRelaySettingsView
 import com.droidbridge.ui.product.mcp.TunnelSettingsReplies
 import com.droidbridge.ui.product.mcp.TunnelRuntimeState
 import com.droidbridge.ui.product.mcp.TunnelSettingsView
@@ -100,7 +103,8 @@ fun HomeUiState.agentSummary(): AgentConnectionSummary? = projection?.let {
     HomeProjection.agentConnections(
         mcp = it.mcp,
         tunnelRunning = tunnel?.state == TunnelRuntimeState.Running,
-        readFailed = mcpFailed || tunnelFailed,
+        readFailed = mcpFailed || tunnelFailed || claudeRelayFailed,
+        claudeRelayRunning = claudeRelay?.state == TunnelRuntimeState.Running,
     )
 }
 
@@ -112,6 +116,8 @@ data class HomeUiState(
     /** The tunnel is the other connection way; the one agent-connection row states whether either is up. */
     val tunnel: TunnelSettingsView? = null,
     val tunnelFailed: Boolean = false,
+    val claudeRelay: ClaudeRelaySettingsView? = null,
+    val claudeRelayFailed: Boolean = false,
     /** Executions a lost instance left running, when that authority has answered. */
     val strandedExecutions: Int? = null,
     val strandedReadFailed: Boolean = false,
@@ -135,16 +141,22 @@ class HomeViewModel(
             val ended = async { tasks.list(TaskFilter.Completed, HomeProjection.ENDED_TASK_LIMIT) }
             val mcp = async { runCatching { client.mcpSettings() }.getOrNull()?.let(McpSettingsReplies::settings) }
             val tunnel = async { runCatching { client.tunnelSettings() }.getOrNull() }
+            val claudeRelay = async {
+                if (client.supportsClaudeRelay) runCatching { client.claudeRelaySettings() }.getOrNull() else null
+            }
             val stranded = async { runCatching { client.strandedExecutions() }.getOrNull() }
             val activeTasks = active.await() as? PublicResult.Success
             val endedTasks = ended.await() as? PublicResult.Success
             val settings = mcp.await()
             val tunnelSettings = tunnel.await()?.let(TunnelSettingsReplies::settings)
+            val claudeRelaySettings = claudeRelay.await()?.let(ClaudeRelaySettingsReplies::settings)
             val strandedExecutions = stranded.await()?.coerceAtLeast(0)
             mutableState.update { current ->
                 val tunnelFacts = current.copy(
                     tunnel = tunnelSettings ?: current.tunnel,
                     tunnelFailed = tunnelSettings == null,
+                    claudeRelay = claudeRelaySettings ?: current.claudeRelay,
+                    claudeRelayFailed = client.supportsClaudeRelay && claudeRelaySettings == null,
                     strandedExecutions = strandedExecutions ?: current.strandedExecutions,
                     strandedReadFailed = strandedExecutions == null,
                 )
@@ -191,6 +203,7 @@ fun HomeRoute(
     attention: List<CapabilityRow>,
     checking: Boolean,
     onCapabilityAction: (CapabilityRow) -> Unit,
+    @StringRes shizukuTitle: Int? = null,
     /** Null for an edition without an Updates page, which then shows no update slot. */
     newerVersionAvailable: Boolean?,
     openTask: (String) -> Unit,
@@ -264,7 +277,7 @@ fun HomeRoute(
                 }
                 RouteContent.Empty, RouteContent.Content ->
                     HomeContent(
-                        requireNotNull(projection), state, clientState, attention, checking, onCapabilityAction,
+                        requireNotNull(projection), state, clientState, attention, checking, onCapabilityAction, shizukuTitle,
                         newerVersionAvailable, open, viewModel::clearStrandedExecutions,
                         { viewModel.refresh() }, openTask,
                     )
@@ -281,6 +294,7 @@ private fun HomeContent(
     attention: List<CapabilityRow>,
     checking: Boolean,
     onCapabilityAction: (CapabilityRow) -> Unit,
+    @StringRes shizukuTitle: Int?,
     newerVersionAvailable: Boolean?,
     open: (HomeDestination) -> Unit,
     clearStranded: () -> Unit,
@@ -312,7 +326,14 @@ private fun HomeContent(
             Column {
                 if (attention.isNotEmpty()) SectionTitle(R.string.home_attention)
                 GroupCard {
-                    attention.forEach { row -> CapabilityListItem(row, refreshing = false, colors = transparent) { onCapabilityAction(row) } }
+                    attention.forEach { row ->
+                        CapabilityListItem(
+                            row,
+                            refreshing = false,
+                            colors = transparent,
+                            titleOverride = if (row.key == CapabilityRowKey.Shizuku) shizukuTitle else null,
+                        ) { onCapabilityAction(row) }
+                    }
                     ListItem(
                         headlineContent = { Text(stringResource(R.string.capabilities_title)) },
                         // A step still being determined asks for nothing yet, which is not the same as done.

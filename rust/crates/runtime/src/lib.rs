@@ -41,7 +41,10 @@ pub use mcp_listener::McpListener;
 pub use network::*;
 pub use ports::*;
 pub use state::*;
-pub use tunnel::{TunnelClient, TunnelError, TunnelRuntime, validate_tunnel_credentials};
+pub use tunnel::{
+    TunnelClient, TunnelError, TunnelRuntime, read_bounded, tunnel_transport,
+    validate_tunnel_credentials,
+};
 pub use vertical::*;
 pub use visual::*;
 pub use visual_input::*;

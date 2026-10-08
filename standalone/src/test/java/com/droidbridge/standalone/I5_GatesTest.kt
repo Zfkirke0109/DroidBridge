@@ -14,16 +14,30 @@ import com.droidbridge.ui.client.resolveContextRefresh
 import com.droidbridge.standalone.execution.android.AndroidExecutionBridge
 import com.droidbridge.standalone.execution.android.AndroidExecutionRegistry
 import com.droidbridge.standalone.execution.android.AndroidExecutionResult
+import com.droidbridge.standalone.execution.android.NativeAndroidExecutionDispatcher
 import com.droidbridge.standalone.execution.android.CapabilityRegistration
 import com.droidbridge.standalone.execution.android.RegisteredCapabilityState
 import com.droidbridge.standalone.runtimehost.NativeRuntime
+import com.droidbridge.standalone.runtimehost.NativeHostHealth
 import com.droidbridge.standalone.runtimehost.RuntimeFence
 import com.droidbridge.standalone.runtimehost.RuntimeHostController
 import com.droidbridge.standalone.runtimehost.RuntimeSessionState
+import com.droidbridge.standalone.runtimehost.RuntimeDeepProbeBudget
+import com.droidbridge.standalone.runtimehost.RuntimeHostHealthGate
+import com.droidbridge.standalone.runtimehost.RuntimeHostHealthPort
+import com.droidbridge.standalone.runtimehost.HostHealthPhase
+import com.droidbridge.standalone.runtimehost.diagnosticSession
+import com.droidbridge.standalone.runtimehost.suspiciousRuntimeReply
+import com.droidbridge.standalone.runtimehost.businessReplyProvesExecution
+import com.droidbridge.standalone.runtimehost.validatedByNativeHealth
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -183,7 +197,22 @@ class I5_GatesTest {
             .map { it.name }
 
         assertTrue("nativeStart" in nativeMethods)
+        assertTrue("nativeValidateHost" in nativeMethods)
+        assertTrue("nativeProbeHost" in nativeMethods)
+        assertTrue("nativeRecordHostHealthFault" in nativeMethods)
+        assertTrue("nativeQuarantineHost" in nativeMethods)
+        assertTrue("nativeLifetimeReleased" in nativeMethods)
         assertTrue("nativeSubmit" in nativeMethods)
+        assertEquals(
+            listOf(ByteArray::class.java, String::class.java, java.lang.Long.TYPE, String::class.java),
+            NativeRuntime::class.java.getDeclaredMethod(
+                "nativeSubmit",
+                ByteArray::class.java,
+                String::class.java,
+                java.lang.Long.TYPE,
+                String::class.java,
+            ).parameterTypes.toList(),
+        )
     }
 
     @Test
@@ -237,6 +266,358 @@ class I5_GatesTest {
         assertFalse(invalid.get())
         assertTrue(first.validates("epoch-a", 1, "instance-a"))
         assertFalse(first.validates("epoch-a", 2, "instance-b"))
+    }
+
+    @Test
+    fun I5_G05_cachedSessionRequiresTheSameReadyNativeInstance() {
+        val session = RuntimeSessionState(
+            started = true,
+            activeFence = RuntimeFence("epoch-a", 7, "instance-a"),
+            startFailure = "",
+        )
+        assertSame(session, session.validatedByNativeHealth("READY"))
+        for (failure in listOf("STALE_AUTHORITY", "CAPABILITY_UNAVAILABLE", "IO_ERROR")) {
+            val withdrawn = session.validatedByNativeHealth(failure)
+            assertFalse(withdrawn.started)
+            assertEquals(failure, withdrawn.startFailure)
+        }
+        assertEquals("INTERNAL_ERROR", session.validatedByNativeHealth(null).startFailure)
+        assertEquals("CAPABILITY_UNAVAILABLE", session.validatedByNativeHealth("unknown").startFailure)
+    }
+
+    @Test
+    fun I5_G05_diagnosticsNeverReportsAStartedSessionWithoutMatchingStatus() {
+        val active = RuntimeSessionState(
+            started = true,
+            activeFence = RuntimeFence("epoch-a", 7, "instance-a"),
+            startFailure = "",
+        )
+        assertSame(active, diagnosticSession(active, active, statusAvailable = true))
+        val noStatus = diagnosticSession(active, active, statusAvailable = false)
+        assertFalse(noStatus.started)
+        assertEquals("CAPABILITY_UNAVAILABLE", noStatus.startFailure)
+        val withdrawn = active.validatedByNativeHealth("STALE_AUTHORITY")
+        assertEquals("STALE_AUTHORITY", diagnosticSession(active, withdrawn, false).startFailure)
+        val replacement = active.copy(activeFence = RuntimeFence("epoch-a", 8, "instance-b"))
+        assertFalse(diagnosticSession(active, replacement, statusAvailable = true).started)
+    }
+
+    @Test
+    fun I5_G05_frameworkProbeReadsTheLiveGenerationWithoutRunningAnExecutor() {
+        val executions = java.util.concurrent.atomic.AtomicInteger()
+        val registry = AndroidExecutionRegistry { _, _, _, _, _ -> true }
+        val executor = AndroidExecutionBridge {
+            executions.incrementAndGet()
+            AndroidExecutionResult(byteArrayOf())
+        }
+        NativeAndroidExecutionDispatcher.install(registry)
+        try {
+            assertFalse(NativeAndroidExecutionDispatcher.probeExecutor("android.framework", 7))
+            assertTrue(registry.register(registration("android.framework", 7, executor)))
+            assertTrue(NativeAndroidExecutionDispatcher.probeExecutor("android.framework", 7))
+            assertFalse(NativeAndroidExecutionDispatcher.probeExecutor("android.framework", 8))
+            assertFalse(NativeAndroidExecutionDispatcher.probeExecutor("shizuku.shell", 7))
+            assertEquals(0, executions.get())
+        } finally {
+            NativeAndroidExecutionDispatcher.uninstall(registry)
+        }
+    }
+
+    @Test
+    fun I5_G05_suspiciousFailuresReprobeAtMostOncePerFiveSecondsPerInstance() {
+        val budget = RuntimeDeepProbeBudget()
+        val first = RuntimeFence("epoch-a", 7, "instance-a")
+        val replacement = RuntimeFence("epoch-a", 8, "instance-b")
+        assertTrue(budget.claim(first, 1_000))
+        assertFalse(budget.claim(first, 5_999))
+        assertTrue(budget.claim(first, 6_000))
+        assertTrue(budget.claim(replacement, 6_001))
+        assertFalse(budget.claim(first, 6_002))
+        assertFalse(budget.claim(replacement, 6_003))
+        for (code in listOf("IO_ERROR", "INTERNAL_ERROR", "RESOURCE_LIMIT")) {
+            assertTrue(suspiciousRuntimeReply("""{"outcome":"error","error":{"code":"$code"}}""".encodeToByteArray()))
+        }
+        assertTrue(suspiciousRuntimeReply(byteArrayOf()))
+        assertTrue(suspiciousRuntimeReply("not json".encodeToByteArray()))
+        assertFalse(suspiciousRuntimeReply("""{"outcome":"error","error":{"code":"NOT_FOUND"}}""".encodeToByteArray()))
+        assertFalse(suspiciousRuntimeReply("""{"outcome":"success","result":{}}""".encodeToByteArray()))
+        assertEquals(NativeHostHealth.StoreUnwritable, NativeHostHealth.decode("store_unwritable"))
+        assertEquals(NativeHostHealth.ProbeBusy, NativeHostHealth.decode("probe_busy"))
+        assertTrue(NativeHostHealth.ProbeBusy.defersAdmission)
+        assertTrue(NativeHostHealth.NotReady.defersAdmission)
+        assertFalse(NativeHostHealth.BridgeFault.defersAdmission)
+        assertFalse(NativeHostHealth.ResourceExhausted.defersAdmission)
+        assertEquals(NativeHostHealth.ProbeFailed, NativeHostHealth.decode("unknown"))
+        assertEquals(NativeHostHealth.ProbeFailed, NativeHostHealth.decode(null))
+    }
+
+    @Test
+    fun I5_G05_unhealthyHostWithdrawsRecordsThenQuarantinesBeforeReplacement() {
+        val fence = RuntimeFence("epoch", 7, "instance")
+        val active = RuntimeSessionState(started = true, activeFence = fence, startFailure = "")
+        val sessions = AtomicReference(active)
+        val events = mutableListOf<String>()
+        var released = false
+        val port = object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase): Boolean {
+                events += "record:${health.wire}:${phase.wire}"
+                return true
+            }
+            override fun quarantine(fence: RuntimeFence): Boolean {
+                events += "quarantine"
+                return true
+            }
+            override fun lifetimeReleased(): Boolean = released
+        }
+        val gate = RuntimeHostHealthGate(sessions, Any(), port) { events += "projection" }
+        assertTrue(gate.admissionCompleted(active))
+        assertTrue(gate.withdraw(active, NativeHostHealth.ResourceExhausted, HostHealthPhase.Admission))
+        assertFalse(gate.admissionCompleted(active))
+        assertEquals("RESOURCE_LIMIT", sessions.get().startFailure)
+        assertFalse(gate.mayEstablish())
+        assertEquals(15_000L, gate.establishmentRetryMillis())
+        assertFalse(gate.withdraw(active, NativeHostHealth.ResourceExhausted, HostHealthPhase.Admission))
+        released = true
+        assertTrue(gate.mayEstablish())
+        assertEquals(listOf("record:resource_exhausted:admission", "quarantine", "projection"), events)
+    }
+
+    @Test
+    fun I5_G05_initialProbeCannotAdmitASessionWithdrawnWhileItWasBlocked() {
+        val active = RuntimeSessionState(
+            started = true,
+            activeFence = RuntimeFence("epoch", 7, "instance"),
+            startFailure = "",
+        )
+        val sessions = AtomicReference(active)
+        val gate = RuntimeHostHealthGate(sessions, Any(), object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }) {}
+        gate.requireDeepProbe(requireNotNull(active.activeFence))
+        assertFalse(gate.admissionCompleted(active))
+        assertEquals(5_000L, gate.establishmentRetryMillis())
+        assertTrue(gate.initialProbePending(requireNotNull(active.activeFence)))
+        gate.markInitialProbeHealthy(requireNotNull(active.activeFence))
+        assertTrue(gate.admissionCompleted(active))
+        sessions.set(RuntimeSessionState(startFailure = "HOST_TRANSITION_PENDING"))
+        assertFalse(gate.admissionCompleted(active))
+        sessions.set(RuntimeSessionState(
+            started = true,
+            activeFence = RuntimeFence("next-epoch", 8, "next-instance"),
+            startFailure = "",
+        ))
+        assertFalse(gate.admissionCompleted(active))
+    }
+
+    @Test
+    fun I5_G05_oldInconclusiveProbeCannotReplaceSuccessorsPendingDeepProof() {
+        val old = RuntimeSessionState(true, RuntimeFence("epoch", 7, "old"), "")
+        val next = RuntimeSessionState(true, RuntimeFence("epoch", 8, "next"), "")
+        val sessions = AtomicReference(old)
+        val gate = RuntimeHostHealthGate(sessions, Any(), object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }) {}
+        sessions.set(next)
+        gate.requireDeepProbe(requireNotNull(next.activeFence))
+        assertFalse(gate.requireDeepProbeIfCurrent(old))
+        assertTrue(gate.initialProbePending(requireNotNull(next.activeFence)))
+        assertFalse(gate.admissionCompleted(next))
+    }
+
+    @Test
+    fun I5_G05_withdrawnProjectionCleanupFinishesBeforeSuccessorAdmission() {
+        val monitor = Any()
+        val old = RuntimeSessionState(true, RuntimeFence("epoch", 7, "old"), "")
+        val next = RuntimeSessionState(true, RuntimeFence("epoch", 8, "next"), "")
+        val sessions = AtomicReference(old)
+        val callbackEntered = CountDownLatch(1)
+        val finishCallback = CountDownLatch(1)
+        val establishAttempted = CountDownLatch(1)
+        val nextInstalled = CountDownLatch(1)
+        val gate = RuntimeHostHealthGate(sessions, monitor, object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }) {
+            callbackEntered.countDown()
+            check(finishCallback.await(2, TimeUnit.SECONDS))
+        }
+        val workers = Executors.newFixedThreadPool(2)
+        try {
+            val withdraw = workers.submit<Boolean> {
+                gate.withdraw(old, NativeHostHealth.HostMissing, HostHealthPhase.Settlement)
+            }
+            assertTrue(callbackEntered.await(2, TimeUnit.SECONDS))
+            assertEquals("true", gate.snapshot()["withdrawal_in_progress"]?.jsonPrimitive?.content)
+            val establish = workers.submit {
+                establishAttempted.countDown()
+                synchronized(monitor) { sessions.set(next) }
+                nextInstalled.countDown()
+            }
+            assertTrue(establishAttempted.await(2, TimeUnit.SECONDS))
+            assertFalse(nextInstalled.await(100, TimeUnit.MILLISECONDS))
+            finishCallback.countDown()
+            assertTrue(withdraw.get(2, TimeUnit.SECONDS))
+            assertEquals("false", gate.snapshot()["withdrawal_in_progress"]?.jsonPrimitive?.content)
+            establish.get(2, TimeUnit.SECONDS)
+            assertSame(next, sessions.get())
+        } finally {
+            finishCallback.countDown()
+            workers.shutdownNow()
+        }
+    }
+
+    @Test
+    fun I5_G05_consecutiveWithdrawalsBackOffAndOnlyBusinessSuccessResetsTheCount() {
+        var now = 1_000L
+        val sessions = AtomicReference(RuntimeSessionState())
+        val port = object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }
+        val gate = RuntimeHostHealthGate(sessions, Any(), port, nowMillis = { now }) {}
+        fun fail(generation: Long) {
+            val active = RuntimeSessionState(true, RuntimeFence("epoch", generation, "instance-$generation"), "")
+            sessions.set(active)
+            assertTrue(gate.withdraw(active, NativeHostHealth.StoreUnreadable, HostHealthPhase.Admission))
+        }
+
+        fail(1)
+        assertTrue(gate.mayEstablish())
+        fail(2)
+        assertTrue(gate.mayEstablish())
+        fail(3)
+        assertFalse(gate.mayEstablish())
+        assertEquals(30_000L, gate.establishmentRetryMillis())
+        now += 30_000
+        assertTrue(gate.mayEstablish())
+        fail(4)
+        assertEquals(60_000L, gate.establishmentRetryMillis())
+        now += 60_000
+        assertTrue(gate.mayEstablish())
+
+        val active = RuntimeSessionState(true, RuntimeFence("epoch", 5, "instance-5"), "")
+        sessions.set(active)
+        gate.businessResponseServed(active)
+        fail(6)
+        assertTrue(gate.mayEstablish())
+        fail(7)
+        assertTrue(gate.mayEstablish())
+        fail(8)
+        assertEquals(30_000L, gate.establishmentRetryMillis())
+        gate.clearBreaker()
+        assertTrue(gate.mayEstablish())
+    }
+
+    @Test
+    fun I5_G05_healthSnapshotRetainsBoundedFaultFactsWithoutHostIdentifiers() {
+        var now = 1_000L
+        val active = RuntimeSessionState(true, RuntimeFence("private-epoch", 7, "private-instance"), "")
+        val sessions = AtomicReference(active)
+        val gate = RuntimeHostHealthGate(sessions, Any(), object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = false
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = false
+        }, nowMillis = { now }) {}
+
+        assertNull(gate.snapshot()["last"])
+        assertTrue(gate.withdraw(active, NativeHostHealth.LeaseStale, HostHealthPhase.Admission))
+        now += 200
+        val snapshot = gate.snapshot()
+        val last = requireNotNull(snapshot["last"]).jsonObject
+        assertEquals("1", snapshot["consecutive_withdrawals"]?.jsonPrimitive?.content)
+        assertEquals("true", snapshot["release_pending"]?.jsonPrimitive?.content)
+        assertEquals("false", snapshot["withdrawal_in_progress"]?.jsonPrimitive?.content)
+        assertEquals("false", snapshot["breaker_open"]?.jsonPrimitive?.content)
+        assertEquals("lease_stale", last["class"]?.jsonPrimitive?.content)
+        assertEquals("admission", last["phase"]?.jsonPrimitive?.content)
+        assertEquals("7", last["host_generation"]?.jsonPrimitive?.content)
+        assertEquals("200", last["age_ms"]?.jsonPrimitive?.content)
+        assertEquals("false", last["fault_recorded"]?.jsonPrimitive?.content)
+        assertEquals("true", last["quarantine_accepted"]?.jsonPrimitive?.content)
+        assertFalse(snapshot.toString().contains("private-epoch"))
+        assertFalse(snapshot.toString().contains("private-instance"))
+    }
+
+    @Test
+    fun I5_G05_healthSnapshotDoesNotWaitForAStalledHostStart() {
+        val monitor = Any()
+        val gate = RuntimeHostHealthGate(AtomicReference(RuntimeSessionState()), monitor, object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }) {}
+        val holderEntered = CountDownLatch(1)
+        val releaseHolder = CountDownLatch(1)
+        val workers = Executors.newFixedThreadPool(2)
+        try {
+            val holder = workers.submit {
+                synchronized(monitor) {
+                    holderEntered.countDown()
+                    check(releaseHolder.await(5, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(holderEntered.await(2, TimeUnit.SECONDS))
+            val read = workers.submit<JsonObject> { gate.snapshot() }
+            assertEquals("0", read.get(1, TimeUnit.SECONDS)["consecutive_withdrawals"]?.jsonPrimitive?.content)
+            releaseHolder.countDown()
+            holder.get(2, TimeUnit.SECONDS)
+        } finally {
+            releaseHolder.countDown()
+            workers.shutdownNow()
+        }
+    }
+
+    @Test
+    fun I5_G05_healthSnapshotShowsWithdrawalWhileNativeFaultRecordingStalls() {
+        val active = RuntimeSessionState(true, RuntimeFence("epoch", 7, "instance"), "")
+        val sessions = AtomicReference(active)
+        val recordingEntered = CountDownLatch(1)
+        val finishRecording = CountDownLatch(1)
+        val gate = RuntimeHostHealthGate(sessions, Any(), object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase): Boolean {
+                recordingEntered.countDown()
+                check(finishRecording.await(5, TimeUnit.SECONDS))
+                return true
+            }
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = false
+        }) {}
+        val worker = Executors.newSingleThreadExecutor()
+        try {
+            val withdrawn = worker.submit<Boolean> {
+                gate.withdraw(active, NativeHostHealth.LeaseStale, HostHealthPhase.Admission)
+            }
+            assertTrue(recordingEntered.await(2, TimeUnit.SECONDS))
+            val pending = gate.snapshot()
+            assertFalse(sessions.get().started)
+            assertEquals("true", pending["release_pending"]?.jsonPrimitive?.content)
+            assertEquals("true", pending["withdrawal_in_progress"]?.jsonPrimitive?.content)
+            finishRecording.countDown()
+            assertTrue(withdrawn.get(2, TimeUnit.SECONDS))
+            assertEquals("false", gate.snapshot()["withdrawal_in_progress"]?.jsonPrimitive?.content)
+        } finally {
+            finishRecording.countDown()
+            worker.shutdownNow()
+        }
+    }
+
+    @Test
+    fun I5_G05_onlySuccessfulBusinessRepliesProveHostRecovery() {
+        val success = """{"outcome":"success","result":{}}""".encodeToByteArray()
+        val status = """{"payload":{"tool":"context"}}""".encodeToByteArray()
+        val taskControl = """{"payload":{"tool":"task_control"}}""".encodeToByteArray()
+        val business = """{"payload":{"tool":"device"}}""".encodeToByteArray()
+        assertFalse(businessReplyProvesExecution(status, success))
+        assertFalse(businessReplyProvesExecution(taskControl, success))
+        assertTrue(businessReplyProvesExecution(business, success))
+        assertFalse(businessReplyProvesExecution(business, """{"outcome":"error","error":{"code":"NOT_FOUND"}}""".encodeToByteArray()))
+        assertFalse(businessReplyProvesExecution("not json".encodeToByteArray(), success))
     }
 
     @Test

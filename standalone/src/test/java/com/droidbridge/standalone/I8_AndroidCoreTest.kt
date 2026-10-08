@@ -12,6 +12,7 @@ import com.droidbridge.standalone.execution.android.NotificationPlatform
 import com.droidbridge.standalone.execution.android.NativeAndroidExecutionDispatcher
 import com.droidbridge.standalone.execution.android.ObservedNotification
 import com.droidbridge.standalone.execution.android.VisiblePackageFact
+import com.droidbridge.standalone.runtimehost.RuntimeFence
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
@@ -23,6 +24,16 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class I8_AndroidCoreTest {
+    private fun taskActivity(fence: RuntimeFence, count: Long, revision: Long) {
+        NativeAndroidExecutionDispatcher.taskActivityChanged(
+            fence.runtimeEpoch,
+            fence.hostGeneration,
+            fence.runtimeInstanceId,
+            count,
+            revision,
+        )
+    }
+
     private class FakeAccess : AndroidMotherToolAccess {
         val calls = mutableListOf<String>()
         var clipboard: () -> String? = { null }
@@ -248,16 +259,41 @@ class I8_AndroidCoreTest {
     fun taskActivityRelayRejectsStaleCountsAndReplaysTruthAfterServiceRecreation() {
         val seen = mutableListOf<Long>()
         NativeAndroidExecutionDispatcher.installTaskActivitySink(seen::add)
-        NativeAndroidExecutionDispatcher.taskActivityChanged("epoch-a", 2, Long.MAX_VALUE - 2)
-        NativeAndroidExecutionDispatcher.taskActivityChanged("epoch-a", 2, Long.MAX_VALUE - 1)
-        NativeAndroidExecutionDispatcher.taskActivityChanged("epoch-a", 1, Long.MAX_VALUE - 3)
+        seen.clear()
+        val first = RuntimeFence("epoch-a", 7, "instance-a")
+        val replacement = RuntimeFence("epoch-b", 8, "instance-b")
+        taskActivity(first, 2, Long.MAX_VALUE - 2)
+        taskActivity(first, 2, Long.MAX_VALUE - 1)
+        taskActivity(first, 1, Long.MAX_VALUE - 3)
         NativeAndroidExecutionDispatcher.installTaskActivitySink(null)
-        NativeAndroidExecutionDispatcher.taskActivityChanged("epoch-a", 0, Long.MAX_VALUE)
+        taskActivity(first, 0, Long.MAX_VALUE)
         NativeAndroidExecutionDispatcher.installTaskActivitySink(seen::add)
-        NativeAndroidExecutionDispatcher.taskActivityChanged("epoch-b", 3, 1)
+        taskActivity(replacement, 3, 1)
         NativeAndroidExecutionDispatcher.installTaskActivitySink(null)
 
         assertEquals(listOf(2L, 0L, 3L), seen)
+    }
+
+    @Test
+    fun withdrawnHostRejectsLateTaskCountEvenAfterSameEpochSuccessorPublishes() {
+        val seen = mutableListOf<Long>()
+        val withdrawn = RuntimeFence("withdrawn-epoch", 7, "old-instance")
+        val successor = RuntimeFence("withdrawn-epoch", 7, "new-instance")
+        NativeAndroidExecutionDispatcher.installTaskActivitySink(seen::add)
+        seen.clear()
+        try {
+            taskActivity(withdrawn, 2, 12)
+            NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity(withdrawn)
+            taskActivity(withdrawn, 1, 13)
+            NativeAndroidExecutionDispatcher.installTaskActivitySink(null)
+            NativeAndroidExecutionDispatcher.installTaskActivitySink(seen::add)
+            taskActivity(successor, 1, 1)
+            taskActivity(withdrawn, 3, 14)
+            assertEquals(listOf(2L, 0L, 1L), seen)
+        } finally {
+            NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity(successor)
+            NativeAndroidExecutionDispatcher.installTaskActivitySink(null)
+        }
     }
 
 }
