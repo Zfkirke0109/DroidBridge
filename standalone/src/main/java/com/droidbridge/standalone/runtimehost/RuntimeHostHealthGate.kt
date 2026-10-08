@@ -20,7 +20,7 @@ internal class RuntimeHostHealthGate(
     private val monitor: Any,
     private val port: RuntimeHostHealthPort,
     private val nowMillis: () -> Long = { System.nanoTime() / 1_000_000 },
-    private val onWithdrawn: () -> Unit,
+    private val onWithdrawn: (RuntimeFence) -> Unit,
 ) {
     private var releasePending = false
     private var pendingInitialProbe: RuntimeFence? = null
@@ -93,7 +93,7 @@ internal class RuntimeHostHealthGate(
                     (BREAKER_BASE_MILLIS shl doublings).coerceAtMost(BREAKER_MAX_MILLIS)
             }
             // start() uses this monitor: successor projections cannot appear before cleanup ends.
-            runCatching { onWithdrawn() }
+            runCatching { onWithdrawn(fence) }
             true
         }
         return withdrawn

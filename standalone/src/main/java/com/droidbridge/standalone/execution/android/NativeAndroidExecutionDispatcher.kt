@@ -1,6 +1,7 @@
 package com.droidbridge.standalone.execution.android
 
 import android.os.ParcelFileDescriptor
+import com.droidbridge.standalone.runtimehost.RuntimeFence
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
@@ -9,9 +10,10 @@ import kotlinx.coroutines.runBlocking
 internal object NativeAndroidExecutionDispatcher {
     private val registry = AtomicReference<AndroidExecutionRegistry?>(null)
     private var taskActivitySink: ((Long) -> Unit)? = null
-    private var taskActivityEpoch: String? = null
+    private var taskActivityFence: RuntimeFence? = null
     private var taskActivityRevision = -1L
     private var activeTaskCount = 0L
+    private val withdrawnTaskSources = HashSet<RuntimeFence>()
 
     fun install(value: AndroidExecutionRegistry) {
         check(registry.compareAndSet(null, value) || registry.get() === value)
@@ -34,24 +36,35 @@ internal object NativeAndroidExecutionDispatcher {
 
     @JvmStatic
     @Synchronized
-    fun taskActivityChanged(runtimeEpoch: String, activeTasks: Long, canonicalRevision: Long) {
-        if (runtimeEpoch.isEmpty() || activeTasks < 0 || canonicalRevision < 0) return
-        val epochChanged = runtimeEpoch != taskActivityEpoch
-        if (epochChanged) {
-            taskActivityEpoch = runtimeEpoch
+    fun taskActivityChanged(
+        runtimeEpoch: String,
+        hostGeneration: Long,
+        runtimeInstanceId: String,
+        activeTasks: Long,
+        canonicalRevision: Long,
+    ) {
+        if (runtimeEpoch.isEmpty() || hostGeneration <= 0 || runtimeInstanceId.isEmpty() ||
+            activeTasks < 0 || canonicalRevision < 0
+        ) return
+        val source = RuntimeFence(runtimeEpoch, hostGeneration, runtimeInstanceId)
+        if (source in withdrawnTaskSources) return
+        val sourceChanged = source != taskActivityFence
+        if (sourceChanged) {
+            taskActivityFence = source
             taskActivityRevision = -1L
         }
         if (canonicalRevision <= taskActivityRevision) return
         taskActivityRevision = canonicalRevision
-        if (!epochChanged && activeTasks == activeTaskCount) return
+        if (!sourceChanged && activeTasks == activeTaskCount) return
         activeTaskCount = activeTasks
         taskActivitySink?.invoke(activeTasks)
     }
 
-    /** A withdrawn host no longer owns Tasks that can justify a foreground hold. */
+    /** Retire the exact JNI source before clearing its foreground hold. */
     @Synchronized
-    fun forgetRuntimeTaskActivity() {
-        taskActivityEpoch = null
+    fun forgetRuntimeTaskActivity(fence: RuntimeFence) {
+        withdrawnTaskSources += fence
+        taskActivityFence = null
         taskActivityRevision = -1L
         if (activeTaskCount == 0L) return
         activeTaskCount = 0L

@@ -1021,7 +1021,7 @@ fn probe_execution_bridge(_host: &NativeHost, _generation: u64) -> host_health::
 pub(crate) fn publish_task_activity(
     active_tasks: usize,
     canonical_revision: u64,
-    runtime_epoch: &UuidV4,
+    live: &RuntimeLive,
 ) -> Result<(), DomainError> {
     let dispatcher = ANDROID_EXECUTION_DISPATCHER.get().ok_or_else(|| {
         DomainError::new(
@@ -1033,16 +1033,21 @@ pub(crate) fn publish_task_activity(
         .map_err(|_| DomainError::new(ErrorCode::ResourceLimit, "active Task count overflow"))?;
     let canonical_revision = i64::try_from(canonical_revision)
         .map_err(|_| DomainError::new(ErrorCode::ResourceLimit, "canonical revision overflow"))?;
+    let host_generation = i64::try_from(live.host_generation)
+        .map_err(|_| DomainError::new(ErrorCode::ResourceLimit, "host generation overflow"))?;
     let vm = JavaVM::singleton()
         .map_err(|_| DomainError::new(ErrorCode::InternalError, "Java VM is unavailable"))?;
     vm.attach_current_thread(|env| -> jni::errors::Result<()> {
-        let runtime_epoch = env.new_string(runtime_epoch.as_str())?;
+        let runtime_epoch = env.new_string(live.runtime_epoch.as_str())?;
+        let runtime_instance_id = env.new_string(live.runtime_instance_id.as_str())?;
         env.call_static_method(
             &**dispatcher,
             jni_str!("taskActivityChanged"),
-            jni_sig!("(Ljava/lang/String;JJ)V"),
+            jni_sig!("(Ljava/lang/String;JLjava/lang/String;JJ)V"),
             &[
                 JValue::Object(runtime_epoch.as_ref()),
+                JValue::Long(host_generation),
+                JValue::Object(runtime_instance_id.as_ref()),
                 JValue::Long(active_tasks),
                 JValue::Long(canonical_revision),
             ],
@@ -1056,7 +1061,7 @@ pub(crate) fn publish_task_activity(
 pub(crate) fn publish_task_activity(
     _active_tasks: usize,
     _canonical_revision: u64,
-    _runtime_epoch: &UuidV4,
+    _live: &RuntimeLive,
 ) -> Result<(), DomainError> {
     Ok(())
 }

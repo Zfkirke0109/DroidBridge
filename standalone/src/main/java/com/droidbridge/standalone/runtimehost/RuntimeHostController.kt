@@ -545,9 +545,9 @@ internal class RuntimeHostController(
     }
 
     /** A health withdrawal clears host-owned process projections while retaining its exact alarm. */
-    private fun onHealthWithdrawn() {
+    private fun onHealthWithdrawn(fence: RuntimeFence) {
         runCatching { hostWithdrawnSink.get()?.invoke() }
-        runCatching { NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity() }
+        runCatching { NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity(fence) }
         runCatching { hintSink.get()?.invoke("context.status") }
     }
 
