@@ -14,6 +14,9 @@ import java.nio.file.Files
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -168,6 +171,93 @@ class I17_ClaudeRelaySettingsControllerTest {
         assertEquals("IO_ERROR", error(controller().settings()))
     }
 
+    @Test
+    fun i17_aSlowValidationCannotBlockServiceShutdownOrCommitAfterIt() {
+        val controller = controller()
+        val gate = CallGate()
+        runtime.onValidate = { gate.block() }
+        val reply = callWhileSuspending(controller, gate) {
+            controller.configure(ORIGIN, DEVICE_KEY, foreground::add)
+        }
+        assertEquals("RELAY_UNAVAILABLE", error(reply))
+        assertFalse(File(directory, "claude-relay.json").exists())
+        assertEquals(TUNNEL_STOPPED, runtime.state())
+    }
+
+    @Test
+    fun i17_slowPairAndRevokeCannotBlockServiceShutdownOrReportStaleSuccess() {
+        val controller = controller()
+        controller.configure(ORIGIN, DEVICE_KEY, foreground::add)
+        val pairGate = CallGate()
+        runtime.onPair = { pairGate.block() }
+        val pairReply = callWhileSuspending(controller, pairGate, controller::pair)
+        assertEquals("RELAY_UNAVAILABLE", error(pairReply))
+        assertFalse(pairReply.contains("pairing_code"))
+
+        controller.restore(foreground::add)
+        val revokeGate = CallGate()
+        runtime.onRevoke = { revokeGate.block() }
+        val revokeReply = callWhileSuspending(controller, revokeGate, controller::revokeClaude)
+        assertEquals("RELAY_UNAVAILABLE", error(revokeReply))
+    }
+
+    @Test
+    fun i17_aSlowEarlierConfigurationCannotReplaceALaterConfiguration() {
+        val controller = controller()
+        val gate = CallGate()
+        runtime.onValidate = { origin -> if (origin == ORIGIN) gate.block() }
+        val earlierReply = AtomicReference<String?>()
+        val earlier = Thread {
+            earlierReply.set(controller.configure(ORIGIN, DEVICE_KEY, foreground::add))
+        }
+        earlier.start()
+        try {
+            assertTrue("earlier validation started", gate.entered.await(5, TimeUnit.SECONDS))
+            assertTrue(boolean(controller.configure(OTHER_ORIGIN, DEVICE_KEY, foreground::add), "configured"))
+        } finally {
+            gate.release.countDown()
+            earlier.join(5_000)
+        }
+        assertFalse("earlier validation ended", earlier.isAlive)
+        assertEquals("RELAY_UNAVAILABLE", error(requireNotNull(earlierReply.get())))
+        assertEquals(OTHER_ORIGIN, string(controller.settings(), "relay_url"))
+    }
+
+    private fun callWhileSuspending(
+        controller: ClaudeRelaySettingsController,
+        gate: CallGate,
+        call: () -> String,
+    ): String {
+        val reply = AtomicReference<String?>()
+        val operation = Thread { reply.set(call()) }
+        var shutdown: Thread? = null
+        operation.start()
+        try {
+            assertTrue("network call started", gate.entered.await(5, TimeUnit.SECONDS))
+            val stopping = Thread { controller.suspendRuntime(foreground::add) }
+            shutdown = stopping
+            stopping.start()
+            stopping.join(2_000)
+            assertFalse("shutdown must not wait for the network", stopping.isAlive)
+        } finally {
+            gate.release.countDown()
+            operation.join(5_000)
+            shutdown?.join(5_000)
+        }
+        assertFalse("network call ended", operation.isAlive)
+        return requireNotNull(reply.get())
+    }
+
+    private class CallGate {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+
+        fun block() {
+            entered.countDown()
+            check(release.await(10, TimeUnit.SECONDS))
+        }
+    }
+
     private fun sha256(value: String): String =
         MessageDigest.getInstance("SHA-256").digest(value.encodeToByteArray()).joinToString("") { "%02x".format(it) }
 
@@ -189,10 +279,14 @@ class I17_ClaudeRelaySettingsControllerTest {
         var revoked: Pair<String, String>? = null
         var paired: Pairing? = null
         var starts = 0
+        var onValidate: ((String) -> Unit)? = null
+        var onPair: (() -> Unit)? = null
+        var onRevoke: (() -> Unit)? = null
         private var current = TUNNEL_STOPPED
 
         override fun validate(relayUrl: String, deviceKey: String): String {
             validated = relayUrl to deviceKey
+            onValidate?.invoke(relayUrl)
             return validation
         }
 
@@ -214,11 +308,13 @@ class I17_ClaudeRelaySettingsControllerTest {
 
         override fun pair(relayUrl: String, deviceKey: String, codeSha256: String, ttlSeconds: Int): String {
             paired = Pairing(relayUrl, deviceKey, codeSha256, ttlSeconds)
+            onPair?.invoke()
             return pairAnswer
         }
 
         override fun revoke(relayUrl: String, deviceKey: String): String {
             revoked = relayUrl to deviceKey
+            onRevoke?.invoke()
             return revokeAnswer
         }
     }
@@ -269,6 +365,7 @@ class I17_ClaudeRelaySettingsControllerTest {
 
     private companion object {
         const val ORIGIN = "https://relay.example.workers.dev"
+        const val OTHER_ORIGIN = "https://replacement.example.workers.dev"
         const val DEVICE_KEY = "dbrk_TESTTESTTESTTESTTESTTESTTESTTESTTESTTESTTES"
         const val NOW = 1_791_300_000_000L
     }

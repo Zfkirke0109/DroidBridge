@@ -74,6 +74,9 @@ internal class ClaudeRelaySettingsController(
     private var committed: Committed? = null
     private var loaded = false
     private var generation = 0L
+    /** Invalidates slow relay calls when settings are replaced or this service is suspended. */
+    private var settingsEpoch = 0L
+    private var suspended = false
     private var watching = false
     private var failure: String? = null
 
@@ -93,28 +96,45 @@ internal class ClaudeRelaySettingsController(
         val firstCallEpochMs: Long? = null,
     )
 
+    private data class RelayCall(
+        val settings: Committed,
+        val deviceKey: String,
+        val settingsEpoch: Long,
+    )
+
     fun settings(): String = synchronized(lock) {
         load().fold({ status(it) }) { IO_ERROR }
     }
 
-    fun configure(relayUrl: String, deviceKey: String, foreground: (Boolean) -> Unit): String = synchronized(lock) {
+    fun configure(relayUrl: String, deviceKey: String, foreground: (Boolean) -> Unit): String {
         val origin = relayOrigin(relayUrl) ?: return INVALID_CONFIG
         if (!isDeviceKey(deviceKey)) return INVALID_CONFIG
-        when (runtime.validate(origin, deviceKey)) {
-            RELAY_CALL_VALID -> Unit
-            RELAY_CALL_INVALID_KEY -> return DEVICE_KEY_INVALID
-            RELAY_CALL_INVALID_RELAY -> return RELAY_NOT_FOUND
-            RELAY_CALL_NOT_CONFIGURED -> return RELAY_NOT_CONFIGURED
-            else -> return RELAY_UNAVAILABLE
+        val expectedEpoch = synchronized(lock) {
+            if (suspended) return RELAY_UNAVAILABLE
+            ++settingsEpoch
         }
-        val current = load().getOrElse { return IO_ERROR }
-        val credential = runCatching { cipher.encrypt(origin, deviceKey) }.getOrElse { return IO_ERROR }
-        val next = commit(Committed(current?.enabled == true, origin, credential)).getOrElse { return IO_ERROR }
-        if (next.enabled) restart(foreground)
-        status(next)
+        // Validation can wait on the network for 15 seconds. Do not hold the service lifecycle
+        // lock while it runs: onDestroy must be able to stop the relay in the meantime.
+        val answer = runtime.validate(origin, deviceKey)
+        return synchronized(lock) {
+            if (suspended || expectedEpoch != settingsEpoch) return RELAY_UNAVAILABLE
+            when (answer) {
+                RELAY_CALL_VALID -> Unit
+                RELAY_CALL_INVALID_KEY -> return DEVICE_KEY_INVALID
+                RELAY_CALL_INVALID_RELAY -> return RELAY_NOT_FOUND
+                RELAY_CALL_NOT_CONFIGURED -> return RELAY_NOT_CONFIGURED
+                else -> return RELAY_UNAVAILABLE
+            }
+            val current = load().getOrElse { return IO_ERROR }
+            val credential = runCatching { cipher.encrypt(origin, deviceKey) }.getOrElse { return IO_ERROR }
+            val next = commit(Committed(current?.enabled == true, origin, credential)).getOrElse { return IO_ERROR }
+            if (next.enabled) restart(foreground)
+            status(next)
+        }
     }
 
     fun setEnabled(enabled: Boolean, foreground: (Boolean) -> Unit): String = synchronized(lock) {
+        if (suspended) return RELAY_UNAVAILABLE
         val current = load().getOrElse { return IO_ERROR } ?: return NOT_CONFIGURED
         if (enabled) {
             val next = if (current.enabled) current else commit(current.copy(enabled = true)).getOrElse { return IO_ERROR }
@@ -131,39 +151,56 @@ internal class ClaudeRelaySettingsController(
      * Publishes a fresh pairing code's hash to the relay and returns the code for the user to type
      * into the relay's consent page. The code never leaves the phone except on screen.
      */
-    fun pair(): String = synchronized(lock) {
-        val current = load().getOrElse { return IO_ERROR } ?: return NOT_CONFIGURED
-        val deviceKey = deviceKey(current) ?: return CREDENTIALS_UNAVAILABLE_ERROR
-        val code = pairingCode(random)
-        when (runtime.pair(current.relayUrl, deviceKey, pairingCodeSha256(code), PAIRING_TTL_SECONDS)) {
-            RELAY_CALL_OK -> Unit
-            RELAY_CALL_INVALID_KEY -> return DEVICE_KEY_INVALID
-            RELAY_CALL_INVALID_RELAY -> return RELAY_NOT_FOUND
-            RELAY_CALL_NOT_CONFIGURED -> return RELAY_NOT_CONFIGURED
-            else -> return RELAY_UNAVAILABLE
+    fun pair(): String {
+        val call = synchronized(lock) {
+            if (suspended) return RELAY_UNAVAILABLE
+            val current = load().getOrElse { return IO_ERROR } ?: return NOT_CONFIGURED
+            RelayCall(current, deviceKey(current) ?: return CREDENTIALS_UNAVAILABLE_ERROR, settingsEpoch)
         }
-        buildJsonObject {
-            put("schema_version", SCHEMA_VERSION)
-            put("pairing_code", "${code.substring(0, 4)}-${code.substring(4)}")
-            put("expires_at_epoch_ms", nowEpochMs() + PAIRING_TTL_SECONDS * 1_000L)
-        }.toString()
+        val code = pairingCode(random)
+        val answer = runtime.pair(call.settings.relayUrl, call.deviceKey, pairingCodeSha256(code), PAIRING_TTL_SECONDS)
+        return synchronized(lock) {
+            // A code published to an old relay must never be displayed as the current pairing.
+            if (suspended || call.settingsEpoch != settingsEpoch) return RELAY_UNAVAILABLE
+            when (answer) {
+                RELAY_CALL_OK -> Unit
+                RELAY_CALL_INVALID_KEY -> return DEVICE_KEY_INVALID
+                RELAY_CALL_INVALID_RELAY -> return RELAY_NOT_FOUND
+                RELAY_CALL_NOT_CONFIGURED -> return RELAY_NOT_CONFIGURED
+                else -> return RELAY_UNAVAILABLE
+            }
+            buildJsonObject {
+                put("schema_version", SCHEMA_VERSION)
+                put("pairing_code", "${code.substring(0, 4)}-${code.substring(4)}")
+                put("expires_at_epoch_ms", nowEpochMs() + PAIRING_TTL_SECONDS * 1_000L)
+            }.toString()
+        }
     }
 
     /** Revokes every grant Claude holds at the relay; the relay settings themselves stay. */
-    fun revokeClaude(): String = synchronized(lock) {
-        val current = load().getOrElse { return IO_ERROR } ?: return NOT_CONFIGURED
-        val deviceKey = deviceKey(current) ?: return CREDENTIALS_UNAVAILABLE_ERROR
-        when (runtime.revoke(current.relayUrl, deviceKey)) {
-            RELAY_CALL_OK -> status(current)
-            RELAY_CALL_INVALID_KEY -> DEVICE_KEY_INVALID
-            RELAY_CALL_INVALID_RELAY -> RELAY_NOT_FOUND
-            RELAY_CALL_NOT_CONFIGURED -> RELAY_NOT_CONFIGURED
-            else -> RELAY_UNAVAILABLE
+    fun revokeClaude(): String {
+        val call = synchronized(lock) {
+            if (suspended) return RELAY_UNAVAILABLE
+            val current = load().getOrElse { return IO_ERROR } ?: return NOT_CONFIGURED
+            RelayCall(current, deviceKey(current) ?: return CREDENTIALS_UNAVAILABLE_ERROR, settingsEpoch)
+        }
+        val answer = runtime.revoke(call.settings.relayUrl, call.deviceKey)
+        return synchronized(lock) {
+            // Revoking an old relay must not be reported as revoking a newly configured one.
+            if (suspended || call.settingsEpoch != settingsEpoch) return RELAY_UNAVAILABLE
+            when (answer) {
+                RELAY_CALL_OK -> status(call.settings)
+                RELAY_CALL_INVALID_KEY -> DEVICE_KEY_INVALID
+                RELAY_CALL_INVALID_RELAY -> RELAY_NOT_FOUND
+                RELAY_CALL_NOT_CONFIGURED -> RELAY_NOT_CONFIGURED
+                else -> RELAY_UNAVAILABLE
+            }
         }
     }
 
     fun clear(foreground: (Boolean) -> Unit): String = synchronized(lock) {
         load().getOrElse { return IO_ERROR }
+        settingsEpoch += 1
         stop(foreground)
         runCatching {
             if (file.exists()) {
@@ -180,13 +217,21 @@ internal class ClaudeRelaySettingsController(
 
     fun restore(foreground: (Boolean) -> Unit) {
         synchronized(lock) {
+            if (suspended) {
+                settingsEpoch += 1
+                suspended = false
+            }
             val current = load().getOrNull() ?: return
             if (current.enabled) start(foreground)
         }
     }
 
     fun suspendRuntime(foreground: (Boolean) -> Unit) {
-        synchronized(lock) { stop(foreground) }
+        synchronized(lock) {
+            settingsEpoch += 1
+            suspended = true
+            stop(foreground)
+        }
     }
 
     private fun deviceKey(current: Committed): String? =
