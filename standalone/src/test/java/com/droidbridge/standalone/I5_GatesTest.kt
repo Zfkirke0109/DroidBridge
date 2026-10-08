@@ -20,6 +20,8 @@ import com.droidbridge.standalone.runtimehost.NativeRuntime
 import com.droidbridge.standalone.runtimehost.RuntimeFence
 import com.droidbridge.standalone.runtimehost.RuntimeHostController
 import com.droidbridge.standalone.runtimehost.RuntimeSessionState
+import com.droidbridge.standalone.runtimehost.diagnosticSession
+import com.droidbridge.standalone.runtimehost.validatedByNativeHealth
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -183,7 +185,18 @@ class I5_GatesTest {
             .map { it.name }
 
         assertTrue("nativeStart" in nativeMethods)
+        assertTrue("nativeValidateHost" in nativeMethods)
         assertTrue("nativeSubmit" in nativeMethods)
+        assertEquals(
+            listOf(ByteArray::class.java, String::class.java, java.lang.Long.TYPE, String::class.java),
+            NativeRuntime::class.java.getDeclaredMethod(
+                "nativeSubmit",
+                ByteArray::class.java,
+                String::class.java,
+                java.lang.Long.TYPE,
+                String::class.java,
+            ).parameterTypes.toList(),
+        )
     }
 
     @Test
@@ -237,6 +250,40 @@ class I5_GatesTest {
         assertFalse(invalid.get())
         assertTrue(first.validates("epoch-a", 1, "instance-a"))
         assertFalse(first.validates("epoch-a", 2, "instance-b"))
+    }
+
+    @Test
+    fun I5_G05_cachedSessionRequiresTheSameReadyNativeInstance() {
+        val session = RuntimeSessionState(
+            started = true,
+            activeFence = RuntimeFence("epoch-a", 7, "instance-a"),
+            startFailure = "",
+        )
+        assertSame(session, session.validatedByNativeHealth("READY"))
+        for (failure in listOf("STALE_AUTHORITY", "CAPABILITY_UNAVAILABLE", "IO_ERROR")) {
+            val withdrawn = session.validatedByNativeHealth(failure)
+            assertFalse(withdrawn.started)
+            assertEquals(failure, withdrawn.startFailure)
+        }
+        assertEquals("INTERNAL_ERROR", session.validatedByNativeHealth(null).startFailure)
+        assertEquals("CAPABILITY_UNAVAILABLE", session.validatedByNativeHealth("unknown").startFailure)
+    }
+
+    @Test
+    fun I5_G05_diagnosticsNeverReportsAStartedSessionWithoutMatchingStatus() {
+        val active = RuntimeSessionState(
+            started = true,
+            activeFence = RuntimeFence("epoch-a", 7, "instance-a"),
+            startFailure = "",
+        )
+        assertSame(active, diagnosticSession(active, active, statusAvailable = true))
+        val noStatus = diagnosticSession(active, active, statusAvailable = false)
+        assertFalse(noStatus.started)
+        assertEquals("CAPABILITY_UNAVAILABLE", noStatus.startFailure)
+        val withdrawn = active.validatedByNativeHealth("STALE_AUTHORITY")
+        assertEquals("STALE_AUTHORITY", diagnosticSession(active, withdrawn, false).startFailure)
+        val replacement = active.copy(activeFence = RuntimeFence("epoch-a", 8, "instance-b"))
+        assertFalse(diagnosticSession(active, replacement, statusAvailable = true).started)
     }
 
     @Test

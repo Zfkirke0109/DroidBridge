@@ -56,6 +56,25 @@ internal data class RuntimeSessionState(
     } == true
 }
 
+/** A cached Kotlin session is usable only while native still names the same ready host. */
+internal fun RuntimeSessionState.validatedByNativeHealth(verdict: String?): RuntimeSessionState {
+    if (!started) return this
+    if (verdict == "READY") return this
+    return RuntimeSessionState(startFailure = verdict?.let(::runtimeErrorToken) ?: ErrorToken.InternalError.wire)
+}
+
+/** A status read only proves the same session healthy if it answered before authority moved. */
+internal fun diagnosticSession(
+    observed: RuntimeSessionState,
+    current: RuntimeSessionState,
+    statusAvailable: Boolean,
+): RuntimeSessionState {
+    if (!observed.started) return observed
+    if (statusAvailable && current === observed) return observed
+    val failure = if (current.started) ErrorToken.CapabilityUnavailable.wire else current.startFailure
+    return RuntimeSessionState(startFailure = failure)
+}
+
 /**
  * The App's one Runtime host: it starts the native Runtime in this process, publishes the App's
  * platform facts to it and owns every maintenance operation on its canonical store.
@@ -82,7 +101,24 @@ internal class RuntimeHostController(
     @Synchronized
     fun start(): Boolean {
         val observedSession = runtimeSession.get()
-        if (observedSession.started) return true
+        if (observedSession.started) {
+            // Keep status and TaskControl available during planned maintenance: this validates
+            // the instance and its readiness, leaving business admission to the native Runtime.
+            val fence = requireNotNull(observedSession.activeFence)
+            val verdict = runCatching {
+                NativeRuntime.nativeValidateHost(
+                    fence.runtimeEpoch,
+                    fence.hostGeneration,
+                    fence.runtimeInstanceId,
+                )
+            }.getOrNull()
+            val validated = observedSession.validatedByNativeHealth(verdict)
+            if (validated !== observedSession) {
+                runtimeSession.compareAndSet(observedSession, validated)
+                return false
+            }
+            return runtimeSession.get() === observedSession
+        }
         // A reset in progress owns the store until it activates the fresh instance itself.
         if (observedSession.startFailure == ErrorToken.HostTransitionPending.wire) return false
         val packageInfo = application.packageManager.getPackageInfo(application.packageName, 0)
@@ -215,7 +251,12 @@ internal class RuntimeHostController(
         val fence = runtimeSession.get().activeFence ?: throw RuntimeStartException(runtimeSession.get().startFailure)
         frameworkReadySink.get()?.invoke(fence.hostGeneration)
         registerPlatformFacts()
-        return NativeRuntime.nativeSubmit(envelope)
+        return NativeRuntime.nativeSubmit(
+            envelope,
+            fence.runtimeEpoch,
+            fence.hostGeneration,
+            fence.runtimeInstanceId,
+        )
     }
 
     /** Answers one S-MCP-006 internal artifact query from this host's own artifact store. */
@@ -323,14 +364,15 @@ internal class RuntimeHostController(
         } else {
             null
         }
+        val displayedSession = diagnosticSession(session, runtimeSession.get(), status != null)
         return buildJsonObject {
             put("schema_version", 1)
             put("session", buildJsonObject {
-                put("started", session.started)
+                put("started", displayedSession.started)
                 put("host", "apk_runtime")
-                if (!session.started) put("start_failure", session.startFailure)
+                if (!displayedSession.started) put("start_failure", displayedSession.startFailure)
             })
-            status?.let { put("status", it) }
+            status?.takeIf { displayedSession.started }?.let { put("status", it) }
         }.toString()
     }
 

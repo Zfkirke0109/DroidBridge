@@ -363,21 +363,68 @@ fn publish_ready_host(
 }
 
 fn existing_host_result(host: &NativeHost) -> Result<StartResult, DomainError> {
-    host.store.validate_lease(&host._lease)?;
-    let capability = host
-        .runtime
-        .capability_port(host.runtime_instance_id.clone())
-        .current()?;
-    if crate::guard::is_quarantined()
-        || !host.admission_open.load(Ordering::SeqCst)
-        || capability.context.readiness != RuntimeReadiness::Ready
-    {
+    validate_host_instance(host, None)?;
+    if !host.admission_open.load(Ordering::SeqCst) {
         return Err(DomainError::new(
             ErrorCode::CapabilityUnavailable,
             "APK Runtime is not ready",
         ));
     }
     Ok(start_result(host._lease.live()))
+}
+
+/// Revalidates a cached App session without changing the native slot or closing read-only
+/// requests during planned maintenance. The lease and native capability fence must still name
+/// precisely the instance Kotlin previously adopted.
+pub(super) fn validate_existing_host(expected: &AdmissionFence) -> Result<(), DomainError> {
+    let host = host_slot()
+        .lock()
+        .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?
+        .clone()
+        .ok_or_else(|| {
+            DomainError::new(
+                ErrorCode::CapabilityUnavailable,
+                "APK Runtime is not started",
+            )
+        })?;
+    validate_host_instance(&host, Some(expected))
+}
+
+pub(super) fn validate_host_instance(
+    host: &NativeHost,
+    expected: Option<&AdmissionFence>,
+) -> Result<(), DomainError> {
+    host.store.validate_lease(&host._lease)?;
+    let live = host._lease.live();
+    if expected.is_some_and(|fence| !fence_names_live(fence, live)) {
+        return Err(DomainError::new(
+            ErrorCode::StaleAuthority,
+            "APK Runtime fence changed",
+        ));
+    }
+    let capability = host
+        .runtime
+        .capability_port(host.runtime_instance_id.clone())
+        .current()?;
+    if expected.is_some_and(|fence| capability.fence != *fence) {
+        return Err(DomainError::new(
+            ErrorCode::StaleAuthority,
+            "APK Runtime capability fence changed",
+        ));
+    }
+    if crate::guard::is_quarantined() || capability.context.readiness != RuntimeReadiness::Ready {
+        return Err(DomainError::new(
+            ErrorCode::CapabilityUnavailable,
+            "APK Runtime is not ready",
+        ));
+    }
+    Ok(())
+}
+
+fn fence_names_live(fence: &AdmissionFence, live: &RuntimeLive) -> bool {
+    fence.runtime_epoch == live.runtime_epoch
+        && fence.host_generation == live.host_generation
+        && fence.runtime_instance_id == live.runtime_instance_id
 }
 
 fn start_result(live: &RuntimeLive) -> StartResult {
@@ -455,4 +502,53 @@ fn record_scheduler_fault(
         now_ms,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(number: u64) -> UuidV4 {
+        UuidV4::parse(format!("00000000-0000-4000-8000-{number:012x}")).unwrap()
+    }
+
+    #[test]
+    fn cached_session_fence_must_name_the_exact_live_instance() {
+        let live = RuntimeLive {
+            runtime_epoch: id(1),
+            host: RuntimeHost::ApkRuntime,
+            host_generation: 7,
+            runtime_instance_id: id(2),
+            boot_id: id(3),
+            pid: 42,
+            start_ticks: 99,
+        };
+        let expected = AdmissionFence {
+            runtime_epoch: id(1),
+            host_generation: 7,
+            runtime_instance_id: id(2),
+        };
+        assert!(fence_names_live(&expected, &live));
+        assert!(!fence_names_live(
+            &AdmissionFence {
+                runtime_epoch: id(4),
+                ..expected.clone()
+            },
+            &live
+        ));
+        assert!(!fence_names_live(
+            &AdmissionFence {
+                host_generation: 8,
+                ..expected.clone()
+            },
+            &live
+        ));
+        assert!(!fence_names_live(
+            &AdmissionFence {
+                runtime_instance_id: id(5),
+                ..expected
+            },
+            &live
+        ));
+    }
 }

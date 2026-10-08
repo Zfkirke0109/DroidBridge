@@ -2,7 +2,13 @@ package com.droidbridge.standalone.runtimehost
 
 internal object NativeRuntime {
     external fun nativeStart(canonicalBase: String, environmentJson: String): String
-    external fun nativeSubmit(envelope: ByteArray): ByteArray
+    external fun nativeValidateHost(runtimeEpoch: String, hostGeneration: Long, runtimeInstanceId: String): String?
+    external fun nativeSubmit(
+        envelope: ByteArray,
+        runtimeEpoch: String,
+        hostGeneration: Long,
+        runtimeInstanceId: String,
+    ): ByteArray
     external fun nativeQueryArtifacts(query: ByteArray, descriptor: IntArray): ByteArray?
     external fun nativeMcpStart(port: Int, token: String, productVersion: String): Boolean
     external fun nativeMcpSetToken(token: String): Boolean

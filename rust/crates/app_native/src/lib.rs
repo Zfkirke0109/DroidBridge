@@ -12,7 +12,7 @@ mod remote_relay;
 mod tunnel;
 mod visual;
 
-use app_host::{AppHostControl, start_host};
+use app_host::{AppHostControl, start_host, validate_existing_host, validate_host_instance};
 
 #[cfg(target_os = "android")]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -1294,17 +1294,75 @@ pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime
     }
 }
 
+/// Answers one cached-session health check. This does not test the planned-maintenance business
+/// barrier, which intentionally leaves status and TaskControl available.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeValidateHost(
+    mut env: EnvUnowned,
+    _class: JClass,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+) -> jstring {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jstring> {
+            let epoch = runtime_epoch.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let verdict = (|| -> Result<(), DomainError> {
+                let fence = AdmissionFence {
+                    runtime_epoch: UuidV4::parse(epoch).map_err(DomainError::invalid)?,
+                    host_generation: u64::try_from(host_generation)
+                        .map_err(|_| DomainError::invalid("invalid host generation"))?,
+                    runtime_instance_id: UuidV4::parse(instance).map_err(DomainError::invalid)?,
+                };
+                validate_existing_host(&fence)
+            })();
+            let token = match verdict {
+                Ok(()) => "READY",
+                Err(error) => error_code_token(error.code),
+            };
+            Ok(owned.new_string(token)?.into_raw())
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeSubmit(
     mut env: EnvUnowned,
     _class: JClass,
     envelope: JByteArray,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
 ) -> jbyteArray {
     match env
         .with_env(|owned| -> jni::errors::Result<jbyteArray> {
             let bytes = owned.convert_byte_array(&envelope)?;
-            let response = with_host(|host| submit_apk_public(host, &bytes))
-                .unwrap_or_else(|error| native_error_envelope(error.code, &bytes));
+            let epoch = runtime_epoch.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let response = (|| -> Result<Vec<u8>, DomainError> {
+                let fence = AdmissionFence {
+                    runtime_epoch: UuidV4::parse(epoch).map_err(DomainError::invalid)?,
+                    host_generation: u64::try_from(host_generation)
+                        .map_err(|_| DomainError::invalid("invalid host generation"))?,
+                    runtime_instance_id: UuidV4::parse(instance).map_err(DomainError::invalid)?,
+                };
+                with_host(|host| {
+                    validate_host_instance(host, Some(&fence))?;
+                    submit_apk_public(host, &bytes)
+                })
+            })()
+            .unwrap_or_else(|error| native_error_envelope(error.code, &bytes));
             Ok(owned.byte_array_from_slice(&response)?.into_raw())
         })
         .into_outcome()
