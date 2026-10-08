@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.os.Bundle
 import android.os.IBinder
 import android.os.SystemClock
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -30,6 +31,24 @@ import org.junit.runner.RunWith
 class I16RuntimeHealthDeviceGateTest {
     private val context: Context = InstrumentationRegistry.getInstrumentation().targetContext
     private val canonicalBase = File(context.createDeviceProtectedStorageContext().filesDir, "droidbridge")
+
+    @Test
+    fun healthSnapshotReportsSessionAndWithdrawalState() {
+        withDebugRuntime { runtime ->
+            val snapshot = JSONObject(runtime.getDiagnosticsSnapshot())
+            val summary = JSONObject()
+                .put("session", snapshot.optJSONObject("session") ?: JSONObject())
+                .put("health", snapshot.optJSONObject("health") ?: JSONObject())
+                .toString()
+                .take(MAX_DIAGNOSTIC_CHARS)
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply { putString("i16_health_snapshot", summary) },
+            )
+            assertTrue("debug Runtime snapshot has no session", snapshot.has("session"))
+            assertTrue("debug Runtime snapshot has no health", snapshot.has("health"))
+        }
+    }
 
     @Test
     fun ordinaryTrafficNeverWithdrawsAHealthyApkRuntime() {
@@ -192,5 +211,6 @@ class I16RuntimeHealthDeviceGateTest {
         const val RUNTIME_AVAILABLE_TIMEOUT_MS = 60_000L
         const val REPLACEMENT_TIMEOUT_MS = 75_000L
         const val POLL_MS = 500L
+        const val MAX_DIAGNOSTIC_CHARS = 2_048
     }
 }
