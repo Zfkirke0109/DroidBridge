@@ -674,13 +674,14 @@ export class OAuthServer {
       // redirect_uri or code_verifier comes with it, like a replayed refresh token. token()
       // has only checked that the request is well formed (form-encoded, within the size cap,
       // no repeated parameter, a supported grant_type); one that is not is refused unread.
-      const family = record.family ? await this.storage.get(`family:${record.family}`) : null;
       this.relay.hub.revokeFamily(record.family);
-      await this.relay.grants.revokeFamily(record.family);
+      const familyExisted = await this.relay.grants.revokeFamily(record.family);
       await this.storage.put(key, { ...record, family: null });
-      return tokenError(400, 'invalid_grant', family
+      return tokenError(400, 'invalid_grant', familyExisted === true
         ? 'The authorization code was already used. Tokens issued from it were revoked.'
-        : 'The authorization code was already used. The grant is no longer active.');
+        : familyExisted === false
+          ? 'The authorization code was already used. The grant is no longer active.'
+          : 'The authorization code was already used. The grant was revoked.');
     }
     if (!key || !redirectUri || !clientId || !verifier) {
       return tokenError(400, 'invalid_request', 'code, redirect_uri, client_id and code_verifier are required.');

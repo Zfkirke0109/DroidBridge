@@ -140,6 +140,36 @@ test('code reuse revokes the family issued from it', async () => {
   assert.equal((await refresh.json()).error, 'invalid_grant');
 });
 
+test('code replay still withdraws a family when its metadata read fails', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204);
+  const queued = mcp(t, tokens.access_token, toolsCall('code-read-error'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+  const originalGet = t.storage.get.bind(t.storage);
+  t.storage.get = async (key) => {
+    if (key.startsWith('family:')) throw new Error('selective family read failure');
+    return originalGet(key);
+  };
+
+  const replay = await tokenPost(t, codeExchange(tokens));
+  assert.equal(replay.status, 400);
+  assert.match((await replay.json()).error_description, /grant was revoked/);
+  assert.equal((await promptly(queued)).status, 403);
+  assert.equal(t.storage.keys('family:').length, 0, 'the authority was removed despite the failed read');
+  assert.ok(t.storage.keys('at:').length > 0, 'unreadable metadata leaves inert hashes for the sweep');
+  t.storage.get = originalGet;
+
+  assert.equal((await mcp(t, tokens.access_token, toolsCall())).status, 401);
+  const refresh = await tokenPost(t, {
+    grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+  });
+  assert.equal(refresh.status, 400);
+  await t.relay.grants.sweep();
+  assert.equal(t.storage.keys('at:').length + t.storage.keys('rt:').length, 0,
+    'a later sweep removes the orphan hashes');
+});
+
 test('failed cleanup after code replay cannot revive orphan access tokens after restart', async () => {
   const t = makeRelay();
   const tokens = await obtainTokens(t);
@@ -386,6 +416,41 @@ test('failed cleanup after refresh replay cannot revive orphan refresh tokens af
   });
   assert.equal(again.status, 400);
   assert.equal((await again.json()).error_description, 'The refresh token is not valid.');
+});
+
+test('refresh replay commits revocation before a selective token-record read can fail', async () => {
+  for (const prefix of ['at:', 'rt:']) {
+    const t = makeRelay();
+    const tokens = await obtainTokens(t);
+    const rotated = await (await tokenPost(t, {
+      grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+    })).json();
+    assert.equal((await poll(t, 0)).status, 204);
+    const queued = mcp(t, rotated.access_token, toolsCall(`refresh-read-error-${prefix}`));
+    await waitFor(() => t.relay.hub.inspect().handoff === 1);
+    const originalGet = t.storage.get.bind(t.storage);
+    const currentRefreshKey = `rt:${sha256HexSync(rotated.refresh_token)}`;
+    t.storage.get = async (key) => {
+      if (key.startsWith('at:') || (prefix === 'rt:' && key === currentRefreshKey)) {
+        throw new Error('selective token-count read failure');
+      }
+      return originalGet(key);
+    };
+
+    const replay = await tokenPost(t, {
+      grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+    });
+    assert.equal(replay.status, 400, prefix);
+    assert.equal((await replay.json()).error, 'invalid_grant', prefix);
+    assert.equal((await promptly(queued)).status, 403, prefix);
+    assert.equal(t.storage.keys('family:').length, 0, prefix);
+    t.storage.get = originalGet;
+    assert.equal((await mcp(t, rotated.access_token, toolsCall())).status, 401, prefix);
+    const later = await tokenPost(t, {
+      grant_type: 'refresh_token', refresh_token: rotated.refresh_token, client_id: tokens.clientId,
+    });
+    assert.equal(later.status, 400, prefix);
+  }
 });
 
 test('a replayed refresh token withdraws only its family\'s queued commands', async () => {

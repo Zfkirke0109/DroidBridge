@@ -454,6 +454,33 @@ test('a failing atomic revoke leaves all durable grants intact while settling in
   assert.equal((await mcp(t, b.access_token, toolsCall())).status, 401);
 });
 
+test('device revoke still clears authority when an advisory token-count list fails', async () => {
+  for (const prefix of ['family:', 'at:', 'rt:']) {
+    const t = makeRelay();
+    const tokens = await obtainTokens(t);
+    assert.equal((await poll(t, 0)).status, 204);
+    const queued = mcp(t, tokens.access_token, toolsCall(`revoke-read-error-${prefix}`));
+    await waitFor(() => t.relay.hub.inspect().handoff === 1);
+    const originalList = t.storage.list.bind(t.storage);
+    t.storage.list = async (options = {}) => {
+      if (options.prefix === prefix) throw new Error('selective count-list read failure');
+      return originalList(options);
+    };
+
+    const revoked = await deviceFetch(t, '/device/v1/revoke', { method: 'POST' });
+    assert.equal(revoked.status, 200, prefix);
+    assert.deepEqual(await revoked.json(), { revoked_tokens: null }, prefix);
+    assert.equal((await promptly(queued)).status, 403, prefix);
+    assert.equal(t.storage.map.size, 0, `atomic deleteAll ran despite the ${prefix} list error`);
+    t.storage.list = originalList;
+    assert.equal((await mcp(t, tokens.access_token, toolsCall())).status, 401, prefix);
+    const refresh = await tokenPost(t, {
+      grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+    });
+    assert.equal(refresh.status, 400, prefix);
+  }
+});
+
 test('revoke prevents a request authenticated before its body finished from reaching the phone', async () => {
   const t = makeRelay();
   const { access_token: token } = await obtainTokens(t);

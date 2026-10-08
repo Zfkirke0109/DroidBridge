@@ -136,7 +136,7 @@ Device key format: `dbrk_` followed by 43 base64url characters (32 random bytes)
 | `POST /device/v1/response` | result of one command; header `x-tunnel-shard-token` | 200 accepted; 400 unreadable body; 413 body too large; 404 unknown, settled, expired or token mismatch |
 | `POST /device/v1/pairing` | body `{"code_sha256":"<64 lowercase hex>","ttl_seconds":≤600}`; replaces any earlier code | 200 `{"expires_at":"<RFC 3339>"}` |
 | `DELETE /device/v1/pairing` | cancel the pairing code | 204 |
-| `POST /device/v1/revoke` | revoke every Claude grant: tokens, codes, pending consents, registered clients, pairing | 200 `{"revoked_tokens":N}` |
+| `POST /device/v1/revoke` | revoke every Claude grant: tokens, codes, pending consents, registered clients, pairing | 200 `{"revoked_tokens":N}` (or `null` when the pre-deletion count could not be read) |
 
 Revocation also removes requests still waiting for a phone poll, answering them 403 with
 `delivered:false`. A request already handed to the phone is settled with HTTP 200 and

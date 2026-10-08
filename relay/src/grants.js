@@ -148,29 +148,28 @@ export class GrantStore {
   /**
    * Revokes a whole family: every access and refresh token issued in it.
    * @param {string | undefined | null} familyId
-   * @returns {Promise<number>} live tokens revoked
+   * @returns {Promise<boolean | null>} whether the family existed, or null when its read failed
    */
   async revokeFamily(familyId) {
-    if (!familyId) return 0;
+    if (!familyId) return false;
+    const key = `family:${familyId}`;
     /** @type {Family | undefined} */
-    const family = await this.storage.get(`family:${familyId}`);
-    if (!family) return 0;
-    const now = this.now();
-    let revoked = 0;
-    for (const hash of family.access) {
-      const record = await this.storage.get(`at:${hash}`);
-      if (record && record.expiresAt > now) revoked += 1;
+    let family;
+    try {
+      family = await this.storage.get(key);
+    } catch {
+      // Even if metadata cannot be read, removing the family key withdraws every token it
+      // authorized. Orphan hashes are inert and the next sweep can remove them.
+      await this.storage.delete(key);
+      return null;
     }
-    for (const hash of family.refresh) {
-      const record = await this.storage.get(`rt:${hash}`);
-      if (record && !record.used && record.expiresAt > now) revoked += 1;
-    }
+    if (!family) return false;
     // This is the commit point. If any later deletion fails, leftover token records have no
     // live family and cannot authorize MCP calls, refresh, or status client counts.
-    await this.storage.delete(`family:${familyId}`);
+    await this.storage.delete(key);
     for (const hash of family.access) await this.storage.delete(`at:${hash}`);
     for (const hash of family.refresh) await this.storage.delete(`rt:${hash}`);
-    return revoked;
+    return true;
   }
 
   /**
@@ -199,22 +198,29 @@ export class GrantStore {
   /**
    * Revokes every Claude grant: tokens, families, codes, pending consents, registered clients,
    * cached client documents and the pairing code.
-   * @returns {Promise<number>} live access and refresh tokens revoked
+   * @returns {Promise<number | null>} live tokens revoked, or null if the exact count was unreadable
    */
   async revokeAll() {
-    const now = this.now();
-    let revoked = 0;
-    const families = await this.storage.list({ prefix: 'family:' });
-    /** @param {any} record */
-    const liveFamily = (record) => {
-      const family = typeof record?.family === 'string' ? families.get(`family:${record.family}`) : null;
-      return family && family.expiresAt > now && family.client_id === record.client_id;
-    };
-    for (const record of (await this.storage.list({ prefix: 'at:' })).values()) {
-      if (record.expiresAt > now && liveFamily(record)) revoked += 1;
-    }
-    for (const record of (await this.storage.list({ prefix: 'rt:' })).values()) {
-      if (!record.used && record.expiresAt > now && liveFamily(record)) revoked += 1;
+    /** @type {number | null} */
+    let revoked = null;
+    try {
+      const now = this.now();
+      let count = 0;
+      const families = await this.storage.list({ prefix: 'family:' });
+      /** @param {any} record */
+      const liveFamily = (record) => {
+        const family = typeof record?.family === 'string' ? families.get(`family:${record.family}`) : null;
+        return family && family.expiresAt > now && family.client_id === record.client_id;
+      };
+      for (const record of (await this.storage.list({ prefix: 'at:' })).values()) {
+        if (record.expiresAt > now && liveFamily(record)) count += 1;
+      }
+      for (const record of (await this.storage.list({ prefix: 'rt:' })).values()) {
+        if (!record.used && record.expiresAt > now && liveFamily(record)) count += 1;
+      }
+      revoked = count;
+    } catch {
+      // Counting is advisory; a selective read failure must not skip the atomic revocation.
     }
     // SQLite-backed Durable Objects guarantee this one operation is all-or-nothing. It also
     // clears rate-limit state and any records a future version adds to this private object.
