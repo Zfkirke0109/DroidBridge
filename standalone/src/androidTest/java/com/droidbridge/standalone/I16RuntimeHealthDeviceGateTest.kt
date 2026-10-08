@@ -34,20 +34,7 @@ class I16RuntimeHealthDeviceGateTest {
 
     @Test
     fun healthSnapshotReportsSessionAndWithdrawalState() {
-        withDebugRuntime { runtime ->
-            val snapshot = JSONObject(runtime.getDiagnosticsSnapshot())
-            val summary = JSONObject()
-                .put("session", snapshot.optJSONObject("session") ?: JSONObject())
-                .put("health", snapshot.optJSONObject("health") ?: JSONObject())
-                .toString()
-                .take(MAX_DIAGNOSTIC_CHARS)
-            InstrumentationRegistry.getInstrumentation().sendStatus(
-                0,
-                Bundle().apply { putString("i16_health_snapshot", summary) },
-            )
-            assertTrue("debug Runtime snapshot has no session", snapshot.has("session"))
-            assertTrue("debug Runtime snapshot has no health", snapshot.has("health"))
-        }
+        withDebugRuntime { runtime -> reportDiagnostic(runtime, "standalone_snapshot") }
     }
 
     @Test
@@ -91,6 +78,7 @@ class I16RuntimeHealthDeviceGateTest {
                 "the stale lease was not recorded",
                 (healthFaults().toSet() - faultsBefore).contains("health_admission:lease_stale@g$generation"),
             )
+            reportDiagnostic(runtime, "after_refusal")
 
             // The refused request is never retried. A later request establishes the successor.
             val deadline = SystemClock.elapsedRealtime() + REPLACEMENT_TIMEOUT_MS
@@ -98,10 +86,10 @@ class I16RuntimeHealthDeviceGateTest {
             while (true) {
                 status = submit(runtime, request("context", "status", JSONObject().put("detail", "full")))
                 if (status.optString("outcome") == "success" && appGuardAvailable(status)) break
-                assertTrue(
-                    "no successor Runtime with an available App command guard: $status",
-                    SystemClock.elapsedRealtime() < deadline,
-                )
+                if (SystemClock.elapsedRealtime() >= deadline) {
+                    reportDiagnostic(runtime, "successor_timeout")
+                    error("no successor Runtime with an available App command guard: $status")
+                }
                 SystemClock.sleep(POLL_MS)
             }
             assertEquals("apk_runtime", status.getJSONObject("result").getJSONObject("runtime").getString("host"))
@@ -148,6 +136,22 @@ class I16RuntimeHealthDeviceGateTest {
         ?.optJSONObject("grants")
         ?.optJSONObject("execution.app_guard")
         ?.optString("state") == "available"
+
+    private fun reportDiagnostic(runtime: IDroidBridgeRuntime, phase: String) {
+        val snapshot = JSONObject(runtime.getDiagnosticsSnapshot())
+        val summary = JSONObject()
+            .put("phase", phase)
+            .put("session", snapshot.optJSONObject("session") ?: JSONObject())
+            .put("health", snapshot.optJSONObject("health") ?: JSONObject())
+            .toString()
+            .take(MAX_DIAGNOSTIC_CHARS)
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            0,
+            Bundle().apply { putString("i16_health_snapshot", summary) },
+        )
+        assertTrue("debug Runtime snapshot has no session", snapshot.has("session"))
+        assertTrue("debug Runtime snapshot has no health", snapshot.has("health"))
+    }
 
     private fun served(response: JSONObject): JSONObject {
         assertEquals(response.toString(), "success", response.getString("outcome"))
