@@ -146,14 +146,31 @@ internal class RuntimeHostController(
                             fence.runtimeInstanceId,
                         )
                     }.getOrNull()
-                    if (retried == "READY") return healthGate.admissionCompleted(observedSession)
+                    if (retried == "READY") {
+                        healthGate.markInitialProbeHealthy(fence)
+                        return healthGate.admissionCompleted(observedSession)
+                    }
+                }
+                val failure = if (deep == NativeHostHealth.Healthy) NativeHostHealth.NotReady else deep
+                if (failure.defersAdmission) {
+                    healthGate.requireDeepProbe(fence)
+                    return false
                 }
                 healthGate.withdraw(
                     observedSession,
-                    if (deep == NativeHostHealth.Healthy) NativeHostHealth.NotReady else deep,
+                    failure,
                     HostHealthPhase.Admission,
                 )
                 return false
+            }
+            if (healthGate.initialProbePending(fence)) {
+                val health = probeDeep(fence)
+                if (health.defersAdmission) return false
+                if (health != NativeHostHealth.Healthy) {
+                    healthGate.withdraw(observedSession, health, HostHealthPhase.Admission)
+                    return false
+                }
+                healthGate.markInitialProbeHealthy(fence)
             }
             return healthGate.admissionCompleted(observedSession)
         }
@@ -207,14 +224,17 @@ internal class RuntimeHostController(
             NativeRuntime.nativeRecordHostFault(ErrorToken.StaleAuthority.wire, "host_start_projection")
             return false
         }
+        healthGate.requireDeepProbe(requireNotNull(activated.activeFence))
         replayFacts()
         registerPlatformFacts()
         frameworkReadySink.get()?.invoke(generation)
         val health = probeDeep(requireNotNull(activated.activeFence))
+        if (health.defersAdmission) return false
         if (health != NativeHostHealth.Healthy) {
             healthGate.withdraw(activated, health, HostHealthPhase.Admission)
             return false
         }
+        healthGate.markInitialProbeHealthy(requireNotNull(activated.activeFence))
         if (!healthGate.admissionCompleted(activated)) return false
         recoverMaintenance()
         val guard = File(application.applicationInfo.nativeLibraryDir, "libdroidbridge_exec_guard.so")
@@ -292,7 +312,9 @@ internal class RuntimeHostController(
     }
 
     fun submit(envelope: ByteArray): ByteArray {
-        if (!start()) throw RuntimeStartException(runtimeSession.get().startFailure)
+        if (!start()) throw RuntimeStartException(
+            runtimeSession.get().startFailure.ifEmpty { ErrorToken.CapabilityUnavailable.wire },
+        )
         val observed = runtimeSession.get()
         val fence = observed.activeFence ?: throw RuntimeStartException(observed.startFailure)
         frameworkReadySink.get()?.invoke(fence.hostGeneration)
@@ -323,7 +345,9 @@ internal class RuntimeHostController(
         if (runtimeSession.get() !== observed) return
         if (!deepProbeBudget.claim(fence, SystemClock.elapsedRealtime())) return
         val health = probeDeep(fence)
-        if (health != NativeHostHealth.Healthy) {
+        if (health.defersAdmission) {
+            healthGate.requireDeepProbe(fence)
+        } else if (health != NativeHostHealth.Healthy) {
             healthGate.withdraw(observed, health, HostHealthPhase.Settlement)
         }
     }

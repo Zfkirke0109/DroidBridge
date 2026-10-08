@@ -337,6 +337,11 @@ class I5_GatesTest {
         assertFalse(suspiciousRuntimeReply("""{"outcome":"error","error":{"code":"NOT_FOUND"}}""".encodeToByteArray()))
         assertFalse(suspiciousRuntimeReply("""{"outcome":"success","result":{}}""".encodeToByteArray()))
         assertEquals(NativeHostHealth.StoreUnwritable, NativeHostHealth.decode("store_unwritable"))
+        assertEquals(NativeHostHealth.ProbeBusy, NativeHostHealth.decode("probe_busy"))
+        assertTrue(NativeHostHealth.ProbeBusy.defersAdmission)
+        assertTrue(NativeHostHealth.NotReady.defersAdmission)
+        assertFalse(NativeHostHealth.BridgeFault.defersAdmission)
+        assertFalse(NativeHostHealth.ResourceExhausted.defersAdmission)
         assertEquals(NativeHostHealth.ProbeFailed, NativeHostHealth.decode("unknown"))
         assertEquals(NativeHostHealth.ProbeFailed, NativeHostHealth.decode(null))
     }
@@ -384,6 +389,11 @@ class I5_GatesTest {
             override fun quarantine(fence: RuntimeFence) = true
             override fun lifetimeReleased() = true
         }) {}
+        gate.requireDeepProbe(requireNotNull(active.activeFence))
+        assertFalse(gate.admissionCompleted(active))
+        assertTrue(gate.initialProbePending(requireNotNull(active.activeFence)))
+        gate.markInitialProbeHealthy(requireNotNull(active.activeFence))
+        assertTrue(gate.admissionCompleted(active))
         sessions.set(RuntimeSessionState(startFailure = "HOST_TRANSITION_PENDING"))
         assertFalse(gate.admissionCompleted(active))
         sessions.set(RuntimeSessionState(

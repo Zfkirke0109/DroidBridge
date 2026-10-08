@@ -17,7 +17,11 @@ internal enum class NativeHostHealth(val wire: String, val failureCode: String) 
     BridgeFault("bridge_fault", ErrorToken.IoError.wire),
     ExecutorMissing("executor_missing", ErrorToken.CapabilityUnavailable.wire),
     ProbeFailed("probe_failed", ErrorToken.InternalError.wire),
+    ProbeBusy("probe_busy", ErrorToken.CapabilityUnavailable.wire),
     ;
+
+    /** A busy store lock or an unproven readiness recovery closes admission until a later probe. */
+    val defersAdmission: Boolean get() = this == ProbeBusy || this == NotReady
 
     companion object {
         fun decode(value: String?): NativeHostHealth = entries.firstOrNull { it.wire == value } ?: ProbeFailed

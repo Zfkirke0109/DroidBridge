@@ -22,8 +22,19 @@ internal class RuntimeHostHealthGate(
     private val onWithdrawn: () -> Unit,
 ) {
     private var releasePending = false
+    private var pendingInitialProbe: RuntimeFence? = null
 
-    fun admissionCompleted(observed: RuntimeSessionState): Boolean = sessions.get() === observed
+    fun requireDeepProbe(fence: RuntimeFence) = synchronized(monitor) { pendingInitialProbe = fence }
+
+    fun initialProbePending(fence: RuntimeFence): Boolean = synchronized(monitor) { pendingInitialProbe == fence }
+
+    fun markInitialProbeHealthy(fence: RuntimeFence) = synchronized(monitor) {
+        if (pendingInitialProbe == fence) pendingInitialProbe = null
+    }
+
+    fun admissionCompleted(observed: RuntimeSessionState): Boolean = synchronized(monitor) {
+        observed.started && sessions.get() === observed && pendingInitialProbe != observed.activeFence
+    }
 
     fun mayEstablish(): Boolean = synchronized(monitor) {
         if (!releasePending) return@synchronized true
@@ -40,6 +51,7 @@ internal class RuntimeHostHealthGate(
                 return@synchronized false
             }
             releasePending = true
+            if (pendingInitialProbe == fence) pendingInitialProbe = null
             runCatching { port.recordFault(fence, health, phase) }
             runCatching { port.quarantine(fence) }
             true

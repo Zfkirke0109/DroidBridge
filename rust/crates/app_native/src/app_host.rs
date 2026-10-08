@@ -2,7 +2,7 @@ use crate::app_guard_recovery::{AppCleanupVerification, reconcile_app_recovery};
 use crate::automation_wake::ApkAlarmWake;
 use crate::host_health::{
     HostHealthClass, bridge_fault_latched, classify_deep_probe, probe_descriptor_class,
-    probe_store_writable,
+    probe_store_writable, with_try_canonical_lock,
 };
 use crate::{
     AndroidFrameworkFilesystemDispatcher, AndroidFrameworkFilesystemPort,
@@ -440,7 +440,13 @@ pub(super) fn probe_existing_host(expected: &AdmissionFence) -> HostHealthClass 
         Err(_) => return HostHealthClass::ProbeFailed,
     }
     classify_deep_probe(
-        || host.store.load(&host._lease).map(|_| ()),
+        || {
+            with_try_canonical_lock(&host.base, || {
+                host.store.validate_lease(&host._lease)?;
+                let bytes = fs::read(host.base.join("runtime-state.json")).map_err(io_error)?;
+                persistence::decode_canonical_state(&bytes).map(|_| ())
+            })
+        },
         || probe_store_writable(&host.base, &host.runtime_instance_id),
         || crate::probe_execution_bridge(&host, expected.host_generation),
     )
@@ -700,7 +706,7 @@ mod tests {
         let executor_was_called = std::cell::Cell::new(false);
         assert_eq!(
             classify_deep_probe(
-                || Err(DomainError::new(ErrorCode::IoError, "state read failed")),
+                || HostHealthClass::StoreUnreadable,
                 || Err(std::io::Error::other("scratch sync failed")),
                 || {
                     executor_was_called.set(true);
@@ -712,7 +718,7 @@ mod tests {
         assert!(!executor_was_called.get());
         assert_eq!(
             classify_deep_probe(
-                || Err(DomainError::new(ErrorCode::StaleAuthority, "lease moved")),
+                || HostHealthClass::LeaseStale,
                 || Ok(()),
                 || HostHealthClass::Healthy,
             ),
@@ -720,7 +726,7 @@ mod tests {
         );
         assert_eq!(
             classify_deep_probe(
-                || Ok(()),
+                || HostHealthClass::Healthy,
                 || Err(std::io::Error::other("disk full")),
                 || {
                     executor_was_called.set(true);
@@ -732,7 +738,7 @@ mod tests {
         assert!(!executor_was_called.get());
         assert_eq!(
             classify_deep_probe(
-                || Ok(()),
+                || HostHealthClass::Healthy,
                 || Ok(()),
                 || {
                     executor_was_called.set(true);

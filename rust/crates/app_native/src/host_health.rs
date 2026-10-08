@@ -3,7 +3,7 @@
 use chrono::{SecondsFormat, Utc};
 use contract::{ErrorCode, UuidV4};
 use domain::DomainError;
-use persistence::{FaultFileStore, FaultRecord, FaultRole};
+use persistence::{FaultFileStore, FaultRecord, FaultRole, FileLock};
 use std::{
     fs,
     io::{self, Write},
@@ -27,6 +27,7 @@ pub(crate) enum HostHealthClass {
     BridgeFault,
     ExecutorMissing,
     ProbeFailed,
+    ProbeBusy,
 }
 
 impl HostHealthClass {
@@ -43,6 +44,7 @@ impl HostHealthClass {
             Self::BridgeFault => "bridge_fault",
             Self::ExecutorMissing => "executor_missing",
             Self::ProbeFailed => "probe_failed",
+            Self::ProbeBusy => "probe_busy",
         }
     }
 
@@ -59,6 +61,7 @@ impl HostHealthClass {
             "bridge_fault" => Self::BridgeFault,
             "executor_missing" => Self::ExecutorMissing,
             "probe_failed" => Self::ProbeFailed,
+            "probe_busy" => Self::ProbeBusy,
             _ => return None,
         })
     }
@@ -66,7 +69,9 @@ impl HostHealthClass {
     fn fault_code(self) -> &'static str {
         match self {
             Self::Healthy | Self::ProbeFailed => "INTERNAL_ERROR",
-            Self::HostMissing | Self::NotReady | Self::ExecutorMissing => "CAPABILITY_UNAVAILABLE",
+            Self::HostMissing | Self::NotReady | Self::ExecutorMissing | Self::ProbeBusy => {
+                "CAPABILITY_UNAVAILABLE"
+            }
             Self::FenceMismatch | Self::LeaseStale => "STALE_AUTHORITY",
             Self::StoreUnreadable | Self::StoreUnwritable | Self::BridgeFault => "IO_ERROR",
             Self::ResourceExhausted => "RESOURCE_LIMIT",
@@ -108,10 +113,10 @@ pub(crate) fn record_host_health_fault(
     phase: HostHealthPhase,
     generation: u64,
 ) -> Result<(), DomainError> {
-    if class == HostHealthClass::Healthy {
+    if matches!(class, HostHealthClass::Healthy | HostHealthClass::ProbeBusy) {
         return Err(DomainError::new(
             ErrorCode::InternalError,
-            "healthy host has no fault",
+            "inconclusive probe has no fault",
         ));
     }
     let now = Utc::now();
@@ -183,21 +188,46 @@ pub(crate) fn probe_descriptor_class() -> HostHealthClass {
 
 /// Keep the most basic failed proof, even if later checks also fail.
 pub(crate) fn classify_deep_probe(
-    canonical_read: impl FnOnce() -> Result<(), DomainError>,
+    canonical_read: impl FnOnce() -> HostHealthClass,
     scratch_write: impl FnOnce() -> io::Result<()>,
     executor_bridge: impl FnOnce() -> HostHealthClass,
 ) -> HostHealthClass {
-    match canonical_read() {
-        Err(error) if error.code == ErrorCode::StaleAuthority => {
-            return HostHealthClass::LeaseStale;
-        }
-        Err(_) => return HostHealthClass::StoreUnreadable,
-        Ok(()) => {}
+    let canonical = canonical_read();
+    if canonical != HostHealthClass::Healthy {
+        return canonical;
     }
     if scratch_write().is_err() {
         HostHealthClass::StoreUnwritable
     } else {
         executor_bridge()
+    }
+}
+
+/// A contended writer lock is inconclusive. Never wait indefinitely while Kotlin holds its
+/// admission monitor, and never read an uncommitted canonical state.
+pub(crate) fn with_try_canonical_lock(
+    base: &Path,
+    read: impl FnOnce() -> Result<(), DomainError>,
+) -> HostHealthClass {
+    let _lock = match FileLock::try_acquire(&base.join("runtime-state.lock")) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return HostHealthClass::ProbeBusy,
+        Err(_) => return HostHealthClass::StoreUnreadable,
+    };
+    match read() {
+        Ok(()) => HostHealthClass::Healthy,
+        Err(error) if error.code == ErrorCode::StaleAuthority => HostHealthClass::LeaseStale,
+        Err(_) => HostHealthClass::StoreUnreadable,
+    }
+}
+
+pub(crate) fn classify_bridge_reply(
+    result: Result<HostHealthClass, std::sync::mpsc::RecvTimeoutError>,
+) -> HostHealthClass {
+    match result {
+        Ok(class) => class,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => HostHealthClass::ProbeBusy,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => HostHealthClass::BridgeFault,
     }
 }
 
@@ -318,5 +348,45 @@ mod tests {
         assert_eq!(records[0].phase, "health_admission:resource_exhausted@g9");
         assert_eq!(records[0].runtime_instance_id, Some(id(8)));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn contended_canonical_lock_defers_probe_without_reading_partial_state() {
+        let directory =
+            std::env::temp_dir().join(format!("droidbridge-busy-state-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let held = persistence::FileLock::acquire(&directory.join("runtime-state.lock")).unwrap();
+        let read = std::cell::Cell::new(false);
+        assert_eq!(
+            with_try_canonical_lock(&directory, || {
+                read.set(true);
+                Ok(())
+            }),
+            HostHealthClass::ProbeBusy,
+        );
+        assert!(!read.get());
+        drop(held);
+        assert_eq!(
+            with_try_canonical_lock(&directory, || {
+                read.set(true);
+                Ok(())
+            }),
+            HostHealthClass::Healthy,
+        );
+        assert!(read.get());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn registry_timeout_is_retryable_but_a_broken_jni_channel_is_a_bridge_fault() {
+        use std::sync::mpsc::RecvTimeoutError;
+        assert_eq!(
+            classify_bridge_reply(Err(RecvTimeoutError::Timeout)),
+            HostHealthClass::ProbeBusy
+        );
+        assert_eq!(
+            classify_bridge_reply(Err(RecvTimeoutError::Disconnected)),
+            HostHealthClass::BridgeFault
+        );
     }
 }

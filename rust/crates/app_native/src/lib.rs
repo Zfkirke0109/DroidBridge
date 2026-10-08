@@ -977,9 +977,7 @@ fn probe_execution_bridge(host: &NativeHost, generation: u64) -> host_health::Ho
     host.async_runtime.spawn_blocking(move || {
         let _ = reply.send(probe_execution_bridge_here(generation));
     });
-    let class = result
-        .recv_timeout(BRIDGE_PROBE_TIMEOUT)
-        .unwrap_or(HostHealthClass::BridgeFault);
+    let class = host_health::classify_bridge_reply(result.recv_timeout(BRIDGE_PROBE_TIMEOUT));
     if class == HostHealthClass::BridgeFault {
         host_health::latch_bridge_fault(&host.runtime_instance_id);
     }
