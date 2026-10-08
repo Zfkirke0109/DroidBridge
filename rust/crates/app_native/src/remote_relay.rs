@@ -500,7 +500,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let request = read_request(&mut stream);
+            let request = read_request(&mut stream).expect("validation request must complete");
             write!(
                 stream,
                 "HTTP/1.1 {status} Result\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
@@ -512,12 +512,14 @@ mod tests {
         (format!("http://{address}/"), handle)
     }
 
-    fn read_request(stream: &mut TcpStream) -> String {
+    fn read_request(stream: &mut TcpStream) -> Option<String> {
         let mut raw = Vec::new();
         let mut block = [0_u8; 4096];
         let end = loop {
             let count = stream.read(&mut block).unwrap();
-            assert!(count > 0);
+            if count == 0 {
+                return None;
+            }
             raw.extend_from_slice(&block[..count]);
             if let Some(index) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
                 break index + 4;
@@ -535,10 +537,12 @@ mod tests {
             .unwrap_or(0);
         while raw.len() - end < content_length {
             let count = stream.read(&mut block).unwrap();
-            assert!(count > 0);
+            if count == 0 {
+                return None;
+            }
             raw.extend_from_slice(&block[..count]);
         }
-        String::from_utf8(raw[..end + content_length].to_vec()).unwrap()
+        Some(String::from_utf8(raw[..end + content_length].to_vec()).unwrap())
     }
 
     #[test]
@@ -717,7 +721,10 @@ mod tests {
                     if halted.load(Ordering::SeqCst) {
                         break;
                     }
-                    let request = read_request(&mut stream);
+                    // Stopping the client can close a just-accepted poll before it sends bytes.
+                    let Some(request) = read_request(&mut stream) else {
+                        continue;
+                    };
                     let path = request
                         .lines()
                         .next()
