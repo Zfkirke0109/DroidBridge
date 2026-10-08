@@ -1,5 +1,39 @@
+# Repository-wide hygiene checks, run by pre-commit locally and by pre-commit.ci on pull requests.
+# Toolchain checks (Gradle, cargo, clippy) stay in CONTRIBUTING.md: they need the pinned Android
+# and Rust toolchains, which pre-commit.ci does not provide.
+ci:
+  # The bot reports; it never pushes fix-up commits to anyone's branch.
+  autofix_prs: false
+  autoupdate_schedule: quarterly
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      - id: check-added-large-files
+      - id: check-case-conflict
       - id: check-merge-conflict
+      - id: check-json
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+        # The release tests sign their manifests with a throwaway fixture key, and these sources
+        # only name the PEM markers they strip. A real key anywhere else still fails the check.
+        exclude: |
+          (?x)^(
+            tools/fixtures/release/manifest-test-private-key\.pem|
+            tools/ReleaseTool\.java|
+            standalone/src/test/java/com/droidbridge/standalone/I12_ReleaseManifestTest\.kt|
+            standalone/src/test/java/com/droidbridge/standalone/I12_UpdateMaintenanceControllerTest\.kt
+          )$
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      # Line endings follow .gitattributes (LF, with CRLF for .bat/.cmd), not a hook's choice.
+      - id: mixed-line-ending
+        args: [--fix=no]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      # Secrets (MCP bearer tokens, tunnel keys, API keys) never enter a commit.
+      - id: gitleaks
