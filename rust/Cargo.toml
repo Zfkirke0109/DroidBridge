@@ -21,7 +21,7 @@ chrono = { version = "=0.4.45", default-features = false, features = ["std", "cl
 chrono-tz = { version = "=0.10.4", features = ["serde"] }
 rrule = "=0.14.0"
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
-rustls = { version = "=0.23.35", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "=1.0.9"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
 tar = "=0.4.46"
