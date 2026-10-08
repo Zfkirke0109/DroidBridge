@@ -282,6 +282,7 @@ internal class RuntimeHostController(
 
     /** Preserve the already returned response; probing cannot replay an ambiguous operation. */
     private fun maybeProbeAfterSuspicious(observed: RuntimeSessionState, fence: RuntimeFence) {
+        if (runtimeSession.get() !== observed) return
         if (!deepProbeBudget.claim(fence, SystemClock.elapsedRealtime())) return
         val health = probeDeep(fence)
         if (health != NativeHostHealth.Healthy) {

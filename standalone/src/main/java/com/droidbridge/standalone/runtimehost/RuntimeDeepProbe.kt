@@ -25,15 +25,17 @@ internal enum class NativeHostHealth(val wire: String, val failureCode: String) 
 
 /** Claims one bounded deep probe before running it, so concurrent failures cannot stampede JNI. */
 internal class RuntimeDeepProbeBudget {
-    private var last: Pair<RuntimeFence, Long>? = null
+    private val lastByFence = LinkedHashMap<RuntimeFence, Long>()
 
     @Synchronized
     fun claim(fence: RuntimeFence, nowMillis: Long): Boolean {
-        val previous = last
-        if (previous?.first == fence && nowMillis >= previous.second && nowMillis - previous.second < 5_000L) {
+        val previous = lastByFence[fence]
+        if (previous != null && nowMillis >= previous && nowMillis - previous < 5_000L) {
             return false
         }
-        last = fence to nowMillis
+        lastByFence.remove(fence)
+        lastByFence[fence] = nowMillis
+        if (lastByFence.size > 16) lastByFence.remove(lastByFence.keys.first())
         return true
     }
 }

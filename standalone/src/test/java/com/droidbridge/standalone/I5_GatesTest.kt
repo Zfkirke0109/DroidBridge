@@ -321,6 +321,8 @@ class I5_GatesTest {
         assertFalse(budget.claim(first, 5_999))
         assertTrue(budget.claim(first, 6_000))
         assertTrue(budget.claim(replacement, 6_001))
+        assertFalse(budget.claim(first, 6_002))
+        assertFalse(budget.claim(replacement, 6_003))
         for (code in listOf("IO_ERROR", "INTERNAL_ERROR", "RESOURCE_LIMIT")) {
             assertTrue(suspiciousRuntimeReply("""{"outcome":"error","error":{"code":"$code"}}""".encodeToByteArray()))
         }
