@@ -14,7 +14,8 @@ mod tunnel;
 mod visual;
 
 use app_host::{
-    AppHostControl, probe_existing_host, start_host, validate_existing_host, validate_host_instance,
+    AppHostControl, probe_existing_host, quarantine_existing_host, start_host,
+    validate_existing_host, validate_host_instance,
 };
 
 #[cfg(target_os = "android")]
@@ -198,7 +199,9 @@ struct NativeHost {
     runtime_instance_id: UuidV4,
     product_version: String,
     admission_open: AtomicBool,
+    quarantined: AtomicBool,
     automation_wake: Arc<ApkAutomationWake>,
+    automation_scheduler: tokio::task::JoinHandle<()>,
 }
 
 type ApkAutomationWake =
@@ -1433,6 +1436,114 @@ pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime
     {
         Outcome::Ok(value) => value,
         Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeRecordHostHealthFault(
+    mut env: EnvUnowned,
+    _class: JClass,
+    canonical_base: JString,
+    product_version: JString,
+    runtime_instance_id: JString,
+    host_generation: jlong,
+    health_class: JString,
+    phase: JString,
+) -> jboolean {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jboolean> {
+            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
+            let version = product_version.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let class = health_class.mutf8_chars(owned)?.to_str().into_owned();
+            let phase = phase.mutf8_chars(owned)?.to_str().into_owned();
+            let recorded = (|| {
+                let instance = UuidV4::parse(instance).ok()?;
+                let generation = u64::try_from(host_generation).ok()?;
+                let class = host_health::HostHealthClass::from_token(&class)?;
+                let phase = host_health::HostHealthPhase::from_token(&phase)?;
+                let boot_id = read_boot_id().ok()?;
+                host_health::record_host_health_fault(
+                    Path::new(&base),
+                    &version,
+                    &boot_id,
+                    &instance,
+                    class,
+                    phase,
+                    generation,
+                )
+                .ok()
+            })()
+            .is_some();
+            Ok(if recorded { JNI_TRUE } else { JNI_FALSE })
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeQuarantineHost(
+    mut env: EnvUnowned,
+    _class: JClass,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+) -> jboolean {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jboolean> {
+            let epoch = runtime_epoch.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let removed = match (
+                UuidV4::parse(epoch),
+                u64::try_from(host_generation),
+                UuidV4::parse(instance),
+            ) {
+                (Ok(runtime_epoch), Ok(host_generation), Ok(runtime_instance_id)) => {
+                    quarantine_existing_host(&AdmissionFence {
+                        runtime_epoch,
+                        host_generation,
+                        runtime_instance_id,
+                    })
+                    .unwrap_or(false)
+                }
+                _ => false,
+            };
+            Ok(if removed { JNI_TRUE } else { JNI_FALSE })
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeLifetimeReleased(
+    mut env: EnvUnowned,
+    _class: JClass,
+    canonical_base: JString,
+) -> jboolean {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jboolean> {
+            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
+            let released =
+                persistence::FileLock::try_acquire(&Path::new(&base).join("runtime-live.lock"))
+                    .is_ok_and(|lock| lock.is_some());
+            Ok(if released { JNI_TRUE } else { JNI_FALSE })
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
     }
 }
 

@@ -23,6 +23,9 @@ import com.droidbridge.standalone.runtimehost.RuntimeFence
 import com.droidbridge.standalone.runtimehost.RuntimeHostController
 import com.droidbridge.standalone.runtimehost.RuntimeSessionState
 import com.droidbridge.standalone.runtimehost.RuntimeDeepProbeBudget
+import com.droidbridge.standalone.runtimehost.RuntimeHostHealthGate
+import com.droidbridge.standalone.runtimehost.RuntimeHostHealthPort
+import com.droidbridge.standalone.runtimehost.HostHealthPhase
 import com.droidbridge.standalone.runtimehost.diagnosticSession
 import com.droidbridge.standalone.runtimehost.suspiciousRuntimeReply
 import com.droidbridge.standalone.runtimehost.validatedByNativeHealth
@@ -191,6 +194,9 @@ class I5_GatesTest {
         assertTrue("nativeStart" in nativeMethods)
         assertTrue("nativeValidateHost" in nativeMethods)
         assertTrue("nativeProbeHost" in nativeMethods)
+        assertTrue("nativeRecordHostHealthFault" in nativeMethods)
+        assertTrue("nativeQuarantineHost" in nativeMethods)
+        assertTrue("nativeLifetimeReleased" in nativeMethods)
         assertTrue("nativeSubmit" in nativeMethods)
         assertEquals(
             listOf(ByteArray::class.java, String::class.java, java.lang.Long.TYPE, String::class.java),
@@ -333,6 +339,59 @@ class I5_GatesTest {
         assertEquals(NativeHostHealth.StoreUnwritable, NativeHostHealth.decode("store_unwritable"))
         assertEquals(NativeHostHealth.ProbeFailed, NativeHostHealth.decode("unknown"))
         assertEquals(NativeHostHealth.ProbeFailed, NativeHostHealth.decode(null))
+    }
+
+    @Test
+    fun I5_G05_unhealthyHostWithdrawsRecordsThenQuarantinesBeforeReplacement() {
+        val fence = RuntimeFence("epoch", 7, "instance")
+        val active = RuntimeSessionState(started = true, activeFence = fence, startFailure = "")
+        val sessions = AtomicReference(active)
+        val events = mutableListOf<String>()
+        var released = false
+        val port = object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase): Boolean {
+                events += "record:${health.wire}:${phase.wire}"
+                return true
+            }
+            override fun quarantine(fence: RuntimeFence): Boolean {
+                events += "quarantine"
+                return true
+            }
+            override fun lifetimeReleased(): Boolean = released
+        }
+        val gate = RuntimeHostHealthGate(sessions, Any(), port) { events += "projection" }
+        assertTrue(gate.admissionCompleted(active))
+        assertTrue(gate.withdraw(active, NativeHostHealth.ResourceExhausted, HostHealthPhase.Admission))
+        assertFalse(gate.admissionCompleted(active))
+        assertEquals("RESOURCE_LIMIT", sessions.get().startFailure)
+        assertFalse(gate.mayEstablish())
+        assertFalse(gate.withdraw(active, NativeHostHealth.ResourceExhausted, HostHealthPhase.Admission))
+        released = true
+        assertTrue(gate.mayEstablish())
+        assertEquals(listOf("record:resource_exhausted:admission", "quarantine", "projection"), events)
+    }
+
+    @Test
+    fun I5_G05_initialProbeCannotAdmitASessionWithdrawnWhileItWasBlocked() {
+        val active = RuntimeSessionState(
+            started = true,
+            activeFence = RuntimeFence("epoch", 7, "instance"),
+            startFailure = "",
+        )
+        val sessions = AtomicReference(active)
+        val gate = RuntimeHostHealthGate(sessions, Any(), object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }) {}
+        sessions.set(RuntimeSessionState(startFailure = "HOST_TRANSITION_PENDING"))
+        assertFalse(gate.admissionCompleted(active))
+        sessions.set(RuntimeSessionState(
+            started = true,
+            activeFence = RuntimeFence("next-epoch", 8, "next-instance"),
+            startFailure = "",
+        ))
+        assertFalse(gate.admissionCompleted(active))
     }
 
     @Test

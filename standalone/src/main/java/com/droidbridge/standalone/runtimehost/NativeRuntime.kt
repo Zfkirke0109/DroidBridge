@@ -4,6 +4,16 @@ internal object NativeRuntime {
     external fun nativeStart(canonicalBase: String, environmentJson: String): String
     external fun nativeValidateHost(runtimeEpoch: String, hostGeneration: Long, runtimeInstanceId: String): String?
     external fun nativeProbeHost(runtimeEpoch: String, hostGeneration: Long, runtimeInstanceId: String): String?
+    external fun nativeRecordHostHealthFault(
+        canonicalBase: String,
+        productVersion: String,
+        runtimeInstanceId: String,
+        hostGeneration: Long,
+        healthClass: String,
+        phase: String,
+    ): Boolean
+    external fun nativeQuarantineHost(runtimeEpoch: String, hostGeneration: Long, runtimeInstanceId: String): Boolean
+    external fun nativeLifetimeReleased(canonicalBase: String): Boolean
     external fun nativeSubmit(
         envelope: ByteArray,
         runtimeEpoch: String,

@@ -94,6 +94,27 @@ internal class RuntimeHostController(
     private val maintenanceExecutor = AtomicReference<ExecutorService?>(null)
     private val deviceContext = application.createDeviceProtectedStorageContext()
     private val canonicalBase = File(deviceContext.filesDir, "droidbridge")
+    private val healthGate = RuntimeHostHealthGate(
+        runtimeSession,
+        this,
+        object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase): Boolean =
+                NativeRuntime.nativeRecordHostHealthFault(
+                    canonicalBase.absolutePath,
+                    BuildConfig.VERSION_NAME,
+                    fence.runtimeInstanceId,
+                    fence.hostGeneration,
+                    health.wire,
+                    phase.wire,
+                )
+
+            override fun quarantine(fence: RuntimeFence): Boolean =
+                NativeRuntime.nativeQuarantineHost(fence.runtimeEpoch, fence.hostGeneration, fence.runtimeInstanceId)
+
+            override fun lifetimeReleased(): Boolean = NativeRuntime.nativeLifetimeReleased(canonicalBase.absolutePath)
+        },
+        this::releaseApkProjection,
+    )
 
     /** One bounded worker for S-UI-017 status reads; a timed-out read never blocks the next caller. */
     private val diagnosticsReads = Executors.newSingleThreadExecutor { task ->
@@ -116,11 +137,27 @@ internal class RuntimeHostController(
             }.getOrNull()
             val validated = observedSession.validatedByNativeHealth(verdict)
             if (validated !== observedSession) {
-                runtimeSession.compareAndSet(observedSession, validated)
+                val deep = probeDeep(fence)
+                if (deep == NativeHostHealth.Healthy) {
+                    val retried = runCatching {
+                        NativeRuntime.nativeValidateHost(
+                            fence.runtimeEpoch,
+                            fence.hostGeneration,
+                            fence.runtimeInstanceId,
+                        )
+                    }.getOrNull()
+                    if (retried == "READY") return healthGate.admissionCompleted(observedSession)
+                }
+                healthGate.withdraw(
+                    observedSession,
+                    if (deep == NativeHostHealth.Healthy) NativeHostHealth.NotReady else deep,
+                    HostHealthPhase.Admission,
+                )
                 return false
             }
-            return runtimeSession.get() === observedSession
+            return healthGate.admissionCompleted(observedSession)
         }
+        if (!healthGate.mayEstablish()) return false
         // A reset in progress owns the store until it activates the fresh instance itself.
         if (observedSession.startFailure == ErrorToken.HostTransitionPending.wire) return false
         val packageInfo = application.packageManager.getPackageInfo(application.packageName, 0)
@@ -168,23 +205,24 @@ internal class RuntimeHostController(
         )
         if (!runtimeSession.compareAndSet(observedSession, activated)) {
             NativeRuntime.nativeRecordHostFault(ErrorToken.StaleAuthority.wire, "host_start_projection")
-            return runtimeSession.get().started
+            return false
         }
         replayFacts()
         registerPlatformFacts()
         frameworkReadySink.get()?.invoke(generation)
         val health = probeDeep(requireNotNull(activated.activeFence))
         if (health != NativeHostHealth.Healthy) {
-            runtimeSession.compareAndSet(activated, inactiveSession(health.failureCode))
+            healthGate.withdraw(activated, health, HostHealthPhase.Admission)
             return false
         }
+        if (!healthGate.admissionCompleted(activated)) return false
         recoverMaintenance()
         val guard = File(application.applicationInfo.nativeLibraryDir, "libdroidbridge_exec_guard.so")
         if (!NativeRuntime.nativeProbeAppGuard(guard.absolutePath)) {
             NativeRuntime.nativeRecordHostFault("CLEANUP_UNVERIFIED", "app_guard_probe")
         }
         guardScopeSink.get()?.invoke()
-        return true
+        return healthGate.admissionCompleted(activated)
     }
 
     /**
@@ -286,7 +324,7 @@ internal class RuntimeHostController(
         if (!deepProbeBudget.claim(fence, SystemClock.elapsedRealtime())) return
         val health = probeDeep(fence)
         if (health != NativeHostHealth.Healthy) {
-            runtimeSession.compareAndSet(observed, inactiveSession(health.failureCode))
+            healthGate.withdraw(observed, health, HostHealthPhase.Settlement)
         }
     }
 

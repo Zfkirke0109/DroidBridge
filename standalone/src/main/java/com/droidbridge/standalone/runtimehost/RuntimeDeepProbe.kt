@@ -13,6 +13,7 @@ internal enum class NativeHostHealth(val wire: String, val failureCode: String) 
     NotReady("not_ready", ErrorToken.CapabilityUnavailable.wire),
     StoreUnreadable("store_unreadable", ErrorToken.IoError.wire),
     StoreUnwritable("store_unwritable", ErrorToken.IoError.wire),
+    ResourceExhausted("resource_exhausted", ErrorToken.ResourceLimit.wire),
     BridgeFault("bridge_fault", ErrorToken.IoError.wire),
     ExecutorMissing("executor_missing", ErrorToken.CapabilityUnavailable.wire),
     ProbeFailed("probe_failed", ErrorToken.InternalError.wire),
