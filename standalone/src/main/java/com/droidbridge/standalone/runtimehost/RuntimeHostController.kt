@@ -470,6 +470,7 @@ internal class RuntimeHostController(
                 put("host", "apk_runtime")
                 if (!displayedSession.started) put("start_failure", displayedSession.startFailure)
             })
+            put("health", healthGate.snapshot())
             status?.takeIf { displayedSession.started }?.let { put("status", it) }
         }.toString()
     }

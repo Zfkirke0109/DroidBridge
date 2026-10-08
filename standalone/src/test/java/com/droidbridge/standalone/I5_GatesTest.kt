@@ -35,6 +35,9 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -449,6 +452,7 @@ class I5_GatesTest {
                 gate.withdraw(old, NativeHostHealth.HostMissing, HostHealthPhase.Settlement)
             }
             assertTrue(callbackEntered.await(2, TimeUnit.SECONDS))
+            assertEquals("true", gate.snapshot()["withdrawal_in_progress"]?.jsonPrimitive?.content)
             val establish = workers.submit {
                 establishAttempted.countDown()
                 synchronized(monitor) { sessions.set(next) }
@@ -458,6 +462,7 @@ class I5_GatesTest {
             assertFalse(nextInstalled.await(100, TimeUnit.MILLISECONDS))
             finishCallback.countDown()
             assertTrue(withdraw.get(2, TimeUnit.SECONDS))
+            assertEquals("false", gate.snapshot()["withdrawal_in_progress"]?.jsonPrimitive?.content)
             establish.get(2, TimeUnit.SECONDS)
             assertSame(next, sessions.get())
         } finally {
@@ -507,6 +512,99 @@ class I5_GatesTest {
         assertEquals(30_000L, gate.establishmentRetryMillis())
         gate.clearBreaker()
         assertTrue(gate.mayEstablish())
+    }
+
+    @Test
+    fun I5_G05_healthSnapshotRetainsBoundedFaultFactsWithoutHostIdentifiers() {
+        var now = 1_000L
+        val active = RuntimeSessionState(true, RuntimeFence("private-epoch", 7, "private-instance"), "")
+        val sessions = AtomicReference(active)
+        val gate = RuntimeHostHealthGate(sessions, Any(), object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = false
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = false
+        }, nowMillis = { now }) {}
+
+        assertNull(gate.snapshot()["last"])
+        assertTrue(gate.withdraw(active, NativeHostHealth.LeaseStale, HostHealthPhase.Admission))
+        now += 200
+        val snapshot = gate.snapshot()
+        val last = requireNotNull(snapshot["last"]).jsonObject
+        assertEquals("1", snapshot["consecutive_withdrawals"]?.jsonPrimitive?.content)
+        assertEquals("true", snapshot["release_pending"]?.jsonPrimitive?.content)
+        assertEquals("false", snapshot["withdrawal_in_progress"]?.jsonPrimitive?.content)
+        assertEquals("false", snapshot["breaker_open"]?.jsonPrimitive?.content)
+        assertEquals("lease_stale", last["class"]?.jsonPrimitive?.content)
+        assertEquals("admission", last["phase"]?.jsonPrimitive?.content)
+        assertEquals("7", last["host_generation"]?.jsonPrimitive?.content)
+        assertEquals("200", last["age_ms"]?.jsonPrimitive?.content)
+        assertEquals("false", last["fault_recorded"]?.jsonPrimitive?.content)
+        assertEquals("true", last["quarantine_accepted"]?.jsonPrimitive?.content)
+        assertFalse(snapshot.toString().contains("private-epoch"))
+        assertFalse(snapshot.toString().contains("private-instance"))
+    }
+
+    @Test
+    fun I5_G05_healthSnapshotDoesNotWaitForAStalledHostStart() {
+        val monitor = Any()
+        val gate = RuntimeHostHealthGate(AtomicReference(RuntimeSessionState()), monitor, object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }) {}
+        val holderEntered = CountDownLatch(1)
+        val releaseHolder = CountDownLatch(1)
+        val workers = Executors.newFixedThreadPool(2)
+        try {
+            val holder = workers.submit {
+                synchronized(monitor) {
+                    holderEntered.countDown()
+                    check(releaseHolder.await(5, TimeUnit.SECONDS))
+                }
+            }
+            assertTrue(holderEntered.await(2, TimeUnit.SECONDS))
+            val read = workers.submit<JsonObject> { gate.snapshot() }
+            assertEquals("0", read.get(1, TimeUnit.SECONDS)["consecutive_withdrawals"]?.jsonPrimitive?.content)
+            releaseHolder.countDown()
+            holder.get(2, TimeUnit.SECONDS)
+        } finally {
+            releaseHolder.countDown()
+            workers.shutdownNow()
+        }
+    }
+
+    @Test
+    fun I5_G05_healthSnapshotShowsWithdrawalWhileNativeFaultRecordingStalls() {
+        val active = RuntimeSessionState(true, RuntimeFence("epoch", 7, "instance"), "")
+        val sessions = AtomicReference(active)
+        val recordingEntered = CountDownLatch(1)
+        val finishRecording = CountDownLatch(1)
+        val gate = RuntimeHostHealthGate(sessions, Any(), object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase): Boolean {
+                recordingEntered.countDown()
+                check(finishRecording.await(5, TimeUnit.SECONDS))
+                return true
+            }
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = false
+        }) {}
+        val worker = Executors.newSingleThreadExecutor()
+        try {
+            val withdrawn = worker.submit<Boolean> {
+                gate.withdraw(active, NativeHostHealth.LeaseStale, HostHealthPhase.Admission)
+            }
+            assertTrue(recordingEntered.await(2, TimeUnit.SECONDS))
+            val pending = gate.snapshot()
+            assertFalse(sessions.get().started)
+            assertEquals("true", pending["release_pending"]?.jsonPrimitive?.content)
+            assertEquals("true", pending["withdrawal_in_progress"]?.jsonPrimitive?.content)
+            finishRecording.countDown()
+            assertTrue(withdrawn.get(2, TimeUnit.SECONDS))
+            assertEquals("false", gate.snapshot()["withdrawal_in_progress"]?.jsonPrimitive?.content)
+        } finally {
+            finishRecording.countDown()
+            worker.shutdownNow()
+        }
     }
 
     @Test

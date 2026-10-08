@@ -43,8 +43,9 @@
 
 ### Task 3: Deploy and exercise the connector
 
-- [ ] Confirm Cloudflare authentication. Wrangler on the PC currently reports signed out; use the user's Termux Wrangler installation if it can access the relay source and account, otherwise complete interactive PC Wrangler login. Do not copy an OAuth token between devices.
-- [ ] Deploy the Worker with `relay/wrangler.toml`, generate a new device key privately, set only its SHA-256 as `DEVICE_KEY_SHA256`, and configure the debug app with the relay URL and raw key. Verify public origin and OAuth metadata without exposing credentials.
+- [x] Confirm Cloudflare authentication on Windows. The user's Termux Wrangler installation cannot run its Android-arm64 `workerd` dependency; the Windows Wrangler login and deployment succeeded without moving OAuth tokens between devices.
+- [x] Deploy the Worker with `relay/wrangler.toml`, generate a new device key privately, set only its SHA-256 as `DEVICE_KEY_SHA256`, and verify the public origin and OAuth metadata without exposing credentials.
+- [ ] Configure the final debug APK with the relay URL and raw key, then verify phone-backed MCP traffic.
 - [ ] Pair a Claude custom connector with the one-use phone code and run `tools/list` plus a harmless read-only MCP call.
 - [ ] Test wrong/reused/expired codes, unauthorized device calls, token refresh/revoke/rotation, offline and aborted requests without replay, screen lock, network reconnect, app/process restart, reboot, and a sustained idle battery/memory/thermal check. Keep sensitive values out of artifacts.
 
