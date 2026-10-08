@@ -47,6 +47,7 @@ class DroidBridgeClient(
     private var subscription: IRuntimeEventCallback? = null
 
     override val state: StateFlow<ClientState> = mutableState.asStateFlow()
+    override val supportsClaudeRelay: Boolean = true
 
     @Synchronized
     fun bind() {
@@ -156,6 +157,19 @@ class DroidBridgeClient(
     override suspend fun setTunnelEnabled(enabled: Boolean): String = mcpCall { it.setTunnelEnabled(enabled) }
 
     override suspend fun clearTunnel(): String = mcpCall(IDroidBridgeRuntime::clearTunnel)
+
+    override suspend fun claudeRelaySettings(): String = mcpCall(IDroidBridgeRuntime::getClaudeRelaySettings)
+
+    override suspend fun configureClaudeRelay(relayUrl: String, deviceKey: String): String =
+        mcpCall { it.configureClaudeRelay(relayUrl, deviceKey) }
+
+    override suspend fun setClaudeRelayEnabled(enabled: Boolean): String = mcpCall { it.setClaudeRelayEnabled(enabled) }
+
+    override suspend fun clearClaudeRelay(): String = mcpCall(IDroidBridgeRuntime::clearClaudeRelay)
+
+    override suspend fun pairClaudeRelay(): String = mcpCall(IDroidBridgeRuntime::pairClaudeRelay)
+
+    override suspend fun revokeClaudeRelayClients(): String = mcpCall(IDroidBridgeRuntime::revokeClaudeRelayClients)
 
     /** The S-UI-017 `{schema_version,blocker,cleanup}` reply or `{error}`. */
     override suspend fun maintenanceState(): String = mcpCall(IDroidBridgeRuntime::getMaintenanceState)

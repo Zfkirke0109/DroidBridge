@@ -389,4 +389,37 @@
     <string name="capabilities_all_set">Everything is ready</string>
     <string name="nav_home">Home</string>
     <string name="settings_data_summary_runtime">Credentials and Runtime data</string>
+    <string name="agent_name_claude" translatable="false">Claude</string>
+    <string name="claude_title">Claude connector</string>
+    <string name="claude_intro">Lets Claude on the web, desktop and the Claude apps reach this phone through a relay you deploy on your own Cloudflare account. The phone dials out to the relay; no port on the phone is opened, and the relay only passes requests through.</string>
+    <string name="claude_setup_steps">Deploy the relay from the relay folder of the DroidBridge source (see relay/README.md), create its device key, then paste both here.</string>
+    <string name="claude_relay_url">Relay URL</string>
+    <string name="claude_relay_url_hint" translatable="false">https://droidbridge-relay.example.workers.dev</string>
+    <string name="claude_device_key">Device key</string>
+    <string name="claude_device_key_hint">Starts with dbrk_. It is encrypted with the Android Keystore and never shown again.</string>
+    <string name="claude_save">Save and connect</string>
+    <string name="claude_enabled">Relay connection</string>
+    <string name="claude_last_error">Last relay error: %1$s</string>
+    <string name="claude_connector_url">Connector URL for Claude</string>
+    <string name="claude_connector_url_help">In Claude open Settings → Connectors → Add custom connector and paste this URL. When Claude asks you to connect, tap Pair Claude here and type the code on the relay page.</string>
+    <string name="claude_open_connectors">Open Claude connectors</string>
+    <string name="claude_pair">Pair Claude</string>
+    <string name="claude_pair_code_label">Type this code on the relay page:</string>
+    <string name="claude_pair_expires">It works once and expires in 10 minutes.</string>
+    <string name="claude_last_call">Claude last called: %1$s</string>
+    <string name="claude_offline_note">While the phone is offline, Claude\'s requests fail at once and are never queued. A request whose result did not come back is reported as unknown and is never retried.</string>
+    <string name="claude_revoke">Disconnect Claude</string>
+    <string name="claude_revoke_confirm_title">Disconnect Claude?</string>
+    <string name="claude_revoke_confirm_text">Claude loses access until you connect it and pair again. The relay settings on this phone stay.</string>
+    <string name="claude_revoked">Claude was disconnected.</string>
+    <string name="claude_change_relay">Change relay or device key</string>
+    <string name="claude_remove">Remove relay</string>
+    <string name="claude_remove_confirm_text">Removes the relay URL and device key from this phone. Disconnect Claude first if you also want the relay to forget Claude\'s access.</string>
+    <string name="claude_error_relay_not_found">This URL is not a DroidBridge relay.</string>
+    <string name="claude_error_relay_not_configured">The relay has no device key yet. Set DEVICE_KEY_SHA256 with wrangler secret put.</string>
+    <string name="claude_error_device_key">The relay refused this device key.</string>
+    <string name="claude_error_unavailable">The relay could not be reached. Check the URL and your connection.</string>
+    <string name="claude_error_credentials">The saved device key could not be read. Remove the relay and add it again.</string>
+    <string name="claude_error_invalid">Enter an https:// relay URL without a path, and a device key that starts with dbrk_.</string>
+    <string name="claude_error_io">The settings could not be saved.</string>
 </resources>

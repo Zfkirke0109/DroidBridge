@@ -20,6 +20,20 @@ internal object NativeRuntime {
     external fun nativeTunnelState(): String?
     external fun nativeTunnelLastCall(): Long
     external fun nativeTunnelLastError(): String?
+    external fun nativeRelayValidate(relayUrl: String, deviceKey: String, productVersion: String): String?
+    external fun nativeRelayStart(port: Int, relayUrl: String, deviceKey: String, productVersion: String): Boolean
+    external fun nativeRelayStop(): Boolean
+    external fun nativeRelayState(): String?
+    external fun nativeRelayLastCall(): Long
+    external fun nativeRelayLastError(): String?
+    external fun nativeRelayPair(
+        relayUrl: String,
+        deviceKey: String,
+        codeSha256: String,
+        ttlSeconds: Int,
+        productVersion: String,
+    ): String?
+    external fun nativeRelayRevoke(relayUrl: String, deviceKey: String, productVersion: String): String?
     external fun nativeMaintenanceState(canonicalBase: String): String?
     external fun nativeResetRuntimeHostToApk(canonicalBase: String): String?
     external fun nativeResetRuntimeData(canonicalBase: String): String?

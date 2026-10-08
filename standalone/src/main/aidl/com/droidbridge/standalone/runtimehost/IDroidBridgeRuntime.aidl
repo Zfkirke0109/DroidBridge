@@ -18,6 +18,12 @@ interface IDroidBridgeRuntime {
     String configureTunnel(String tunnelId, String apiKey);
     String setTunnelEnabled(boolean enabled);
     String clearTunnel();
+    String getClaudeRelaySettings();
+    String configureClaudeRelay(String relayUrl, String deviceKey);
+    String setClaudeRelayEnabled(boolean enabled);
+    String clearClaudeRelay();
+    String pairClaudeRelay();
+    String revokeClaudeRelayClients();
     String getMaintenanceState();
     String getDiagnosticsSnapshot();
     String resetRuntimeData();

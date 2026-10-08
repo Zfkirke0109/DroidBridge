@@ -35,6 +35,7 @@ internal class RuntimeProcessGraph(application: Application) {
     val hostController: RuntimeHostController
     val mcpSettings: McpSettingsController
     val tunnelSettings: TunnelSettingsController
+    val claudeRelaySettings: ClaudeRelaySettingsController
     val androidExecutionRegistry: AndroidExecutionRegistry
     val visualDisplay: VisualDisplayTracker
     val visualEncoder: VisualImageEncoder
@@ -63,6 +64,13 @@ internal class RuntimeProcessGraph(application: Application) {
             NativeTunnelRuntime(mcpPort, BuildConfig.VERSION_NAME),
             AndroidTunnelNetworkMonitor(application.getSystemService(ConnectivityManager::class.java)),
             AndroidTunnelCredentialCipher(),
+            AndroidMcpSettingsFileSystem(),
+        )
+        claudeRelaySettings = ClaudeRelaySettingsController(
+            settingsDirectory,
+            NativeClaudeRelayRuntime(mcpPort, BuildConfig.VERSION_NAME),
+            AndroidTunnelNetworkMonitor(application.getSystemService(ConnectivityManager::class.java)),
+            AndroidTunnelCredentialCipher(CLAUDE_RELAY_KEY_ALIAS),
             AndroidMcpSettingsFileSystem(),
         )
         visualDisplay = VisualDisplayTracker(application)

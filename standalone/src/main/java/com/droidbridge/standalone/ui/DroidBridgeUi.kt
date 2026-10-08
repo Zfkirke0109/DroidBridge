@@ -131,6 +131,8 @@ import com.droidbridge.ui.home.HomeViewModel
 import com.droidbridge.ui.maintenance.MaintenanceRecoveryRoute
 import com.droidbridge.ui.maintenance.MaintenanceViewModel
 import com.droidbridge.ui.mcp.AgentConnectionRoute
+import com.droidbridge.ui.mcp.ClaudeConnectorRoute
+import com.droidbridge.ui.mcp.ClaudeConnectorViewModel
 import com.droidbridge.ui.mcp.McpRoute
 import com.droidbridge.ui.mcp.McpViewModel
 import com.droidbridge.ui.mcp.TunnelRoute
@@ -164,6 +166,7 @@ import kotlinx.serialization.Serializable
 @Serializable data object AgentConnections : NavKey
 @Serializable data object MCP : NavKey
 @Serializable data object TunnelSetup : NavKey
+@Serializable data object ClaudeConnector : NavKey
 @Serializable data object Diagnostics : NavKey
 @Serializable data object Settings : NavKey
 @Serializable data object Updates : NavKey
@@ -485,6 +488,7 @@ private fun NavigationRoot(state: AppUiState, viewModel: AppViewModel, graph: Ap
                     viewModel = viewModel { McpViewModel(graph.client) },
                     openMcp = { backStack.add(MCP) },
                     openTunnel = { backStack.add(TunnelSetup) },
+                    openClaude = { backStack.add(ClaudeConnector) },
                 ) { backStack.removeLastOrNull() }
             }
             entry<MCP> {
@@ -512,6 +516,11 @@ private fun NavigationRoot(state: AppUiState, viewModel: AppViewModel, graph: Ap
                     },
                     finishSetup = finishSetup,
                 ) { backStack.removeLastOrNull() }
+            }
+            entry<ClaudeConnector> {
+                ClaudeConnectorRoute(viewModel { ClaudeConnectorViewModel(graph.client) }) {
+                    backStack.removeLastOrNull()
+                }
             }
             entry<Diagnostics> {
                 DiagnosticsRoute(

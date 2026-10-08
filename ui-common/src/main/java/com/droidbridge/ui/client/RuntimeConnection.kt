@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.StateFlow
  */
 interface RuntimeConnection {
     val state: StateFlow<ClientState>
+    val supportsClaudeRelay: Boolean get() = false
 
     /** Rereads the Runtime status now. */
     fun recheck()
@@ -31,6 +32,14 @@ interface RuntimeConnection {
     suspend fun setTunnelEnabled(enabled: Boolean): String
 
     suspend fun clearTunnel(): String
+
+    suspend fun claudeRelaySettings(): String = error("Claude relay is unavailable in this edition")
+    suspend fun configureClaudeRelay(relayUrl: String, deviceKey: String): String =
+        error("Claude relay is unavailable in this edition")
+    suspend fun setClaudeRelayEnabled(enabled: Boolean): String = error("Claude relay is unavailable in this edition")
+    suspend fun clearClaudeRelay(): String = error("Claude relay is unavailable in this edition")
+    suspend fun pairClaudeRelay(): String = error("Claude relay is unavailable in this edition")
+    suspend fun revokeClaudeRelayClients(): String = error("Claude relay is unavailable in this edition")
 
     /** The S-UI-017 `{schema_version,blocker,cleanup}` reply or `{error}`. */
     suspend fun maintenanceState(): String
