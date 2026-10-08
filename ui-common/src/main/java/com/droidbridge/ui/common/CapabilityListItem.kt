@@ -34,13 +34,14 @@ fun CapabilityListItem(
     refreshing: Boolean,
     colors: ListItemColors = ListItemDefaults.colors(),
     emphasized: Boolean = true,
+    @StringRes titleOverride: Int? = null,
     onAction: () -> Unit,
 ) {
     val action = row.action
     val reason = rowReason(row)
     val loadingDescription = stringResource(R.string.state_loading)
     ListItem(
-        headlineContent = { Text(stringResource(rowTitle(row.key))) },
+        headlineContent = { Text(stringResource(titleOverride ?: rowTitle(row.key))) },
         supportingContent = {
             Column {
                 Text(stringResource(rowState(row)))

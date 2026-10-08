@@ -58,6 +58,7 @@ import com.droidbridge.ui.product.tasks.TaskSummary
 import com.droidbridge.ui.tasks.TaskRow
 import com.droidbridge.ui.common.RowIcon
 import com.droidbridge.ui.client.CapabilityRow
+import com.droidbridge.ui.client.CapabilityRowKey
 import com.droidbridge.ui.client.ClientState
 import com.droidbridge.ui.client.RuntimeConnection
 import com.droidbridge.ui.client.RuntimeReadiness
@@ -191,6 +192,7 @@ fun HomeRoute(
     attention: List<CapabilityRow>,
     checking: Boolean,
     onCapabilityAction: (CapabilityRow) -> Unit,
+    @StringRes shizukuTitle: Int? = null,
     /** Null for an edition without an Updates page, which then shows no update slot. */
     newerVersionAvailable: Boolean?,
     openTask: (String) -> Unit,
@@ -264,7 +266,7 @@ fun HomeRoute(
                 }
                 RouteContent.Empty, RouteContent.Content ->
                     HomeContent(
-                        requireNotNull(projection), state, clientState, attention, checking, onCapabilityAction,
+                        requireNotNull(projection), state, clientState, attention, checking, onCapabilityAction, shizukuTitle,
                         newerVersionAvailable, open, viewModel::clearStrandedExecutions,
                         { viewModel.refresh() }, openTask,
                     )
@@ -281,6 +283,7 @@ private fun HomeContent(
     attention: List<CapabilityRow>,
     checking: Boolean,
     onCapabilityAction: (CapabilityRow) -> Unit,
+    @StringRes shizukuTitle: Int?,
     newerVersionAvailable: Boolean?,
     open: (HomeDestination) -> Unit,
     clearStranded: () -> Unit,
@@ -312,7 +315,14 @@ private fun HomeContent(
             Column {
                 if (attention.isNotEmpty()) SectionTitle(R.string.home_attention)
                 GroupCard {
-                    attention.forEach { row -> CapabilityListItem(row, refreshing = false, colors = transparent) { onCapabilityAction(row) } }
+                    attention.forEach { row ->
+                        CapabilityListItem(
+                            row,
+                            refreshing = false,
+                            colors = transparent,
+                            titleOverride = if (row.key == CapabilityRowKey.Shizuku) shizukuTitle else null,
+                        ) { onCapabilityAction(row) }
+                    }
                     ListItem(
                         headlineContent = { Text(stringResource(R.string.capabilities_title)) },
                         // A step still being determined asks for nothing yet, which is not the same as done.

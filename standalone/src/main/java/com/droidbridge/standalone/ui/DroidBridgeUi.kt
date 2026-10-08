@@ -107,6 +107,7 @@ import com.droidbridge.ui.client.CapabilityRowKey
 import com.droidbridge.ui.client.CapabilityRowState
 import com.droidbridge.standalone.client.CapabilityRows
 import com.droidbridge.standalone.client.SetupSteps
+import com.droidbridge.standalone.execution.shizuku.ShizukuManager
 import com.droidbridge.ui.client.settledCapabilityStates
 import com.droidbridge.ui.client.ClientState
 import com.droidbridge.ui.client.RuntimeReadiness
@@ -232,9 +233,11 @@ private val checkingCapabilityStates = setOf(CapabilityRowState.Starting, Capabi
 /** Device facts read outside the Runtime: they change in system settings, so they are reread on every resume. */
 private data class DeviceSetupState(
     val background: BackgroundFacts,
-    val shizukuInstalled: Boolean,
+    val shizukuManager: ShizukuManager?,
     val notificationListenerGranted: Boolean,
-)
+) {
+    val shizukuInstalled: Boolean get() = shizukuManager != null
+}
 
 @Composable
 private fun rememberDeviceSetup(state: AppUiState): DeviceSetupState {
@@ -242,7 +245,7 @@ private fun rememberDeviceSetup(state: AppUiState): DeviceSetupState {
     val confirmations = state.backgroundConfirmations
     fun read() = DeviceSetupState(
         DeviceSetup.backgroundFacts(context, confirmations.autostart, confirmations.recentsLock),
-        DeviceSetup.shizukuInstalled(context),
+        DeviceSetup.shizukuManager(context),
         DeviceSetup.notificationListenerGranted(
             context,
             (context.applicationContext as DroidBridgeApplication).requireAppGraph().notificationListener,
@@ -391,6 +394,9 @@ private fun NavigationRoot(state: AppUiState, viewModel: AppViewModel, graph: Ap
                             attention = attention,
                             checking = checking,
                             onCapabilityAction = { row -> row.action?.let { capabilityAction(row.key, it) } },
+                            shizukuTitle = if (setup.shizukuManager == ShizukuManager.ShizukuPlus) {
+                                AppR.string.cap_shizuku_plus_title
+                            } else null,
                             newerVersionAvailable = updateState.newerVersionAvailable,
                             openTask = { taskId -> backStack.add(TaskDetail(taskId)) },
                         ) { destination ->
@@ -742,6 +748,9 @@ private fun CapabilitiesScreen(
                     row = row,
                     refreshing = row.key == CapabilityRowKey.Runtime && available?.refreshing == true,
                     emphasized = row.key == next,
+                    titleOverride = if (row.key == CapabilityRowKey.Shizuku && setup.shizukuManager == ShizukuManager.ShizukuPlus) {
+                        AppR.string.cap_shizuku_plus_title
+                    } else null,
                 ) { row.action?.let { actionHandler(row.key, it) } }
                 if (index != access.lastIndex) HorizontalDivider()
             }
@@ -849,7 +858,9 @@ private fun rememberCapabilityActionHandler(
             CapabilityAction.Authorize -> viewModel.requestShizukuAuthorization()
             CapabilityAction.Diagnostics -> navigate(Diagnostics)
             CapabilityAction.InstallShizuku -> context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://shizuku.rikka.app/download/")))
-            CapabilityAction.OpenShizuku -> context.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")?.let(context::startActivity)
+            CapabilityAction.OpenShizuku -> DeviceSetup.shizukuManager(context)
+                ?.let { manager -> context.packageManager.getLaunchIntentForPackage(manager.packageName) }
+                ?.let(context::startActivity)
             CapabilityAction.Allow -> {
                 if (row == CapabilityRowKey.LocalNetwork) {
                     if (Build.VERSION.SDK_INT >= 37) localNetwork.launch(localNetworkPermission())
