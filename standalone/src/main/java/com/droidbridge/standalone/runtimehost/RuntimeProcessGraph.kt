@@ -99,6 +99,12 @@ internal class RuntimeProcessGraph(application: Application) {
         )
         val exactAlarms = AndroidExactAlarmAccess(application, ExactAlarmReceiver::class.java)
         hostController.setApkProjectionReleasedSink(exactAlarms::cancel)
+        hostController.setAutomationRetrySink { delayMillis ->
+            if (exactAlarms.canScheduleExactAlarms()) {
+                exactAlarms.setExactAndAllowWhileIdle(System.currentTimeMillis() + delayMillis)
+            }
+        }
+        hostController.setHostWithdrawnSink { networkDefault.close() }
         val framework = RoutedAndroidExecution(
             ContentResolverFilesystemAdapter(
                 AndroidContentResolverAccess(application.contentResolver),

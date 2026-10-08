@@ -62,3 +62,15 @@ internal fun suspiciousRuntimeReply(response: ByteArray): Boolean {
         else -> true
     }
 }
+
+/** Status and task-control reads do not prove that the framework executor can serve work. */
+internal fun businessReplyProvesExecution(request: ByteArray, response: ByteArray): Boolean = runCatching {
+    val requestObject = Json.parseToJsonElement(request.decodeToString()) as? JsonObject
+        ?: return@runCatching false
+    val payload = requestObject["payload"] as? JsonObject ?: return@runCatching false
+    val tool = (payload["tool"] as? JsonPrimitive)?.content ?: return@runCatching false
+    if (tool == "context" || tool == "task_control") return@runCatching false
+    val replyObject = Json.parseToJsonElement(response.decodeToString()) as? JsonObject
+        ?: return@runCatching false
+    (replyObject["outcome"] as? JsonPrimitive)?.content == "success"
+}.getOrDefault(false)

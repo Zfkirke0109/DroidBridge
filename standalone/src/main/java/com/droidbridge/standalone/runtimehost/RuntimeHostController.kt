@@ -9,6 +9,7 @@ import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import com.droidbridge.standalone.BuildConfig
 import com.droidbridge.standalone.execution.android.NetworkDefaultObservation
+import com.droidbridge.standalone.execution.android.NativeAndroidExecutionDispatcher
 import com.droidbridge.standalone.product.release.ReleaseConfig
 import com.droidbridge.ui.product.deviceName
 import java.io.File
@@ -85,6 +86,8 @@ internal class RuntimeHostController(
 ) {
     private val runtimeSession = AtomicReference(RuntimeSessionState())
     private val hintSink = AtomicReference<((String) -> Unit)?>(null)
+    private val automationRetrySink = AtomicReference<((Long) -> Unit)?>(null)
+    private val hostWithdrawnSink = AtomicReference<(() -> Unit)?>(null)
     private val frameworkReadySink = AtomicReference<((Long) -> Unit)?>(null)
     private val guardScopeSink = AtomicReference<(() -> Unit)?>(null)
     private val apkProjectionReleasedSink = AtomicReference<(() -> Unit)?>(null)
@@ -113,7 +116,8 @@ internal class RuntimeHostController(
 
             override fun lifetimeReleased(): Boolean = NativeRuntime.nativeLifetimeReleased(canonicalBase.absolutePath)
         },
-        this::releaseApkProjection,
+        nowMillis = SystemClock::elapsedRealtime,
+        onWithdrawn = this::onHealthWithdrawn,
     )
 
     /** One bounded worker for S-UI-017 status reads; a timed-out read never blocks the next caller. */
@@ -331,6 +335,7 @@ internal class RuntimeHostController(
             throw failure
         }
         if (suspiciousRuntimeReply(response)) maybeProbeAfterSuspicious(observed, fence)
+        if (businessReplyProvesExecution(envelope, response)) healthGate.businessResponseServed(observed)
         return response
     }
 
@@ -346,7 +351,7 @@ internal class RuntimeHostController(
         if (!deepProbeBudget.claim(fence, SystemClock.elapsedRealtime())) return
         val health = probeDeep(fence)
         if (health.defersAdmission) {
-            healthGate.requireDeepProbe(fence)
+            healthGate.requireDeepProbeIfCurrent(observed)
         } else if (health != NativeHostHealth.Healthy) {
             healthGate.withdraw(observed, health, HostHealthPhase.Settlement)
         }
@@ -524,6 +529,7 @@ internal class RuntimeHostController(
     }
 
     private fun activateAfterMaintenance(): String {
+        healthGate.clearBreaker()
         runtimeSession.updateAndGet { current ->
             if (current.started) current else inactiveSession("RUNTIME_UNAVAILABLE")
         }
@@ -536,6 +542,13 @@ internal class RuntimeHostController(
                 // A retained alarm reaches only a released instance and delivers nothing there.
                 NativeRuntime.nativeRecordHostFault(ErrorToken.IoError.wire, "automation_alarm_release")
             }
+    }
+
+    /** A health withdrawal clears host-owned process projections while retaining its exact alarm. */
+    private fun onHealthWithdrawn() {
+        runCatching { hostWithdrawnSink.get()?.invoke() }
+        runCatching { NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity() }
+        runCatching { hintSink.get()?.invoke("context.status") }
     }
 
     private fun onMaintenanceExecutor(action: () -> String): String =
@@ -557,7 +570,13 @@ internal class RuntimeHostController(
      */
     fun wakeAutomation(): Boolean {
         registerPlatformFacts()
-        if (!start()) return false
+        if (!start()) {
+            healthGate.establishmentRetryMillis()?.let { delay ->
+                runCatching { automationRetrySink.get()?.invoke(delay) }
+                    .onFailure { NativeRuntime.nativeRecordHostFault(ErrorToken.IoError.wire, "automation_retry") }
+            }
+            return false
+        }
         return NativeRuntime.nativeAutomationWake()
     }
 
@@ -582,6 +601,15 @@ internal class RuntimeHostController(
 
     fun setHintSink(sink: ((String) -> Unit)?) {
         hintSink.set(sink)
+    }
+
+    /** Arms a replacement wake when the exact alarm was spent during a held-off admission. */
+    fun setAutomationRetrySink(sink: ((Long) -> Unit)?) {
+        automationRetrySink.set(sink)
+    }
+
+    fun setHostWithdrawnSink(sink: (() -> Unit)?) {
+        hostWithdrawnSink.set(sink)
     }
 
     fun setFrameworkReadySink(sink: ((Long) -> Unit)?) {

@@ -260,4 +260,22 @@ class I8_AndroidCoreTest {
         assertEquals(listOf(2L, 0L, 3L), seen)
     }
 
+    @Test
+    fun withdrawnHostDropsForegroundTaskCountAndAcceptsSuccessorRevision() {
+        val seen = mutableListOf<Long>()
+        NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity()
+        NativeAndroidExecutionDispatcher.installTaskActivitySink(seen::add)
+        try {
+            NativeAndroidExecutionDispatcher.taskActivityChanged("withdrawn-epoch", 2, 12)
+            NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity()
+            NativeAndroidExecutionDispatcher.installTaskActivitySink(null)
+            NativeAndroidExecutionDispatcher.installTaskActivitySink(seen::add)
+            NativeAndroidExecutionDispatcher.taskActivityChanged("withdrawn-epoch", 1, 1)
+            assertEquals(listOf(2L, 0L, 1L), seen)
+        } finally {
+            NativeAndroidExecutionDispatcher.forgetRuntimeTaskActivity()
+            NativeAndroidExecutionDispatcher.installTaskActivitySink(null)
+        }
+    }
+
 }

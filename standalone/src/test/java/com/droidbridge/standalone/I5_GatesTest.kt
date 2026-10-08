@@ -28,9 +28,11 @@ import com.droidbridge.standalone.runtimehost.RuntimeHostHealthPort
 import com.droidbridge.standalone.runtimehost.HostHealthPhase
 import com.droidbridge.standalone.runtimehost.diagnosticSession
 import com.droidbridge.standalone.runtimehost.suspiciousRuntimeReply
+import com.droidbridge.standalone.runtimehost.businessReplyProvesExecution
 import com.droidbridge.standalone.runtimehost.validatedByNativeHealth
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
@@ -370,6 +372,7 @@ class I5_GatesTest {
         assertFalse(gate.admissionCompleted(active))
         assertEquals("RESOURCE_LIMIT", sessions.get().startFailure)
         assertFalse(gate.mayEstablish())
+        assertEquals(15_000L, gate.establishmentRetryMillis())
         assertFalse(gate.withdraw(active, NativeHostHealth.ResourceExhausted, HostHealthPhase.Admission))
         released = true
         assertTrue(gate.mayEstablish())
@@ -391,6 +394,7 @@ class I5_GatesTest {
         }) {}
         gate.requireDeepProbe(requireNotNull(active.activeFence))
         assertFalse(gate.admissionCompleted(active))
+        assertEquals(5_000L, gate.establishmentRetryMillis())
         assertTrue(gate.initialProbePending(requireNotNull(active.activeFence)))
         gate.markInitialProbeHealthy(requireNotNull(active.activeFence))
         assertTrue(gate.admissionCompleted(active))
@@ -402,6 +406,120 @@ class I5_GatesTest {
             startFailure = "",
         ))
         assertFalse(gate.admissionCompleted(active))
+    }
+
+    @Test
+    fun I5_G05_oldInconclusiveProbeCannotReplaceSuccessorsPendingDeepProof() {
+        val old = RuntimeSessionState(true, RuntimeFence("epoch", 7, "old"), "")
+        val next = RuntimeSessionState(true, RuntimeFence("epoch", 8, "next"), "")
+        val sessions = AtomicReference(old)
+        val gate = RuntimeHostHealthGate(sessions, Any(), object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }) {}
+        sessions.set(next)
+        gate.requireDeepProbe(requireNotNull(next.activeFence))
+        assertFalse(gate.requireDeepProbeIfCurrent(old))
+        assertTrue(gate.initialProbePending(requireNotNull(next.activeFence)))
+        assertFalse(gate.admissionCompleted(next))
+    }
+
+    @Test
+    fun I5_G05_withdrawnProjectionCleanupFinishesBeforeSuccessorAdmission() {
+        val monitor = Any()
+        val old = RuntimeSessionState(true, RuntimeFence("epoch", 7, "old"), "")
+        val next = RuntimeSessionState(true, RuntimeFence("epoch", 8, "next"), "")
+        val sessions = AtomicReference(old)
+        val callbackEntered = CountDownLatch(1)
+        val finishCallback = CountDownLatch(1)
+        val establishAttempted = CountDownLatch(1)
+        val nextInstalled = CountDownLatch(1)
+        val gate = RuntimeHostHealthGate(sessions, monitor, object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }) {
+            callbackEntered.countDown()
+            check(finishCallback.await(2, TimeUnit.SECONDS))
+        }
+        val workers = Executors.newFixedThreadPool(2)
+        try {
+            val withdraw = workers.submit<Boolean> {
+                gate.withdraw(old, NativeHostHealth.HostMissing, HostHealthPhase.Settlement)
+            }
+            assertTrue(callbackEntered.await(2, TimeUnit.SECONDS))
+            val establish = workers.submit {
+                establishAttempted.countDown()
+                synchronized(monitor) { sessions.set(next) }
+                nextInstalled.countDown()
+            }
+            assertTrue(establishAttempted.await(2, TimeUnit.SECONDS))
+            assertFalse(nextInstalled.await(100, TimeUnit.MILLISECONDS))
+            finishCallback.countDown()
+            assertTrue(withdraw.get(2, TimeUnit.SECONDS))
+            establish.get(2, TimeUnit.SECONDS)
+            assertSame(next, sessions.get())
+        } finally {
+            finishCallback.countDown()
+            workers.shutdownNow()
+        }
+    }
+
+    @Test
+    fun I5_G05_consecutiveWithdrawalsBackOffAndOnlyBusinessSuccessResetsTheCount() {
+        var now = 1_000L
+        val sessions = AtomicReference(RuntimeSessionState())
+        val port = object : RuntimeHostHealthPort {
+            override fun recordFault(fence: RuntimeFence, health: NativeHostHealth, phase: HostHealthPhase) = true
+            override fun quarantine(fence: RuntimeFence) = true
+            override fun lifetimeReleased() = true
+        }
+        val gate = RuntimeHostHealthGate(sessions, Any(), port, nowMillis = { now }) {}
+        fun fail(generation: Long) {
+            val active = RuntimeSessionState(true, RuntimeFence("epoch", generation, "instance-$generation"), "")
+            sessions.set(active)
+            assertTrue(gate.withdraw(active, NativeHostHealth.StoreUnreadable, HostHealthPhase.Admission))
+        }
+
+        fail(1)
+        assertTrue(gate.mayEstablish())
+        fail(2)
+        assertTrue(gate.mayEstablish())
+        fail(3)
+        assertFalse(gate.mayEstablish())
+        assertEquals(30_000L, gate.establishmentRetryMillis())
+        now += 30_000
+        assertTrue(gate.mayEstablish())
+        fail(4)
+        assertEquals(60_000L, gate.establishmentRetryMillis())
+        now += 60_000
+        assertTrue(gate.mayEstablish())
+
+        val active = RuntimeSessionState(true, RuntimeFence("epoch", 5, "instance-5"), "")
+        sessions.set(active)
+        gate.businessResponseServed(active)
+        fail(6)
+        assertTrue(gate.mayEstablish())
+        fail(7)
+        assertTrue(gate.mayEstablish())
+        fail(8)
+        assertEquals(30_000L, gate.establishmentRetryMillis())
+        gate.clearBreaker()
+        assertTrue(gate.mayEstablish())
+    }
+
+    @Test
+    fun I5_G05_onlySuccessfulBusinessRepliesProveHostRecovery() {
+        val success = """{"outcome":"success","result":{}}""".encodeToByteArray()
+        val status = """{"payload":{"tool":"context"}}""".encodeToByteArray()
+        val taskControl = """{"payload":{"tool":"task_control"}}""".encodeToByteArray()
+        val business = """{"payload":{"tool":"device"}}""".encodeToByteArray()
+        assertFalse(businessReplyProvesExecution(status, success))
+        assertFalse(businessReplyProvesExecution(taskControl, success))
+        assertTrue(businessReplyProvesExecution(business, success))
+        assertFalse(businessReplyProvesExecution(business, """{"outcome":"error","error":{"code":"NOT_FOUND"}}""".encodeToByteArray()))
+        assertFalse(businessReplyProvesExecution("not json".encodeToByteArray(), success))
     }
 
     @Test

@@ -48,6 +48,16 @@ internal object NativeAndroidExecutionDispatcher {
         taskActivitySink?.invoke(activeTasks)
     }
 
+    /** A withdrawn host no longer owns Tasks that can justify a foreground hold. */
+    @Synchronized
+    fun forgetRuntimeTaskActivity() {
+        taskActivityEpoch = null
+        taskActivityRevision = -1L
+        if (activeTaskCount == 0L) return
+        activeTaskCount = 0L
+        taskActivitySink?.invoke(0L)
+    }
+
     @JvmStatic
     fun execute(
         key: String,
