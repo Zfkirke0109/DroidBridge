@@ -54,4 +54,3 @@
 - [ ] On the fully tested integration tree, merge old PR #1 head `fa3d9c3` with the `ours` strategy as a second parent; verify the merge tree is byte-for-byte identical to the tested tree and fast-forward-push it to PR #1's existing head branch.
 - [ ] Rewrite PR #1 title/body with the parity ledger, tests, security review, device evidence, root-edition limitation, and debug-only status. Verify its GitHub comparison is against 0.5.1; refresh the base comparison if GitHub pins the old base. Attach the PR to the Codex task.
 - [ ] Require green PR checks and an independent final review, no known reproducible defect, and no unmitigated reachable high/critical security finding. If any gate fails, keep PR #1 draft, fix, and rerun affected gates. Otherwise mark it ready, merge it into fork `main`, and close PR #2 as superseded.
-
