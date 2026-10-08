@@ -1,6 +1,7 @@
 // @ts-check
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Relay } from '../src/relay.js';
 import {
   ORIGIN,
   makeRelay,
@@ -137,6 +138,42 @@ test('code reuse revokes the family issued from it', async () => {
   });
   assert.equal(refresh.status, 400);
   assert.equal((await refresh.json()).error, 'invalid_grant');
+});
+
+test('failed cleanup after code replay cannot revive orphan access tokens after restart', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204);
+  const queued = mcp(t, tokens.access_token, toolsCall('queued-code-replay'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+  const deleteKey = t.storage.delete.bind(t.storage);
+  t.storage.delete = async (key) => {
+    if (key.startsWith('at:')) throw new Error('cleanup interrupted after family deletion');
+    return deleteKey(key);
+  };
+
+  const replay = await tokenPost(t, codeExchange(tokens));
+  assert.equal(replay.status, 500);
+  assert.equal((await promptly(queued)).status, 403, 'queued work is withdrawn');
+  assert.equal(t.storage.keys('family:').length, 0, 'revocation commit survived cleanup failure');
+  assert.equal(t.storage.keys('at:').length, 1, 'an orphan access record remains for the regression');
+  assert.equal(t.storage.keys('rt:').length, 1, 'an orphan refresh record remains for the regression');
+  t.storage.delete = deleteKey;
+
+  t.relay = new Relay({ storage: t.storage, env: t.env, now: t.clock.now, timers: t.clock.api });
+  assert.equal(await t.relay.grants.lookupAccess(tokens.access_token), null);
+  assert.equal((await t.relay.grants.liveClientIds()).size, 0);
+  assert.equal((await mcp(t, tokens.access_token, toolsCall())).status, 401);
+  const refresh = await tokenPost(t, {
+    grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+  });
+  assert.equal(refresh.status, 400);
+  assert.equal((await refresh.json()).error, 'invalid_grant');
+  assert.equal(t.storage.keys('at:').length + t.storage.keys('rt:').length, 0,
+    'the next sweep cleans up orphan token records');
+  const again = await tokenPost(t, codeExchange(tokens));
+  assert.equal(again.status, 400);
+  assert.match((await again.json()).error_description, /grant is no longer active/);
 });
 
 test('code reuse settles a command already delivered from its grant as unknown', async () => {
@@ -304,6 +341,51 @@ test('refresh token reuse revokes the entire family', async () => {
   const stillRotated = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: rotated.refresh_token, client_id: tokens.clientId });
   assert.equal(stillRotated.status, 400);
   assert.equal(t.storage.keys('family:').length, 0);
+});
+
+test('failed cleanup after refresh replay cannot revive orphan refresh tokens after restart', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  const rotated = await (await tokenPost(t, {
+    grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+  })).json();
+  const waitingPoll = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const delivered = mcp(t, rotated.access_token, toolsCall('delivered-refresh-replay'));
+  const [command] = (await (await waitingPoll).json()).commands;
+  const deleteKey = t.storage.delete.bind(t.storage);
+  t.storage.delete = async (key) => {
+    if (key.startsWith('rt:')) throw new Error('cleanup interrupted after family deletion');
+    return deleteKey(key);
+  };
+
+  const replay = await tokenPost(t, {
+    grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+  });
+  assert.equal(replay.status, 500);
+  const answer = await promptly(delivered);
+  assert.equal(answer.status, 200);
+  assert.deepEqual((await answer.json()).error.data.droidbridge_relay, {
+    state: 'settlement_unknown', delivered: true, retried: false,
+  });
+  assert.equal((await respond(t, command)).status, 404);
+  assert.equal(t.storage.keys('family:').length, 0);
+  assert.ok(t.storage.keys('rt:').length > 0, 'orphan refresh records remain for the regression');
+  t.storage.delete = deleteKey;
+
+  t.relay = new Relay({ storage: t.storage, env: t.env, now: t.clock.now, timers: t.clock.api });
+  assert.equal((await t.relay.grants.liveClientIds()).size, 0);
+  assert.equal((await mcp(t, rotated.access_token, toolsCall())).status, 401);
+  const current = await tokenPost(t, {
+    grant_type: 'refresh_token', refresh_token: rotated.refresh_token, client_id: tokens.clientId,
+  });
+  assert.equal(current.status, 400);
+  assert.equal((await current.json()).error, 'invalid_grant');
+  const again = await tokenPost(t, {
+    grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+  });
+  assert.equal(again.status, 400);
+  assert.equal((await again.json()).error_description, 'The refresh token is not valid.');
 });
 
 test('a replayed refresh token withdraws only its family\'s queued commands', async () => {

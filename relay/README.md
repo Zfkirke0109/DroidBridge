@@ -85,7 +85,9 @@ behind one network address may share the limit; a distributed flood can still fi
 
 - **Disconnect Claude** in DroidBridge calls `POST /device/v1/revoke`. The relay deletes every
   access and refresh token, authorization code, waiting consent request, registered client,
-  cached client document and the pairing code. Requests waiting for a phone poll are withdrawn;
+  cached client document and the pairing code in one atomic storage operation. If storage rejects
+  that operation, none of the grants is partly deleted and the phone can retry. Requests waiting
+  for a phone poll are withdrawn;
   requests already delivered get an outcome-unknown answer because they may have run. Claude has
   to connect again (with a new pairing code) to regain access.
 - **Rotate the device key**: run `node scripts/new-device-key.mjs` again, store the new hash with

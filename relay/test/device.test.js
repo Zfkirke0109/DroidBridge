@@ -24,6 +24,7 @@ import {
   waitFor,
 } from './helpers.js';
 import { clampInt } from '../src/device.js';
+import { Relay } from '../src/relay.js';
 
 const DEVICE_ROUTES = [
   ['GET', '/device/v1/status'],
@@ -408,6 +409,49 @@ test('revoke settles a delivered request as unknown and rejects its late reply',
     retried: false,
   });
   assert.equal((await respond(t, command)).status, 404);
+});
+
+test('a failing atomic revoke leaves all durable grants intact while settling in-flight work', async () => {
+  const t = makeRelay();
+  const a = await obtainTokens(t, { pairingCode: 'AAAA1111' });
+  const b = await obtainTokens(t, { pairingCode: 'BBBB2222' });
+  const waitingPoll = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const delivered = mcp(t, a.access_token, toolsCall('delivered-before-storage-failure'));
+  const [command] = (await (await waitingPoll).json()).commands;
+  const queued = mcp(t, b.access_token, toolsCall('queued-before-storage-failure'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+
+  const before = [...t.storage.map];
+  const deleteAll = t.storage.deleteAll.bind(t.storage);
+  let attempts = 0;
+  t.storage.deleteAll = async () => {
+    attempts += 1;
+    throw new Error('atomic storage deletion failed before commit');
+  };
+  const failed = await deviceFetch(t, '/device/v1/revoke', { method: 'POST' });
+  assert.equal(failed.status, 500);
+  assert.equal(attempts, 1);
+  assert.deepEqual([...t.storage.map], before, 'failure cannot leave some grants deleted');
+  const deliveredResult = await promptly(delivered);
+  assert.equal(deliveredResult.status, 200);
+  assert.equal((await deliveredResult.json()).error.data.droidbridge_relay.delivered, true);
+  const queuedResult = await promptly(queued);
+  assert.equal(queuedResult.status, 403);
+  assert.equal((await queuedResult.json()).error.data.droidbridge_relay.delivered, false);
+  assert.equal((await respond(t, command)).status, 404);
+  assert.ok(await t.relay.grants.lookupAccess(a.access_token));
+  assert.ok(await t.relay.grants.lookupAccess(b.access_token));
+  const afterRestart = new Relay({ storage: t.storage, env: t.env, now: t.clock.now, timers: t.clock.api });
+  assert.ok(await afterRestart.grants.lookupAccess(a.access_token), 'the failed atomic deletion stays intact after restart');
+  assert.ok(await afterRestart.grants.lookupAccess(b.access_token), 'other grants stay intact after restart');
+
+  t.storage.deleteAll = deleteAll;
+  const retried = await deviceFetch(t, '/device/v1/revoke', { method: 'POST' });
+  assert.equal(retried.status, 200);
+  assert.deepEqual(await retried.json(), { revoked_tokens: 4 });
+  assert.equal((await mcp(t, a.access_token, toolsCall())).status, 401);
+  assert.equal((await mcp(t, b.access_token, toolsCall())).status, 401);
 });
 
 test('revoke prevents a request authenticated before its body finished from reaching the phone', async () => {

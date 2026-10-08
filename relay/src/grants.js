@@ -52,7 +52,8 @@ export function refreshTokenFamily(token) {
 
 /**
  * @typedef {{ get: (key: string) => Promise<any>, put: (key: string, value: any) => Promise<void>,
- *   delete: (key: string) => Promise<boolean>, list: (options: { prefix: string }) => Promise<Map<string, any>> }} Storage
+ *   delete: (key: string) => Promise<boolean>, deleteAll: () => Promise<void>,
+ *   list: (options: { prefix: string }) => Promise<Map<string, any>> }} Storage
  * @typedef {{ id: string, client_id: string, resource: string, scope: string, created_at: number,
  *   access: string[], refresh: string[], expiresAt: number }} Family
  */
@@ -74,6 +75,11 @@ export class GrantStore {
   async lookupAccess(token) {
     const record = await this.storage.get(`at:${await sha256Hex(token)}`);
     if (!record || record.expiresAt <= this.now()) return null;
+    // A family is the durable authority for every token it issued. Cleanup can fail after
+    // revocation, leaving orphan token records, but those records must never authorize calls.
+    const family = typeof record.family === 'string' ? await this.storage.get(`family:${record.family}`) : null;
+    if (!family || family.expiresAt <= this.now() || family.client_id !== record.client_id ||
+        family.resource !== record.resource || family.scope !== record.scope) return null;
     return record;
   }
 
@@ -154,14 +160,16 @@ export class GrantStore {
     for (const hash of family.access) {
       const record = await this.storage.get(`at:${hash}`);
       if (record && record.expiresAt > now) revoked += 1;
-      await this.storage.delete(`at:${hash}`);
     }
     for (const hash of family.refresh) {
       const record = await this.storage.get(`rt:${hash}`);
       if (record && !record.used && record.expiresAt > now) revoked += 1;
-      await this.storage.delete(`rt:${hash}`);
     }
+    // This is the commit point. If any later deletion fails, leftover token records have no
+    // live family and cannot authorize MCP calls, refresh, or status client counts.
     await this.storage.delete(`family:${familyId}`);
+    for (const hash of family.access) await this.storage.delete(`at:${hash}`);
+    for (const hash of family.refresh) await this.storage.delete(`rt:${hash}`);
     return revoked;
   }
 
@@ -173,11 +181,17 @@ export class GrantStore {
     const now = this.now();
     /** @type {Set<string>} */
     const ids = new Set();
+    const families = await this.storage.list({ prefix: 'family:' });
+    /** @param {any} record */
+    const liveFamily = (record) => {
+      const family = typeof record?.family === 'string' ? families.get(`family:${record.family}`) : null;
+      return family && family.expiresAt > now && family.client_id === record.client_id;
+    };
     for (const record of (await this.storage.list({ prefix: 'at:' })).values()) {
-      if (record.expiresAt > now) ids.add(record.client_id);
+      if (record.expiresAt > now && liveFamily(record)) ids.add(record.client_id);
     }
     for (const record of (await this.storage.list({ prefix: 'rt:' })).values()) {
-      if (!record.used && record.expiresAt > now) ids.add(record.client_id);
+      if (!record.used && record.expiresAt > now && liveFamily(record)) ids.add(record.client_id);
     }
     return ids;
   }
@@ -190,32 +204,46 @@ export class GrantStore {
   async revokeAll() {
     const now = this.now();
     let revoked = 0;
-    for (const [key, record] of await this.storage.list({ prefix: 'at:' })) {
-      if (record.expiresAt > now) revoked += 1;
-      await this.storage.delete(key);
+    const families = await this.storage.list({ prefix: 'family:' });
+    /** @param {any} record */
+    const liveFamily = (record) => {
+      const family = typeof record?.family === 'string' ? families.get(`family:${record.family}`) : null;
+      return family && family.expiresAt > now && family.client_id === record.client_id;
+    };
+    for (const record of (await this.storage.list({ prefix: 'at:' })).values()) {
+      if (record.expiresAt > now && liveFamily(record)) revoked += 1;
     }
-    for (const [key, record] of await this.storage.list({ prefix: 'rt:' })) {
-      if (!record.used && record.expiresAt > now) revoked += 1;
-      await this.storage.delete(key);
+    for (const record of (await this.storage.list({ prefix: 'rt:' })).values()) {
+      if (!record.used && record.expiresAt > now && liveFamily(record)) revoked += 1;
     }
-    for (const prefix of ['family:', 'code:', 'pending:', 'client:', 'cimd:']) {
-      for (const key of (await this.storage.list({ prefix })).keys()) await this.storage.delete(key);
-    }
-    await this.storage.delete('pairing');
+    // SQLite-backed Durable Objects guarantee this one operation is all-or-nothing. It also
+    // clears rate-limit state and any records a future version adds to this private object.
+    await this.storage.deleteAll();
     return revoked;
   }
 
   /** Deletes every expired record. Bounded by the collection caps above. */
   async sweep() {
     const now = this.now();
+    const liveFamilies = new Set();
     // Families first, so the codes of a grant that ends here are purged in the same sweep.
     for (const [key, family] of await this.storage.list({ prefix: 'family:' })) {
-      if (family && typeof family.expiresAt === 'number' && family.expiresAt > now) continue;
+      if (family && typeof family.expiresAt === 'number' && family.expiresAt > now) {
+        liveFamilies.add(key);
+        continue;
+      }
       if (family?.id) await this.revokeFamily(family.id);
       await this.storage.delete(key);
     }
     for (const prefix of EXPIRING_PREFIXES) {
       for (const [key, record] of await this.storage.list({ prefix })) {
+        // A failed post-revocation cleanup may leave token hashes behind. They are already
+        // inert; remove them at the next sweep instead of keeping them until their TTL.
+        if ((prefix === 'at:' || prefix === 'rt:') &&
+            !liveFamilies.has(`family:${record?.family}`)) {
+          await this.storage.delete(key);
+          continue;
+        }
         const until = record?.purgeAt ?? record?.expiresAt;
         if (typeof until === 'number' && until > now) continue;
         // A redeemed code's hash is kept while the grant it started exists, so replaying the

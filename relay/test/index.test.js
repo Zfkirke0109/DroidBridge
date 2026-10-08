@@ -279,6 +279,10 @@ class FlakyStorage extends MemoryStorage {
     this.#check();
     return super.delete(key);
   }
+  async deleteAll() {
+    this.#check();
+    return super.deleteAll();
+  }
   /** @param {{ prefix?: string }} [options] */
   async list(options) {
     this.#check();

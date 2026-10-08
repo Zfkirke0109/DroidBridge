@@ -313,6 +313,11 @@ Follows the MCP 2026-07-28 authorization spec.
   family id is the grant's random 128-bit id (22 base64url characters) and the secret is 256
   random bits (43 base64url characters). Each code exchange starts a family; each family keeps
   the hashes of only its last 8 access and 16 refresh tokens, and older ones are deleted.
+- **Revocation durability.** The SQLite-backed object's `deleteAll()` atomically revokes every
+  grant and pairing record on device disconnect. A code or refresh replay deletes its family
+  record before cleaning up token hashes. Access checks, refresh checks and the authorized-client
+  count require a live family, so a cleanup failure or object restart cannot revive orphan tokens;
+  the next sweep removes them.
 - **Replay detection survives trimming.** A presented refresh token with no record, or whose
   record is already used, counts as a replay when the grant it names (from its record, or else
   from the family id inside the token) is still live, that is, its family exists and has not

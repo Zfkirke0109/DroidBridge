@@ -480,6 +480,18 @@ test('/register: missing and malformed edge IP values share a bounded fallback',
   assert.equal((await register(t, {}, { 'cf-connecting-ip': '2001:db8::26' })).status, 201);
 });
 
+/** @param {ReturnType<typeof makeRelay>} t @param {string} clientId @param {string} hash */
+async function seedLiveToken(t, clientId, hash) {
+  const expiresAt = t.clock.now() + 1000;
+  await t.storage.put(`family:${hash}`, {
+    id: hash, client_id: clientId, resource: 'x', scope: 'droidbridge',
+    created_at: t.clock.now(), access: [hash], refresh: [], expiresAt,
+  });
+  await t.storage.put(`at:${hash}`, {
+    family: hash, client_id: clientId, resource: 'x', scope: 'droidbridge', expiresAt,
+  });
+}
+
 test('/register evicts the oldest client without live tokens at 100 clients', async () => {
   const t = makeRelay();
   // Seed 100 stored clients directly (the hourly rate limit would otherwise take 5 hours).
@@ -492,7 +504,7 @@ test('/register evicts the oldest client without live tokens at 100 clients', as
     });
   }
   // Client 0 holds a live token, so client 1 is the oldest evictable one.
-  await t.storage.put('at:feed', { family: 'f', client_id: 'dbrcl_0000000000000000000000', resource: 'x', scope: 'droidbridge', expiresAt: t.clock.now() + 1000 });
+  await seedLiveToken(t, 'dbrcl_0000000000000000000000', 'feed');
   const res = await register(t);
   assert.equal(res.status, 201);
   assert.equal(t.storage.keys('client:').length, 100);
@@ -502,7 +514,7 @@ test('/register evicts the oldest client without live tokens at 100 clients', as
   // When every stored client has live tokens, registration is refused.
   for (const key of t.storage.keys('client:')) {
     const id = key.slice('client:'.length);
-    await t.storage.put(`at:${id}`, { family: 'f', client_id: id, resource: 'x', scope: 'droidbridge', expiresAt: t.clock.now() + 1000 });
+    await seedLiveToken(t, id, id);
   }
   const full = await register(t);
   assert.equal(full.status, 400);
@@ -512,8 +524,7 @@ test('/register evicts the oldest client without live tokens at 100 clients', as
 test('/register stores a 100th client and refuses a 101st when every stored client holds live tokens', async () => {
   const t = makeRelay();
   /** @param {string} id */
-  const holdLiveToken = (id) =>
-    t.storage.put(`at:${id}`, { family: 'f', client_id: id, resource: 'x', scope: 'droidbridge', expiresAt: t.clock.now() + 1000 });
+  const holdLiveToken = (id) => seedLiveToken(t, id, id);
   for (let i = 0; i < 99; i += 1) {
     const id = `dbrcl_${String(i).padStart(22, '0')}`;
     await t.storage.put(`client:${id}`, { client_id: id, redirect_uris: [CLAUDE_CALLBACK], created_ms: t.clock.now() + i });

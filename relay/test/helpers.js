@@ -27,6 +27,9 @@ export class MemoryStorage {
   async delete(key) {
     return this.map.delete(key);
   }
+  async deleteAll() {
+    this.map.clear();
+  }
   /** @param {{ prefix?: string }} [options] */
   async list({ prefix = '' } = {}) {
     const out = new Map();
