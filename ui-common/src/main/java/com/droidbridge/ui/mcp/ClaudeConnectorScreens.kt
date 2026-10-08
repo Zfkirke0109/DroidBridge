@@ -66,6 +66,8 @@ data class ClaudeConnectorUiState(
     val settings: ClaudeRelaySettingsView? = null,
     val loading: Boolean = true,
     val failed: Boolean = false,
+    /** A failed settings read must not leave a previously running connection visible as live. */
+    val statusReadFailed: Boolean = false,
     val error: ClaudeRelaySettingsError? = null,
     /** Shown until it expires or this route's ViewModel ends; never stored. */
     val pairing: ClaudePairing? = null,
@@ -75,6 +77,7 @@ data class ClaudeConnectorUiState(
 class ClaudeConnectorViewModel(private val client: RuntimeConnection) : ViewModel() {
     private val mutableState = MutableStateFlow(ClaudeConnectorUiState())
     val state: StateFlow<ClaudeConnectorUiState> = mutableState.asStateFlow()
+    private var backgroundReadInFlight = false
 
     init {
         viewModelScope.launch {
@@ -85,17 +88,24 @@ class ClaudeConnectorViewModel(private val client: RuntimeConnection) : ViewMode
     }
 
     fun refresh(background: Boolean = false) {
+        if (background && (mutableState.value.loading || backgroundReadInFlight)) return
+        if (background) backgroundReadInFlight = true
         if (!background) mutableState.update { it.copy(loading = true, failed = false, error = null) }
         viewModelScope.launch {
-            val reply = runCatching { client.claudeRelaySettings() }.getOrNull()
-            val settings = reply?.let(ClaudeRelaySettingsReplies::settings)
-            mutableState.update { current ->
-                current.copy(
-                    settings = settings ?: current.settings,
-                    loading = if (background) current.loading else false,
-                    failed = if (background) current.failed else settings == null,
-                    error = if (settings == null && !background) reply?.let(ClaudeRelaySettingsReplies::error) else current.error,
-                )
+            try {
+                val reply = runCatching { client.claudeRelaySettings() }.getOrNull()
+                val settings = reply?.let(ClaudeRelaySettingsReplies::settings)
+                mutableState.update { current ->
+                    current.copy(
+                        settings = settings ?: current.settings,
+                        loading = if (background) current.loading else false,
+                        failed = settings == null,
+                        statusReadFailed = settings == null,
+                        error = if (settings == null) reply?.let(ClaudeRelaySettingsReplies::error) else null,
+                    )
+                }
+            } finally {
+                if (background) backgroundReadInFlight = false
             }
         }
     }
@@ -105,22 +115,31 @@ class ClaudeConnectorViewModel(private val client: RuntimeConnection) : ViewMode
         viewModelScope.launch {
             val reply = runCatching { client.configureClaudeRelay(relayUrl.trim(), deviceKey.trim()) }.getOrNull()
             val configured = reply?.let(ClaudeRelaySettingsReplies::settings)
+            var enableReply: String? = null
             val connected = when {
                 configured == null -> null
                 configured.enabled -> configured
-                else -> runCatching { client.setClaudeRelayEnabled(true) }
-                    .getOrNull()?.let(ClaudeRelaySettingsReplies::settings)
+                else -> {
+                    enableReply = runCatching { client.setClaudeRelayEnabled(true) }.getOrNull()
+                    enableReply?.let(ClaudeRelaySettingsReplies::settings)
+                }
             }
+            val enabled = connected?.enabled == true && connected.state != TunnelRuntimeState.Failed
             mutableState.update { current ->
                 current.copy(
                     settings = connected ?: configured ?: current.settings,
                     loading = false,
-                    failed = connected == null,
-                    error = if (configured == null) reply?.let(ClaudeRelaySettingsReplies::error) else null,
+                    failed = !enabled,
+                    statusReadFailed = false,
+                    error = when {
+                        configured == null -> reply?.let(ClaudeRelaySettingsReplies::error)
+                        !enabled -> enableReply?.let(ClaudeRelaySettingsReplies::error)
+                        else -> null
+                    },
                     pairing = null,
                 )
             }
-            complete(configured != null)
+            complete(enabled)
         }
     }
 
@@ -191,9 +210,9 @@ class ClaudeConnectorViewModel(private val client: RuntimeConnection) : ViewMode
 @OptIn(ExperimentalMaterial3Api::class)
 fun ClaudeConnectorRoute(viewModel: ClaudeConnectorViewModel, back: () -> Unit) {
     val state by viewModel.state.collectAsStateWithLifecycle()
-    val settings = state.settings
     val context = LocalContext.current
     var editing by rememberSaveable { mutableStateOf(false) }
+    val settings = state.settings.takeUnless { state.statusReadFailed && !editing }
     var confirmRevoke by remember { mutableStateOf(false) }
     var confirmRemove by remember { mutableStateOf(false) }
     val showForm = settings != null && (!settings.configured || editing)
@@ -239,7 +258,7 @@ fun ClaudeConnectorRoute(viewModel: ClaudeConnectorViewModel, back: () -> Unit) 
                         loading = state.loading,
                         initialUrl = settings.relayUrl.orEmpty(),
                         cancel = if (settings.configured) ({ editing = false }) else null,
-                    ) { url, key -> viewModel.configureAndEnable(url, key) { saved -> if (saved) editing = false } }
+                    ) { url, key -> viewModel.configureAndEnable(url, key) { enabled -> editing = !enabled } }
                 }
             } else if (settings != null && settings.configured) {
                 item {
@@ -371,9 +390,10 @@ fun ClaudeConnectorRoute(viewModel: ClaudeConnectorViewModel, back: () -> Unit) 
     }
 
     LaunchedEffect(Unit) { viewModel.refresh() }
-    // A relay that is enabled but not yet running is read again until it settles.
-    LaunchedEffect(settings?.enabled, settings?.state) {
-        while (settings?.enabled == true && settings.state != TunnelRuntimeState.Running) {
+    // Keep the displayed status current after a successful connection too: the relay can later
+    // lose the network or reject its device key without any UI connection-state event.
+    LaunchedEffect(Unit) {
+        while (true) {
             delay(REFRESH_MS)
             viewModel.refresh(background = true)
         }

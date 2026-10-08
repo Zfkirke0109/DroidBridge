@@ -56,10 +56,9 @@ You can check the relay with `curl https://<relay>/` (it answers `DroidBridge re
 
 ## Connect DroidBridge
 
-In a phone build with the Claude relay client, open **Agent connection → Claude connector**, enter
-the relay URL and the device key, and turn the connector on. The phone then keeps one long poll open
-to the relay. In the root edition, configure it through DroidBridge Root; the root backend must
-maintain the poll independently of that settings app.
+In a standalone phone build with the Claude relay client, open **Agent connection → Claude
+connector**, enter the relay URL and the device key, and turn the connector on. The phone then
+keeps one long poll open to the relay. The root edition does not yet include a relay client.
 
 ## Connect Claude
 
