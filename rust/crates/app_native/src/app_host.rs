@@ -1,5 +1,8 @@
 use crate::app_guard_recovery::{AppCleanupVerification, reconcile_app_recovery};
 use crate::automation_wake::ApkAlarmWake;
+use crate::host_health::{
+    HostHealthClass, bridge_fault_latched, classify_deep_probe, probe_store_writable,
+};
 use crate::{
     AndroidFrameworkFilesystemDispatcher, AndroidFrameworkFilesystemPort,
     AndroidShizukuFilesystemPort, ApkCommandProcessPort, ApkCore, ApkNetworkPort, ApkVisualPort,
@@ -390,6 +393,50 @@ pub(super) fn validate_existing_host(expected: &AdmissionFence) -> Result<(), Do
     validate_host_instance(&host, Some(expected))
 }
 
+/// A deep probe reads the canonical state, proves this instance's private directory can take a
+/// synced write, and checks the framework executor through the actual JNI bridge. It never runs
+/// an executor or changes canonical state.
+pub(super) fn probe_existing_host(expected: &AdmissionFence) -> HostHealthClass {
+    let Some(host) = host_slot().lock().ok().and_then(|slot| slot.clone()) else {
+        return HostHealthClass::HostMissing;
+    };
+    if !fence_names_live(expected, host._lease.live()) {
+        return HostHealthClass::FenceMismatch;
+    }
+    if let Err(error) = host.store.validate_lease(&host._lease) {
+        return if error.code == ErrorCode::StaleAuthority {
+            HostHealthClass::LeaseStale
+        } else {
+            HostHealthClass::StoreUnreadable
+        };
+    }
+    if bridge_fault_latched(&host.runtime_instance_id) {
+        return HostHealthClass::BridgeFault;
+    }
+    match validate_host_instance(&host, Some(expected)) {
+        Ok(()) => {}
+        Err(error) if error.code == ErrorCode::StaleAuthority => {
+            return HostHealthClass::FenceMismatch;
+        }
+        Err(error) if error.code == ErrorCode::IoError => {
+            return if bridge_fault_latched(&host.runtime_instance_id) {
+                HostHealthClass::BridgeFault
+            } else {
+                HostHealthClass::StoreUnreadable
+            };
+        }
+        Err(error) if error.code == ErrorCode::CapabilityUnavailable => {
+            return HostHealthClass::NotReady;
+        }
+        Err(_) => return HostHealthClass::ProbeFailed,
+    }
+    classify_deep_probe(
+        || host.store.load(&host._lease).map(|_| ()),
+        || probe_store_writable(&host.base, &host.runtime_instance_id),
+        || crate::probe_execution_bridge(&host, expected.host_generation),
+    )
+}
+
 pub(super) fn validate_host_instance(
     host: &NativeHost,
     expected: Option<&AdmissionFence>,
@@ -416,6 +463,12 @@ pub(super) fn validate_host_instance(
         return Err(DomainError::new(
             ErrorCode::CapabilityUnavailable,
             "APK Runtime is not ready",
+        ));
+    }
+    if bridge_fault_latched(&host.runtime_instance_id) {
+        return Err(DomainError::new(
+            ErrorCode::IoError,
+            "Android execution bridge failed",
         ));
     }
     Ok(())
@@ -507,6 +560,7 @@ fn record_scheduler_fault(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_health::{HostHealthClass, classify_deep_probe, probe_store_writable};
 
     fn id(number: u64) -> UuidV4 {
         UuidV4::parse(format!("00000000-0000-4000-8000-{number:012x}")).unwrap()
@@ -550,5 +604,74 @@ mod tests {
             },
             &live
         ));
+    }
+
+    #[test]
+    fn deep_probe_keeps_canonical_bytes_untouched_and_cleans_its_private_scratch_file() {
+        let base = std::env::temp_dir().join(format!("droidbridge-probe-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&base).unwrap();
+        let canonical = base.join("runtime-state.json");
+        fs::write(&canonical, b"canonical-before-probe").unwrap();
+
+        probe_store_writable(&base, &id(2)).unwrap();
+        probe_store_writable(&base, &id(2)).unwrap();
+
+        assert_eq!(fs::read(&canonical).unwrap(), b"canonical-before-probe");
+        let names: Vec<_> = fs::read_dir(&base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["runtime-state.json"]);
+        assert!(probe_store_writable(&base.join("missing"), &id(2)).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn deep_probe_reports_the_first_failed_source_without_running_an_executor() {
+        let executor_was_called = std::cell::Cell::new(false);
+        assert_eq!(
+            classify_deep_probe(
+                || Err(DomainError::new(ErrorCode::IoError, "state read failed")),
+                || Err(std::io::Error::other("scratch sync failed")),
+                || {
+                    executor_was_called.set(true);
+                    HostHealthClass::ExecutorMissing
+                },
+            ),
+            HostHealthClass::StoreUnreadable,
+        );
+        assert!(!executor_was_called.get());
+        assert_eq!(
+            classify_deep_probe(
+                || Err(DomainError::new(ErrorCode::StaleAuthority, "lease moved")),
+                || Ok(()),
+                || HostHealthClass::Healthy,
+            ),
+            HostHealthClass::LeaseStale,
+        );
+        assert_eq!(
+            classify_deep_probe(
+                || Ok(()),
+                || Err(std::io::Error::other("disk full")),
+                || {
+                    executor_was_called.set(true);
+                    HostHealthClass::Healthy
+                },
+            ),
+            HostHealthClass::StoreUnwritable,
+        );
+        assert!(!executor_was_called.get());
+        assert_eq!(
+            classify_deep_probe(
+                || Ok(()),
+                || Ok(()),
+                || {
+                    executor_was_called.set(true);
+                    HostHealthClass::ExecutorMissing
+                }
+            ),
+            HostHealthClass::ExecutorMissing,
+        );
+        assert!(executor_was_called.get());
     }
 }

@@ -3,6 +3,7 @@ package com.droidbridge.standalone.runtimehost
 internal object NativeRuntime {
     external fun nativeStart(canonicalBase: String, environmentJson: String): String
     external fun nativeValidateHost(runtimeEpoch: String, hostGeneration: Long, runtimeInstanceId: String): String?
+    external fun nativeProbeHost(runtimeEpoch: String, hostGeneration: Long, runtimeInstanceId: String): String?
     external fun nativeSubmit(
         envelope: ByteArray,
         runtimeEpoch: String,

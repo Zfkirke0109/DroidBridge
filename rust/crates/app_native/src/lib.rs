@@ -6,13 +6,16 @@ mod app_host;
 mod automation_wake;
 mod command;
 mod guard;
+mod host_health;
 mod mcp_listener;
 mod network;
 mod remote_relay;
 mod tunnel;
 mod visual;
 
-use app_host::{AppHostControl, start_host, validate_existing_host, validate_host_instance};
+use app_host::{
+    AppHostControl, probe_existing_host, start_host, validate_existing_host, validate_host_instance,
+};
 
 #[cfg(target_os = "android")]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -960,6 +963,60 @@ fn initialize_android_execution_dispatcher(env: &mut Env<'_>) -> jni::errors::Re
 }
 
 #[cfg(target_os = "android")]
+const BRIDGE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Use the host's blocking pool so this check crosses the same JNI attach path as a real Android
+/// primitive. The check only reads the Kotlin executor registry.
+#[cfg(target_os = "android")]
+fn probe_execution_bridge(host: &NativeHost, generation: u64) -> host_health::HostHealthClass {
+    use host_health::HostHealthClass;
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    host.async_runtime.spawn_blocking(move || {
+        let _ = reply.send(probe_execution_bridge_here(generation));
+    });
+    let class = result
+        .recv_timeout(BRIDGE_PROBE_TIMEOUT)
+        .unwrap_or(HostHealthClass::BridgeFault);
+    if class == HostHealthClass::BridgeFault {
+        host_health::latch_bridge_fault(&host.runtime_instance_id);
+    }
+    class
+}
+
+#[cfg(target_os = "android")]
+fn probe_execution_bridge_here(generation: u64) -> host_health::HostHealthClass {
+    use host_health::HostHealthClass;
+    let Some(dispatcher) = ANDROID_EXECUTION_DISPATCHER.get() else {
+        return HostHealthClass::BridgeFault;
+    };
+    let Ok(generation) = i64::try_from(generation) else {
+        return HostHealthClass::ExecutorMissing;
+    };
+    let Ok(vm) = JavaVM::singleton() else {
+        return HostHealthClass::BridgeFault;
+    };
+    match vm.attach_current_thread(|env| -> jni::errors::Result<bool> {
+        let key = env.new_string("android.framework")?;
+        env.call_static_method(
+            &**dispatcher,
+            jni_str!("probeExecutor"),
+            jni_sig!("(Ljava/lang/String;J)Z"),
+            &[JValue::Object(key.as_ref()), JValue::Long(generation)],
+        )?
+        .z()
+    }) {
+        Ok(true) => HostHealthClass::Healthy,
+        Ok(false) => HostHealthClass::ExecutorMissing,
+        Err(_) => HostHealthClass::BridgeFault,
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn probe_execution_bridge(_host: &NativeHost, _generation: u64) -> host_health::HostHealthClass {
+    host_health::HostHealthClass::Healthy
+}
+
+#[cfg(target_os = "android")]
 pub(crate) fn publish_task_activity(
     active_tasks: usize,
     canonical_revision: u64,
@@ -1044,20 +1101,26 @@ fn dispatch_android_execution_for_with_descriptor(
     descriptor: Option<(&str, i32)>,
 ) -> Result<AndroidPrimitiveResult, DomainError> {
     let dispatcher = ANDROID_EXECUTION_DISPATCHER.get().ok_or_else(|| {
+        host_health::latch_bridge_fault(&execution.executor.fence.runtime_instance_id);
         DomainError::new(
             ErrorCode::CapabilityUnavailable,
             "Android execution dispatcher is unavailable",
         )
     })?;
-    let vm = JavaVM::singleton()
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "Java VM is unavailable"))?;
+    let vm = JavaVM::singleton().map_err(|_| {
+        host_health::latch_bridge_fault(&execution.executor.fence.runtime_instance_id);
+        DomainError::new(ErrorCode::InternalError, "Java VM is unavailable")
+    })?;
     let (error_code, result) = vm
         .attach_current_thread(|env| {
             dispatch_android_execution_jni(
                 env, dispatcher, key, primitive, payload, execution, descriptor,
             )
         })
-        .map_err(|_| DomainError::new(ErrorCode::IoError, "Android execution bridge failed"))?;
+        .map_err(|_| {
+            host_health::latch_bridge_fault(&execution.executor.fence.runtime_instance_id);
+            DomainError::new(ErrorCode::IoError, "Android execution bridge failed")
+        })?;
     if let Some((error_code, error_reason)) = error_code {
         return Err(DomainError {
             peer_reason: error_reason,
@@ -1325,6 +1388,46 @@ pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime
                 Err(error) => error_code_token(error.code),
             };
             Ok(owned.new_string(token)?.into_raw())
+        })
+        .into_outcome()
+    {
+        Outcome::Ok(value) => value,
+        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
+    }
+}
+
+/// Side-effect-free deep health evidence for the exact APK instance Kotlin admitted. This does
+/// not execute a public tool or change canonical state.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeProbeHost(
+    mut env: EnvUnowned,
+    _class: JClass,
+    runtime_epoch: JString,
+    host_generation: jlong,
+    runtime_instance_id: JString,
+) -> jstring {
+    match env
+        .with_env(|owned| -> jni::errors::Result<jstring> {
+            let epoch = runtime_epoch.mutf8_chars(owned)?.to_str().into_owned();
+            let instance = runtime_instance_id
+                .mutf8_chars(owned)?
+                .to_str()
+                .into_owned();
+            let class = match (
+                UuidV4::parse(epoch),
+                u64::try_from(host_generation),
+                UuidV4::parse(instance),
+            ) {
+                (Ok(runtime_epoch), Ok(host_generation), Ok(runtime_instance_id)) => {
+                    probe_existing_host(&AdmissionFence {
+                        runtime_epoch,
+                        host_generation,
+                        runtime_instance_id,
+                    })
+                }
+                _ => host_health::HostHealthClass::FenceMismatch,
+            };
+            Ok(owned.new_string(class.token())?.into_raw())
         })
         .into_outcome()
     {

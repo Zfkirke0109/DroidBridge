@@ -21,6 +21,11 @@ internal object NativeAndroidExecutionDispatcher {
         registry.compareAndSet(value, null)
     }
 
+    /** Reads the framework executor registry through JNI without invoking an executor. */
+    @JvmStatic
+    fun probeExecutor(key: String, generation: Long): Boolean =
+        key == "android.framework" && generation > 0 && registry.get()?.executor(key, generation) != null
+
     @Synchronized
     fun installTaskActivitySink(value: ((Long) -> Unit)?) {
         taskActivitySink = value
@@ -168,5 +173,9 @@ internal object NativeAndroidExecutionDispatcher {
         AndroidExecutionResult(byteArrayOf(), errorCode = "TIMEOUT")
     } catch (_: CancellationException) {
         AndroidExecutionResult(byteArrayOf(), errorCode = "CANCELLED")
+    } catch (_: Exception) {
+        // An executor's own exception is an operation failure, not a failure of the shared JNI
+        // bridge that every Android primitive uses.
+        AndroidExecutionResult(byteArrayOf(), errorCode = "INTERNAL_ERROR")
     }
 }

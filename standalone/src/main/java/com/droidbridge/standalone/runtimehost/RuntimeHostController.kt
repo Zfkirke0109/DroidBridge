@@ -6,6 +6,7 @@ import android.app.Application
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import com.droidbridge.standalone.BuildConfig
 import com.droidbridge.standalone.execution.android.NetworkDefaultObservation
 import com.droidbridge.standalone.product.release.ReleaseConfig
@@ -89,6 +90,7 @@ internal class RuntimeHostController(
     private val apkProjectionReleasedSink = AtomicReference<(() -> Unit)?>(null)
     private val platformGeneration = AtomicLong(0)
     private val capabilityFacts = CapabilityFacts()
+    private val deepProbeBudget = RuntimeDeepProbeBudget()
     private val maintenanceExecutor = AtomicReference<ExecutorService?>(null)
     private val deviceContext = application.createDeviceProtectedStorageContext()
     private val canonicalBase = File(deviceContext.filesDir, "droidbridge")
@@ -171,6 +173,11 @@ internal class RuntimeHostController(
         replayFacts()
         registerPlatformFacts()
         frameworkReadySink.get()?.invoke(generation)
+        val health = probeDeep(requireNotNull(activated.activeFence))
+        if (health != NativeHostHealth.Healthy) {
+            runtimeSession.compareAndSet(activated, inactiveSession(health.failureCode))
+            return false
+        }
         recoverMaintenance()
         val guard = File(application.applicationInfo.nativeLibraryDir, "libdroidbridge_exec_guard.so")
         if (!NativeRuntime.nativeProbeAppGuard(guard.absolutePath)) {
@@ -248,15 +255,38 @@ internal class RuntimeHostController(
 
     fun submit(envelope: ByteArray): ByteArray {
         if (!start()) throw RuntimeStartException(runtimeSession.get().startFailure)
-        val fence = runtimeSession.get().activeFence ?: throw RuntimeStartException(runtimeSession.get().startFailure)
+        val observed = runtimeSession.get()
+        val fence = observed.activeFence ?: throw RuntimeStartException(observed.startFailure)
         frameworkReadySink.get()?.invoke(fence.hostGeneration)
         registerPlatformFacts()
-        return NativeRuntime.nativeSubmit(
-            envelope,
-            fence.runtimeEpoch,
-            fence.hostGeneration,
-            fence.runtimeInstanceId,
+        val response = try {
+            NativeRuntime.nativeSubmit(
+                envelope,
+                fence.runtimeEpoch,
+                fence.hostGeneration,
+                fence.runtimeInstanceId,
+            )
+        } catch (failure: Throwable) {
+            maybeProbeAfterSuspicious(observed, fence)
+            throw failure
+        }
+        if (suspiciousRuntimeReply(response)) maybeProbeAfterSuspicious(observed, fence)
+        return response
+    }
+
+    private fun probeDeep(fence: RuntimeFence): NativeHostHealth = runCatching {
+        NativeHostHealth.decode(
+            NativeRuntime.nativeProbeHost(fence.runtimeEpoch, fence.hostGeneration, fence.runtimeInstanceId),
         )
+    }.getOrDefault(NativeHostHealth.ProbeFailed)
+
+    /** Preserve the already returned response; probing cannot replay an ambiguous operation. */
+    private fun maybeProbeAfterSuspicious(observed: RuntimeSessionState, fence: RuntimeFence) {
+        if (!deepProbeBudget.claim(fence, SystemClock.elapsedRealtime())) return
+        val health = probeDeep(fence)
+        if (health != NativeHostHealth.Healthy) {
+            runtimeSession.compareAndSet(observed, inactiveSession(health.failureCode))
+        }
     }
 
     /** Answers one S-MCP-006 internal artifact query from this host's own artifact store. */

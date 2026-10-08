@@ -14,13 +14,17 @@ import com.droidbridge.ui.client.resolveContextRefresh
 import com.droidbridge.standalone.execution.android.AndroidExecutionBridge
 import com.droidbridge.standalone.execution.android.AndroidExecutionRegistry
 import com.droidbridge.standalone.execution.android.AndroidExecutionResult
+import com.droidbridge.standalone.execution.android.NativeAndroidExecutionDispatcher
 import com.droidbridge.standalone.execution.android.CapabilityRegistration
 import com.droidbridge.standalone.execution.android.RegisteredCapabilityState
 import com.droidbridge.standalone.runtimehost.NativeRuntime
+import com.droidbridge.standalone.runtimehost.NativeHostHealth
 import com.droidbridge.standalone.runtimehost.RuntimeFence
 import com.droidbridge.standalone.runtimehost.RuntimeHostController
 import com.droidbridge.standalone.runtimehost.RuntimeSessionState
+import com.droidbridge.standalone.runtimehost.RuntimeDeepProbeBudget
 import com.droidbridge.standalone.runtimehost.diagnosticSession
+import com.droidbridge.standalone.runtimehost.suspiciousRuntimeReply
 import com.droidbridge.standalone.runtimehost.validatedByNativeHealth
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -186,6 +190,7 @@ class I5_GatesTest {
 
         assertTrue("nativeStart" in nativeMethods)
         assertTrue("nativeValidateHost" in nativeMethods)
+        assertTrue("nativeProbeHost" in nativeMethods)
         assertTrue("nativeSubmit" in nativeMethods)
         assertEquals(
             listOf(ByteArray::class.java, String::class.java, java.lang.Long.TYPE, String::class.java),
@@ -284,6 +289,48 @@ class I5_GatesTest {
         assertEquals("STALE_AUTHORITY", diagnosticSession(active, withdrawn, false).startFailure)
         val replacement = active.copy(activeFence = RuntimeFence("epoch-a", 8, "instance-b"))
         assertFalse(diagnosticSession(active, replacement, statusAvailable = true).started)
+    }
+
+    @Test
+    fun I5_G05_frameworkProbeReadsTheLiveGenerationWithoutRunningAnExecutor() {
+        val executions = java.util.concurrent.atomic.AtomicInteger()
+        val registry = AndroidExecutionRegistry { _, _, _, _, _ -> true }
+        val executor = AndroidExecutionBridge {
+            executions.incrementAndGet()
+            AndroidExecutionResult(byteArrayOf())
+        }
+        NativeAndroidExecutionDispatcher.install(registry)
+        try {
+            assertFalse(NativeAndroidExecutionDispatcher.probeExecutor("android.framework", 7))
+            assertTrue(registry.register(registration("android.framework", 7, executor)))
+            assertTrue(NativeAndroidExecutionDispatcher.probeExecutor("android.framework", 7))
+            assertFalse(NativeAndroidExecutionDispatcher.probeExecutor("android.framework", 8))
+            assertFalse(NativeAndroidExecutionDispatcher.probeExecutor("shizuku.shell", 7))
+            assertEquals(0, executions.get())
+        } finally {
+            NativeAndroidExecutionDispatcher.uninstall(registry)
+        }
+    }
+
+    @Test
+    fun I5_G05_suspiciousFailuresReprobeAtMostOncePerFiveSecondsPerInstance() {
+        val budget = RuntimeDeepProbeBudget()
+        val first = RuntimeFence("epoch-a", 7, "instance-a")
+        val replacement = RuntimeFence("epoch-a", 8, "instance-b")
+        assertTrue(budget.claim(first, 1_000))
+        assertFalse(budget.claim(first, 5_999))
+        assertTrue(budget.claim(first, 6_000))
+        assertTrue(budget.claim(replacement, 6_001))
+        for (code in listOf("IO_ERROR", "INTERNAL_ERROR", "RESOURCE_LIMIT")) {
+            assertTrue(suspiciousRuntimeReply("""{"outcome":"error","error":{"code":"$code"}}""".encodeToByteArray()))
+        }
+        assertTrue(suspiciousRuntimeReply(byteArrayOf()))
+        assertTrue(suspiciousRuntimeReply("not json".encodeToByteArray()))
+        assertFalse(suspiciousRuntimeReply("""{"outcome":"error","error":{"code":"NOT_FOUND"}}""".encodeToByteArray()))
+        assertFalse(suspiciousRuntimeReply("""{"outcome":"success","result":{}}""".encodeToByteArray()))
+        assertEquals(NativeHostHealth.StoreUnwritable, NativeHostHealth.decode("store_unwritable"))
+        assertEquals(NativeHostHealth.ProbeFailed, NativeHostHealth.decode("unknown"))
+        assertEquals(NativeHostHealth.ProbeFailed, NativeHostHealth.decode(null))
     }
 
     @Test
