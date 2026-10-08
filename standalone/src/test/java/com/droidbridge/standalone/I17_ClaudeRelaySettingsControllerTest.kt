@@ -16,6 +16,7 @@ import java.security.SecureRandom
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
@@ -221,6 +222,48 @@ class I17_ClaudeRelaySettingsControllerTest {
         assertFalse("earlier validation ended", earlier.isAlive)
         assertEquals("RELAY_UNAVAILABLE", error(requireNotNull(earlierReply.get())))
         assertEquals(OTHER_ORIGIN, string(controller.settings(), "relay_url"))
+    }
+
+    @Test
+    fun i17_revocationCannotBeOvertakenByAnEarlierSlowPairingRequest() {
+        val controller = controller()
+        controller.configure(ORIGIN, DEVICE_KEY, foreground::add)
+        val pairGate = CallGate()
+        val pairingActive = AtomicBoolean(false)
+        val revokeEntered = CountDownLatch(1)
+        val revokeReachedRelay = CountDownLatch(1)
+        runtime.onPair = {
+            pairGate.block()
+            pairingActive.set(true)
+        }
+        runtime.onRevoke = {
+            pairingActive.set(false)
+            revokeReachedRelay.countDown()
+        }
+        val pairReply = AtomicReference<String?>()
+        val revokeReply = AtomicReference<String?>()
+        val pair = Thread { pairReply.set(controller.pair()) }
+        val revoke = Thread {
+            revokeEntered.countDown()
+            revokeReply.set(controller.revokeClaude())
+        }
+        pair.start()
+        try {
+            assertTrue("pairing request started", pairGate.entered.await(5, TimeUnit.SECONDS))
+            revoke.start()
+            assertTrue("revocation entered", revokeEntered.await(5, TimeUnit.SECONDS))
+            assertFalse("revocation must wait for pairing", revokeReachedRelay.await(250, TimeUnit.MILLISECONDS))
+        } finally {
+            pairGate.release.countDown()
+            pair.join(5_000)
+            revoke.join(5_000)
+        }
+        assertFalse("pairing request ended", pair.isAlive)
+        assertFalse("revocation ended", revoke.isAlive)
+        assertTrue("revocation reached relay", revokeReachedRelay.await(5, TimeUnit.SECONDS))
+        assertTrue(requireNotNull(pairReply.get()).contains("pairing_code"))
+        assertTrue(boolean(requireNotNull(revokeReply.get()), "configured"))
+        assertFalse("revocation must clear the earlier pairing", pairingActive.get())
     }
 
     private fun callWhileSuspending(

@@ -8,6 +8,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.concurrent.CompletableFuture
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
@@ -77,6 +78,8 @@ internal class ClaudeRelaySettingsController(
     /** Invalidates slow relay calls when settings are replaced or this service is suspended. */
     private var settingsEpoch = 0L
     private var suspended = false
+    /** Pair and revoke mutate the same relay authority, but must not hold the lifecycle lock. */
+    private var relayMutationTail = CompletableFuture.completedFuture(Unit)
     private var watching = false
     private var failure: String? = null
 
@@ -100,7 +103,30 @@ internal class ClaudeRelaySettingsController(
         val settings: Committed,
         val deviceKey: String,
         val settingsEpoch: Long,
+        val turn: RelayMutationTurn,
     )
+
+    private data class RelayMutationTurn(
+        val predecessor: CompletableFuture<Unit>,
+        val completed: CompletableFuture<Unit>,
+    ) {
+        fun run(action: () -> String): String {
+            predecessor.join()
+            return try {
+                action()
+            } finally {
+                completed.complete(Unit)
+            }
+        }
+    }
+
+    /** Called only under [lock], so a later revoke cannot overtake an earlier pair. */
+    private fun reserveRelayMutation(): RelayMutationTurn {
+        val completed = CompletableFuture<Unit>()
+        val turn = RelayMutationTurn(relayMutationTail, completed)
+        relayMutationTail = completed
+        return turn
+    }
 
     fun settings(): String = synchronized(lock) {
         load().fold({ status(it) }) { IO_ERROR }
@@ -155,25 +181,36 @@ internal class ClaudeRelaySettingsController(
         val call = synchronized(lock) {
             if (suspended) return RELAY_UNAVAILABLE
             val current = load().getOrElse { return IO_ERROR } ?: return NOT_CONFIGURED
-            RelayCall(current, deviceKey(current) ?: return CREDENTIALS_UNAVAILABLE_ERROR, settingsEpoch)
+            RelayCall(
+                current,
+                deviceKey(current) ?: return CREDENTIALS_UNAVAILABLE_ERROR,
+                settingsEpoch,
+                reserveRelayMutation(),
+            )
         }
-        val code = pairingCode(random)
-        val answer = runtime.pair(call.settings.relayUrl, call.deviceKey, pairingCodeSha256(code), PAIRING_TTL_SECONDS)
-        return synchronized(lock) {
-            // A code published to an old relay must never be displayed as the current pairing.
-            if (suspended || call.settingsEpoch != settingsEpoch) return RELAY_UNAVAILABLE
-            when (answer) {
-                RELAY_CALL_OK -> Unit
-                RELAY_CALL_INVALID_KEY -> return DEVICE_KEY_INVALID
-                RELAY_CALL_INVALID_RELAY -> return RELAY_NOT_FOUND
-                RELAY_CALL_NOT_CONFIGURED -> return RELAY_NOT_CONFIGURED
-                else -> return RELAY_UNAVAILABLE
+        return call.turn.run {
+            if (synchronized(lock) { suspended || call.settingsEpoch != settingsEpoch }) {
+                RELAY_UNAVAILABLE
+            } else {
+                val code = pairingCode(random)
+                val answer = runtime.pair(call.settings.relayUrl, call.deviceKey, pairingCodeSha256(code), PAIRING_TTL_SECONDS)
+                synchronized(lock) {
+                    // A code published to an old relay must never be displayed as the current pairing.
+                    if (suspended || call.settingsEpoch != settingsEpoch) return@synchronized RELAY_UNAVAILABLE
+                    when (answer) {
+                        RELAY_CALL_OK -> Unit
+                        RELAY_CALL_INVALID_KEY -> return@synchronized DEVICE_KEY_INVALID
+                        RELAY_CALL_INVALID_RELAY -> return@synchronized RELAY_NOT_FOUND
+                        RELAY_CALL_NOT_CONFIGURED -> return@synchronized RELAY_NOT_CONFIGURED
+                        else -> return@synchronized RELAY_UNAVAILABLE
+                    }
+                    buildJsonObject {
+                        put("schema_version", SCHEMA_VERSION)
+                        put("pairing_code", "${code.substring(0, 4)}-${code.substring(4)}")
+                        put("expires_at_epoch_ms", nowEpochMs() + PAIRING_TTL_SECONDS * 1_000L)
+                    }.toString()
+                }
             }
-            buildJsonObject {
-                put("schema_version", SCHEMA_VERSION)
-                put("pairing_code", "${code.substring(0, 4)}-${code.substring(4)}")
-                put("expires_at_epoch_ms", nowEpochMs() + PAIRING_TTL_SECONDS * 1_000L)
-            }.toString()
         }
     }
 
@@ -182,18 +219,29 @@ internal class ClaudeRelaySettingsController(
         val call = synchronized(lock) {
             if (suspended) return RELAY_UNAVAILABLE
             val current = load().getOrElse { return IO_ERROR } ?: return NOT_CONFIGURED
-            RelayCall(current, deviceKey(current) ?: return CREDENTIALS_UNAVAILABLE_ERROR, settingsEpoch)
+            RelayCall(
+                current,
+                deviceKey(current) ?: return CREDENTIALS_UNAVAILABLE_ERROR,
+                settingsEpoch,
+                reserveRelayMutation(),
+            )
         }
-        val answer = runtime.revoke(call.settings.relayUrl, call.deviceKey)
-        return synchronized(lock) {
-            // Revoking an old relay must not be reported as revoking a newly configured one.
-            if (suspended || call.settingsEpoch != settingsEpoch) return RELAY_UNAVAILABLE
-            when (answer) {
-                RELAY_CALL_OK -> status(call.settings)
-                RELAY_CALL_INVALID_KEY -> DEVICE_KEY_INVALID
-                RELAY_CALL_INVALID_RELAY -> RELAY_NOT_FOUND
-                RELAY_CALL_NOT_CONFIGURED -> RELAY_NOT_CONFIGURED
-                else -> RELAY_UNAVAILABLE
+        return call.turn.run {
+            if (synchronized(lock) { suspended || call.settingsEpoch != settingsEpoch }) {
+                RELAY_UNAVAILABLE
+            } else {
+                val answer = runtime.revoke(call.settings.relayUrl, call.deviceKey)
+                synchronized(lock) {
+                    // Revoking an old relay must not be reported as revoking a newly configured one.
+                    if (suspended || call.settingsEpoch != settingsEpoch) return@synchronized RELAY_UNAVAILABLE
+                    when (answer) {
+                        RELAY_CALL_OK -> status(call.settings)
+                        RELAY_CALL_INVALID_KEY -> DEVICE_KEY_INVALID
+                        RELAY_CALL_INVALID_RELAY -> RELAY_NOT_FOUND
+                        RELAY_CALL_NOT_CONFIGURED -> RELAY_NOT_CONFIGURED
+                        else -> RELAY_UNAVAILABLE
+                    }
+                }
             }
         }
     }
