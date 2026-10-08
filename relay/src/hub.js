@@ -12,6 +12,8 @@
  *   settled      delivered, and the phone posted a response with the right shard token
  *   invalid      delivered, and the phone posted a reply that could not be read (too large,
  *                not JSON, or no request_id) carrying the request's shard token
+ *   revoked      a device disconnect or OAuth token replay removed the grant; records whether
+ *                the command was delivered before revocation
  *   unknown      delivered, and no response arrived before the deadline
  *
  * A command is "delivered" the moment it is placed into a poll response body, and it is
@@ -31,10 +33,12 @@ import { constantTimeEqual } from './util.js';
 
 /**
  * @typedef {{ kind: 'offline' } | { kind: 'busy' } | { kind: 'unavailable' } | { kind: 'unknown' }
- *   | { kind: 'invalid' } | { kind: 'settled', payload: Record<string, any>, source: string }} Outcome
+ *   | { kind: 'invalid' } | { kind: 'revoked', delivered: boolean }
+ *   | { kind: 'settled', payload: Record<string, any>, source: string }} Outcome
  *   a settled outcome carries the phone's reply parsed (payload) and as JSON text (source)
  * @typedef {{
- *   id: string, shardToken: string, command: Record<string, any>, wire: string,
+ *   id: string, shardToken: string, familyId: string | undefined,
+ *   command: Record<string, any>, wire: string,
  *   state: 'handoff' | 'delivered' | 'done', settleWithinMs: number,
  *   resolve: (outcome: Outcome) => void, timer: unknown, detach: () => void,
  *   onDelivered: () => void
@@ -92,11 +96,11 @@ export class DeviceHub {
    * unchanged) when the command cannot be encoded or a timer cannot be armed.
    * @param {Record<string, any>} command the command's fields, without `jsonrpc`
    * @param {string} jsonrpc the JSON-RPC message as JSON text, sent to the phone as it is
-   * @param {{ configured: boolean, settleWithinMs: number, signal?: AbortSignal | null,
+   * @param {{ configured: boolean, settleWithinMs: number, familyId?: string, signal?: AbortSignal | null,
    *   onDelivered?: () => void }} options
    * @returns {Promise<Outcome>}
    */
-  submit(command, jsonrpc, { configured, settleWithinMs, signal, onDelivered = () => {} }) {
+  submit(command, jsonrpc, { configured, settleWithinMs, familyId, signal, onDelivered = () => {} }) {
     if (!configured || !this.isOnline()) return Promise.resolve({ kind: 'offline' });
     // Claude already gave up (its request was aborted while it was authenticated or read):
     // the command is never offered to the phone.
@@ -115,6 +119,7 @@ export class DeviceHub {
     const entry = {
       id: command.request_id,
       shardToken: command.shard_token,
+      familyId,
       command,
       wire,
       state: 'handoff',
@@ -249,6 +254,30 @@ export class DeviceHub {
     }
     this.#finish(entry, delivered ? { kind: 'unknown' } : { kind: 'unavailable' });
     return delivered;
+  }
+
+  /** Stop every outstanding request when the phone revokes Claude access. */
+  revokeAll() {
+    this.handoff.length = 0;
+    for (const entry of [...this.entries.values()]) {
+      this.#finish(entry, { kind: 'revoked', delivered: entry.state === 'delivered' });
+    }
+  }
+
+  /**
+   * Stop requests belonging to one OAuth grant after a token or code replay.
+   * @param {string | null | undefined} familyId
+   */
+  revokeFamily(familyId) {
+    if (!familyId) return;
+    for (const entry of [...this.entries.values()]) {
+      if (entry.familyId !== familyId) continue;
+      if (entry.state === 'handoff') {
+        const index = this.handoff.indexOf(entry);
+        if (index !== -1) this.handoff.splice(index, 1);
+      }
+      this.#finish(entry, { kind: 'revoked', delivered: entry.state === 'delivered' });
+    }
   }
 
   /** Counters for tests and diagnostics; carries no secrets. */

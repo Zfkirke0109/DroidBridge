@@ -71,9 +71,10 @@ keeps one long poll open to the relay. The root edition does not yet include a r
    are read as `0`, `1` and `1`) and select **Allow**.
 4. Claude receives its OAuth tokens and the connector is ready.
 
-The pairing code works once. A consent page accepts at most 3 failed tries before you have to
-start connecting again from Claude, and after 5 wrong entries in all the code is cancelled and you
-tap **Pair Claude** again. A wrong code and a missing or expired one get the same message, so the
+The 8-character pairing code has 40 random bits, lasts up to 10 minutes, and works once.
+A consent page accepts at most 3 failed tries before you have to
+start connecting again from Claude. Wrong entries on another client's page cannot cancel the
+phone's code. A wrong code and a missing or expired one get the same message, so the
 page never reveals whether a pairing code is active. Only allow a consent page that you opened
 yourself by connecting Claude: whoever started the flow receives the access.
 
@@ -81,8 +82,9 @@ yourself by connecting Claude: whoever started the flow receives the access.
 
 - **Disconnect Claude** in DroidBridge calls `POST /device/v1/revoke`. The relay deletes every
   access and refresh token, authorization code, waiting consent request, registered client,
-  cached client document and the pairing code. Claude has to connect again (with a new pairing
-  code) to regain access.
+  cached client document and the pairing code. Requests waiting for a phone poll are withdrawn;
+  requests already delivered get an outcome-unknown answer because they may have run. Claude has
+  to connect again (with a new pairing code) to regain access.
 - **Rotate the device key**: run `node scripts/new-device-key.mjs` again, store the new hash with
   `npx wrangler@4 secret put DEVICE_KEY_SHA256`, and enter the new key in DroidBridge. The old key
   stops working once the new secret is deployed. This changes the phone's credential; it does not
@@ -159,6 +161,9 @@ outcomes:
   503, the request is dropped, and no later poll can receive it.
 - **Busy**: 16 requests are already in flight. Claude gets HTTP 429, and the request was not
   delivered.
+- **Revoked**: Disconnect Claude removes a request waiting for a phone poll. Claude gets HTTP
+  403 with `delivered: false`. A request already handed to the phone gets HTTP 200 with an
+  outcome-unknown error; it may already have run.
 - **Answered**: the phone posted its result in time, and Claude gets it with the phone's status
   code, except that 401, 407, 408, 413, 421, 425, 429 and every 5xx become HTTP 200: the phone
   has the request and may have run it, so Claude never gets a status after which an HTTP client

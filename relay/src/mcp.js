@@ -73,6 +73,9 @@ export const MESSAGES = Object.freeze({
   unavailable:
     'DroidBridge did not pick up the request in time. The request was not delivered to the phone.',
   busy: 'DroidBridge is busy with too many requests. The request was not delivered to the phone.',
+  revoked: 'Claude access was revoked. The request was not delivered to the phone.',
+  revokedDelivered:
+    'Claude access was revoked after the request reached the phone. The request may or may not have run, and it was not retried.',
   unknown:
     'DroidBridge did not report the outcome in time. The request may or may not have run on the phone, and it was not retried.',
   invalid:
@@ -174,9 +177,11 @@ export async function handleMcp(relay, request, origin, progress = mcpProgress()
   const authorization = request.headers.get('authorization');
   const presented = authorization !== null && /^bearer(?:\s|$)/i.test(authorization.trim());
   const match = authorization === null ? null : BEARER.exec(authorization);
-  const record = match ? await relay.grants.lookupAccess(match[1]) : null;
+  const accessToken = match?.[1];
+  const record = accessToken ? await relay.grants.lookupAccess(accessToken) : null;
   const resource = normalizeResource(`${origin}/mcp`);
   if (
+    !accessToken ||
     !record ||
     record.resource !== resource ||
     !String(record.scope ?? '').split(' ').includes(SCOPE)
@@ -253,14 +258,27 @@ export async function handleMcp(relay, request, origin, progress = mcpProgress()
   };
   progress.requestId = command.request_id;
   // The hub adds the message as the command's `jsonrpc` member, as the text Claude sent.
-  const outcome = await relay.hub.submit(command, text, {
-    configured: relay.config.deviceKeyConfigured,
-    settleWithinMs: seconds * 1000 + relay.timings.responseGraceMs,
-    signal: request.signal,
-    onDelivered: () => {
-      progress.delivered = true;
-    },
+  // A device revoke or token replay may have removed this grant while a slow request body was
+  // being read. Serialize the final access check and hand-off with revocation.
+  const offered = await relay.lock.run(async () => {
+    const current = await relay.grants.lookupAccess(accessToken);
+    if (!current || current.resource !== resource || !String(current.scope ?? '').split(' ').includes(SCOPE)) {
+      return null;
+    }
+    return {
+      outcome: relay.hub.submit(command, text, {
+        configured: relay.config.deviceKeyConfigured,
+        settleWithinMs: seconds * 1000 + relay.timings.responseGraceMs,
+        familyId: current.family,
+        signal: request.signal,
+        onDelivered: () => {
+          progress.delivered = true;
+        },
+      }),
+    };
   });
+  if (!offered) return unauthorized(origin, true);
+  const outcome = await offered.outcome;
   return outcomeResponse(outcome, isRequest, idText);
 }
 
@@ -390,6 +408,14 @@ export function outcomeResponse(outcome, isRequest, idText) {
       return relayError(503, -32001, MESSAGES.unavailable, { state: 'unavailable', delivered: false });
     case 'busy':
       return relayError(429, -32001, MESSAGES.busy, { state: 'busy', delivered: false }, { 'Retry-After': '1' });
+    case 'revoked':
+      return outcome.delivered
+        ? relayError(200, -32002, MESSAGES.revokedDelivered, {
+            state: 'settlement_unknown',
+            delivered: true,
+            retried: false,
+          })
+        : relayError(403, -32001, MESSAGES.revoked, { state: 'revoked', delivered: false });
     case 'unknown':
       // HTTP 200 so no HTTP-layer client replays a request that may already have run.
       return relayError(200, -32002, MESSAGES.unknown, {

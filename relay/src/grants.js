@@ -4,7 +4,7 @@
  * authorization codes, consent request ids and the pairing code are ever stored.
  *
  * Keys (Durable Object storage):
- *   pairing               { hash, expiresAt, attempts }
+ *   pairing               { hash, expiresAt }
  *   pending:<sha256(id)>  pending consent request, 10 min
  *   code:<sha256(code)>   authorization code, 60 s (kept 10 more minutes for reuse detection,
  *                         and once redeemed for as long as the grant it started exists)

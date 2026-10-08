@@ -170,9 +170,7 @@ async function startPairing(relay, request) {
     return json(400, { error: 'invalid_request', error_description: 'ttl_seconds must be an integer from 1 to 600.' });
   }
   const expiresAt = relay.now() + ttl * 1000;
-  await relay.lock.run(() =>
-    relay.storage.put('pairing', { hash: body.code_sha256, expiresAt, attempts: 0 }),
-  );
+  await relay.lock.run(() => relay.storage.put('pairing', { hash: body.code_sha256, expiresAt }));
   return json(200, { expires_at: new Date(expiresAt).toISOString() });
 }
 
@@ -184,6 +182,9 @@ async function cancelPairing(relay) {
 
 /** @param {Relay} relay */
 async function revoke(relay) {
-  const revoked = await relay.lock.run(() => relay.grants.revokeAll());
+  const revoked = await relay.lock.run(() => {
+    relay.hub.revokeAll();
+    return relay.grants.revokeAll();
+  });
   return json(200, { revoked_tokens: revoked });
 }

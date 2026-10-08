@@ -13,8 +13,10 @@ import {
   obtainTokens,
   pair,
   pkcePair,
+  poll,
   promptly,
   register,
+  respond,
   requestIdFrom,
   sha256HexSync,
   tokenPost,
@@ -110,10 +112,10 @@ async function consent(t, clientId) {
   return requestIdFrom(await page.text());
 }
 
-test('pairing: 5 wrong attempts across consent requests invalidate the code', async () => {
+test('pairing: unauthenticated wrong attempts cannot cancel a phone-generated code', async () => {
   const t = makeRelay();
   await pair(t, 'R2D2C3P0');
-  // Request A: 3 wrong codes cancel the request (pairing attempts 1..3).
+  // A public client can create consent requests and submit guesses without the device key.
   const a = await consent(t);
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     const res = await authorizePost(t, { request_id: a, pairing_code: 'WXYZ-WXYZ', action: 'allow' });
@@ -123,18 +125,16 @@ test('pairing: 5 wrong attempts across consent requests invalidate the code', as
   const third = await authorizePost(t, { request_id: a, pairing_code: 'WXYZ-WXYZ', action: 'allow' });
   assert.equal(third.status, 403);
   assert.match(await third.text(), /this request was cancelled/);
-  assert.equal((await t.storage.get('pairing')).attempts, 3);
-  // Request B: 2 more wrong codes reach 5 and cancel the pairing code.
+  assert.ok(await t.storage.get('pairing'));
+  // A second request cannot cancel the phone's code either.
   const b = await consent(t);
   await authorizePost(t, { request_id: b, pairing_code: 'nope', action: 'allow' });
-  assert.equal((await t.storage.get('pairing')).attempts, 4);
   await authorizePost(t, { request_id: b, pairing_code: 'nope', action: 'allow' });
-  assert.equal(await t.storage.get('pairing'), undefined);
-  // Even the right code no longer works.
+  assert.ok(await t.storage.get('pairing'));
+  // The user can still finish their own consent request with the right code.
   const c = await consent(t);
   const right = await authorizePost(t, { request_id: c, pairing_code: 'R2D2-C3P0', action: 'allow' });
-  assert.equal(right.status, 403);
-  assert.match(await right.text(), /That code did not work/);
+  assert.equal(right.status, 302);
 });
 
 test('pairing: 3 failed submissions discard the consent request, not the pairing code', async () => {
@@ -148,8 +148,8 @@ test('pairing: 3 failed submissions discard the consent request, not the pairing
   const after = await authorizePost(t, { request_id: requestId, pairing_code: 'HJKM-2222', action: 'allow' });
   assert.equal(after.status, 400);
   assert.match(await after.text(), /expired or was already answered/);
-  // The pairing code survives (3 < 5) and works on a fresh request.
-  assert.equal((await t.storage.get('pairing')).attempts, 3);
+  // The pairing code survives and works on a fresh request.
+  assert.ok(await t.storage.get('pairing'));
   const fresh = await consent(t);
   assert.equal((await authorizePost(t, { request_id: fresh, pairing_code: 'HJKM-2222', action: 'allow' })).status, 302);
 });
@@ -173,7 +173,7 @@ test('pairing: no active code answers exactly like a wrong code; an empty code i
   // An empty submission is not an attempt anywhere.
   const blank = await authorizePost(t, { request_id: withPairing, pairing_code: '  ', action: 'allow' });
   assert.equal(blank.status, 400);
-  assert.equal((await t.storage.get('pairing')).attempts, 1);
+  assert.ok(await t.storage.get('pairing'));
   const ok = await authorizePost(t, { request_id: withPairing, pairing_code: 'abcd efgh', action: 'allow' });
   assert.equal(ok.status, 302);
 });
@@ -207,14 +207,14 @@ test('pairing: DELETE cancels the code', async () => {
   assert.equal(attempt.status, 403);
 });
 
-test('pairing: a new code replaces the old one and resets attempts', async () => {
+test('pairing: a new code replaces the old one', async () => {
   const t = makeRelay();
   const requestId = await consent(t);
   await pair(t, 'OLDC0DE1');
   await authorizePost(t, { request_id: requestId, pairing_code: 'XXXX-XXXX', action: 'allow' });
-  assert.equal((await t.storage.get('pairing')).attempts, 1);
+  assert.ok(await t.storage.get('pairing'));
   await pair(t, 'NEWC0DE2');
-  assert.equal((await t.storage.get('pairing')).attempts, 0);
+  assert.ok(await t.storage.get('pairing'));
   assert.equal(
     (await authorizePost(t, { request_id: requestId, pairing_code: 'OLDC-0DE1', action: 'allow' })).status,
     403,
@@ -253,7 +253,7 @@ test('consent page: an expired pending request is an error page', async () => {
   const res = await authorizePost(t, { request_id: requestId, pairing_code: 'ABCD-EFGH', action: 'allow' });
   assert.equal(res.status, 400);
   assert.match(await res.text(), /expired/);
-  assert.equal((await t.storage.get('pairing')).attempts, 0);
+  assert.ok(await t.storage.get('pairing'));
 });
 
 test('consent page: at most 10 pending requests per client and 50 overall', async () => {
@@ -315,6 +315,82 @@ test('revoke: tokens stop working, clients are removed, status shows 0 authorize
   assert.equal(late.status, 400);
   // Revoking again is harmless.
   assert.deepEqual(await (await deviceFetch(t, '/device/v1/revoke', { method: 'POST' })).json(), { revoked_tokens: 0 });
+});
+
+test('revoke withdraws an authenticated request still waiting for a phone poll', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204);
+  const answer = mcp(t, token, toolsCall('before-revoke'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+
+  assert.equal((await deviceFetch(t, '/device/v1/revoke', { method: 'POST' })).status, 200);
+  const result = await promptly(answer);
+  assert.equal(result.status, 403);
+  assert.equal((await result.json()).error.data.droidbridge_relay.delivered, false);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  assert.equal((await poll(t, 0)).status, 204, 'the revoked request cannot reach a later poll');
+});
+
+test('revoke settles a delivered request as unknown and rejects its late reply', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const waitingPoll = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const answer = mcp(t, token, toolsCall('delivered-before-revoke'));
+  const [command] = (await (await waitingPoll).json()).commands;
+
+  assert.equal((await deviceFetch(t, '/device/v1/revoke', { method: 'POST' })).status, 200);
+  const result = await promptly(answer);
+  assert.equal(result.status, 200);
+  assert.deepEqual((await result.json()).error.data.droidbridge_relay, {
+    state: 'settlement_unknown',
+    delivered: true,
+    retried: false,
+  });
+  assert.equal((await respond(t, command)).status, 404);
+});
+
+test('revoke prevents a request authenticated before its body finished from reaching the phone', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const originalGet = t.storage.get.bind(t.storage);
+  let accessRead = false;
+  t.storage.get = async (key) => {
+    const record = await originalGet(key);
+    if (key.startsWith('at:')) accessRead = true;
+    return record;
+  };
+  /** @type {ReadableStreamDefaultController<Uint8Array> | undefined} */
+  let bodyController;
+  const body = new ReadableStream({
+    start(controller) {
+      bodyController = controller;
+    },
+  });
+  const request = new Request('https://relay.example/mcp', /** @type {any} */ ({
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body,
+    duplex: 'half',
+  }));
+  const answer = t.relay.fetch(request);
+  await waitFor(() => accessRead);
+  const waitingPoll = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+
+  assert.equal((await deviceFetch(t, '/device/v1/revoke', { method: 'POST' })).status, 200);
+  bodyController.enqueue(new TextEncoder().encode(JSON.stringify(toolsCall('slow-body'))));
+  bodyController.close();
+  const first = await Promise.race([
+    answer.then((response) => ({ kind: 'answer', response })),
+    waitingPoll.then((response) => ({ kind: 'poll', response })),
+  ]);
+  assert.equal(first.kind, 'answer', 'the stale access token must never release a phone command');
+  assert.equal(first.response.status, 401);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+  await t.clock.advance(15_000);
+  assert.equal((await waitingPoll).status, 204);
 });
 
 /**

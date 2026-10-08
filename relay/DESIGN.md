@@ -138,6 +138,14 @@ Device key format: `dbrk_` followed by 43 base64url characters (32 random bytes)
 | `DELETE /device/v1/pairing` | cancel the pairing code | 204 |
 | `POST /device/v1/revoke` | revoke every Claude grant: tokens, codes, pending consents, registered clients, pairing | 200 `{"revoked_tokens":N}` |
 
+Revocation also removes requests still waiting for a phone poll, answering them 403 with
+`delivered:false`. A request already handed to the phone is settled with HTTP 200 and
+`settlement_unknown`; the phone may already be running it, and a later reply is discarded.
+A request whose body was still arriving when revocation happened checks its access token again
+before hand-off, so it cannot execute after revocation.
+Authorization-code or refresh-token replay withdraws outstanding requests from the affected
+grant by the same rule; requests from other grants continue.
+
 A device route answers 500 when the relay itself fails; a poll that fails this way has
 delivered none of the commands it would have carried. A wrong or missing device key is 401 on
 every device route. Shard-token mismatches are 404, never
@@ -265,9 +273,8 @@ Follows the MCP 2026-07-28 authorization spec.
   (only `droidbridge`), keeps the request usable for 10 minutes and shows a page naming the
   client and its redirect host, asking for the pairing code shown in DroidBridge. The code is
   8 characters of Crockford base32 (shown `XXXX-XXXX`, 40 bits), lives at most 10 minutes, is
-  single-use, and is invalidated after 5 wrong attempts across all consent requests. Each
-  consent request is discarded after 3 failed attempts, and at most 10 requests per client
-  (50 in all) wait at once.
+  single-use. Each consent request is discarded after 3 failed attempts, and at most 10
+  requests per client (50 in all) wait at once.
   The page answers a wrong code and a missing or expired pairing code identically, so it never
   reveals whether a pairing is active. The phone sends the relay only the code's SHA-256 (of
   the normalized uppercase code without the dash), and that hash is all the relay stores. The

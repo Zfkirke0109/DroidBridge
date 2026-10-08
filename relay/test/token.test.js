@@ -12,6 +12,7 @@ import {
   sha256HexSync,
   tokenPost,
   mcp,
+  promptly,
   waitFor,
   toolsCall,
 } from './helpers.js';
@@ -136,6 +137,24 @@ test('code reuse revokes the family issued from it', async () => {
   });
   assert.equal(refresh.status, 400);
   assert.equal((await refresh.json()).error, 'invalid_grant');
+});
+
+test('code reuse settles a command already delivered from its grant as unknown', async () => {
+  const t = makeRelay();
+  const grant = await obtainCode(t);
+  const tokens = await (await tokenPost(t, codeExchange(grant))).json();
+  const waitingPoll = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const answer = mcp(t, tokens.access_token, toolsCall('replayed-code'));
+  const [command] = (await (await waitingPoll).json()).commands;
+
+  assert.equal((await tokenPost(t, codeExchange(grant))).status, 400);
+  const result = await promptly(answer);
+  assert.equal(result.status, 200);
+  assert.deepEqual((await result.json()).error.data.droidbridge_relay, {
+    state: 'settlement_unknown', delivered: true, retried: false,
+  });
+  assert.equal((await respond(t, command)).status, 404);
 });
 
 test('a replayed code revokes its grant whatever client_id, redirect_uri or code_verifier comes with it', async () => {
@@ -285,6 +304,32 @@ test('refresh token reuse revokes the entire family', async () => {
   const stillRotated = await tokenPost(t, { grant_type: 'refresh_token', refresh_token: rotated.refresh_token, client_id: tokens.clientId });
   assert.equal(stillRotated.status, 400);
   assert.equal(t.storage.keys('family:').length, 0);
+});
+
+test('a replayed refresh token withdraws only its family\'s queued commands', async () => {
+  const t = makeRelay();
+  const first = await obtainTokens(t);
+  const second = await obtainTokens(t, { pairingCode: 'QQQQ2222' });
+  const rotated = await (
+    await tokenPost(t, { grant_type: 'refresh_token', refresh_token: first.refresh_token, client_id: first.clientId })
+  ).json();
+  assert.equal((await poll(t, 0)).status, 204);
+  const firstAnswer = mcp(t, rotated.access_token, toolsCall('revoked-family'));
+  const secondAnswer = mcp(t, second.access_token, toolsCall('other-family'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 2);
+
+  const replay = await tokenPost(t, {
+    grant_type: 'refresh_token', refresh_token: first.refresh_token, client_id: first.clientId,
+  });
+  assert.equal(replay.status, 400);
+  const withdrawn = await promptly(firstAnswer);
+  assert.equal(withdrawn.status, 403);
+  assert.equal((await withdrawn.json()).error.data.droidbridge_relay.delivered, false);
+  assert.equal(t.relay.hub.inspect().handoff, 1);
+  const [command] = (await (await poll(t, 0)).json()).commands;
+  assert.equal(command.jsonrpc.id, 'other-family');
+  assert.equal((await respond(t, command)).status, 200);
+  assert.equal((await secondAnswer).status, 200);
 });
 
 test('refresh tokens expire after 30 days; storage stays bounded under heavy refreshing', async () => {

@@ -49,8 +49,6 @@ export const OAUTH_LIMITS = Object.freeze({
   pendingPerClientMax: 10,
   clientsMax: 100,
   registrationsPerHour: 20,
-  /** wrong codes before the pairing code itself is cancelled, across all consent requests */
-  pairingMaxAttempts: 5,
   /** failed submissions before one consent request is discarded */
   requestMaxAttempts: 3,
   stateMaxLength: 2048,
@@ -555,19 +553,15 @@ export class OAuthServer {
       const typedHash = await sha256Hex(normalized);
       if (!pairing || !constantTimeEqual(typedHash, pairing.hash)) {
         // A wrong code and a missing or expired pairing get the same answer, so this page never
-        // reveals whether a pairing code is active. Both count against this consent request.
-        if (pairing) {
-          const attempts = (Number(pairing.attempts) || 0) + 1;
-          if (attempts >= OAUTH_LIMITS.pairingMaxAttempts) await this.storage.delete('pairing');
-          else await this.storage.put('pairing', { ...pairing, attempts });
-        }
+        // reveals whether a pairing code is active. Only this consent request is cancelled:
+        // any public client can create a request, so its guesses must not cancel the phone's code.
         const requestAttempts = (Number(pending.attempts) || 0) + 1;
         if (requestAttempts >= OAUTH_LIMITS.requestMaxAttempts) {
           await this.storage.delete(pendingKey);
           return messagePage(
             403,
             'Request cancelled',
-            'The pairing code was not accepted 3 times, so this request was cancelled. In DroidBridge, tap Pair Claude for a new code, then start connecting again from Claude.',
+            'The pairing code was not accepted 3 times, so this request was cancelled. Start connecting again from Claude and use the code currently shown in DroidBridge.',
           );
         }
         await this.storage.put(pendingKey, { ...pending, attempts: requestAttempts });
@@ -634,6 +628,7 @@ export class OAuthServer {
       // redirect_uri or code_verifier comes with it, like a replayed refresh token. token()
       // has only checked that the request is well formed (form-encoded, within the size cap,
       // no repeated parameter, a supported grant_type); one that is not is refused unread.
+      this.relay.hub.revokeFamily(record.family);
       await this.relay.grants.revokeFamily(record.family);
       await this.storage.put(key, { ...record, family: null });
       return tokenError(400, 'invalid_grant', 'The authorization code was already used. Tokens issued from it were revoked.');
@@ -693,6 +688,7 @@ export class OAuthServer {
       const familyId = record ? record.family : refreshTokenFamily(refreshToken);
       const family = familyId ? await this.storage.get(`family:${familyId}`) : undefined;
       if (family && typeof family.expiresAt === 'number' && family.expiresAt > now) {
+        this.relay.hub.revokeFamily(familyId);
         await this.relay.grants.revokeFamily(familyId);
         return tokenError(400, 'invalid_grant', 'The refresh token was already used. The grant was revoked.');
       }
