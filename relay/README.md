@@ -10,9 +10,9 @@ poll. The phone never opens a port. The design is in [DESIGN.md](DESIGN.md).
 - A Cloudflare account. The Workers free plan is enough (see [Costs](#costs)).
 - Node.js 22 or newer, for Wrangler and the key script (Wrangler 4 refuses to run on older
   versions). Nothing gets installed into this folder: the relay has no npm dependencies.
-- A DroidBridge phone build with the `droidbridge-relay/1` device client. The 0.5.1 source on this
-  branch does not include the Claude connector yet; deploying the Worker alone cannot connect the
-  phone to Claude.
+- A DroidBridge phone build from this branch with the `droidbridge-relay/1` device client. The
+  official upstream 0.5.1 APK does not include the Claude connector; deploying the Worker alone
+  cannot connect that APK to Claude.
 
 ## Deploy
 
