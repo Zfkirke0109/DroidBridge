@@ -78,8 +78,11 @@ class I16RuntimeHealthDeviceGateTest {
             var status: JSONObject
             while (true) {
                 status = submit(runtime, request("context", "status", JSONObject().put("detail", "full")))
-                if (status.optString("outcome") == "success") break
-                assertTrue("no successor Runtime: $status", SystemClock.elapsedRealtime() < deadline)
+                if (status.optString("outcome") == "success" && appGuardAvailable(status)) break
+                assertTrue(
+                    "no successor Runtime with an available App command guard: $status",
+                    SystemClock.elapsedRealtime() < deadline,
+                )
                 SystemClock.sleep(POLL_MS)
             }
             assertEquals("apk_runtime", status.getJSONObject("result").getJSONObject("runtime").getString("host"))
@@ -112,12 +115,20 @@ class I16RuntimeHealthDeviceGateTest {
             val status = submit(runtime, request("context", "status", JSONObject().put("detail", "full")))
             if (status.optString("outcome") == "success") {
                 assertEquals("apk_runtime", status.getJSONObject("result").getJSONObject("runtime").getString("host"))
-                return
+                if (appGuardAvailable(status)) return
             }
-            assertTrue("debug APK Runtime never became ready: $status", SystemClock.elapsedRealtime() < deadline)
+            assertTrue(
+                "debug APK Runtime's App command guard never became ready: $status",
+                SystemClock.elapsedRealtime() < deadline,
+            )
             SystemClock.sleep(POLL_MS)
         }
     }
+
+    private fun appGuardAvailable(status: JSONObject): Boolean = status.optJSONObject("result")
+        ?.optJSONObject("grants")
+        ?.optJSONObject("execution.app_guard")
+        ?.optString("state") == "available"
 
     private fun served(response: JSONObject): JSONObject {
         assertEquals(response.toString(), "success", response.getString("outcome"))
