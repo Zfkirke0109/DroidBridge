@@ -128,25 +128,27 @@ fn i11_maintenance_blocker_distinguishes_owner_from_store_corruption() {
 fn i11_malformed_owner_reset_replaces_only_the_owner_at_generation_one() {
     let (directory, store) = initialized("owner-reset");
     assert_eq!(
-        code(store.reset_malformed_owner(id(9), true)),
+        code(store.reset_malformed_owner(id(9), RuntimeHost::ApkRuntime, true)),
         ErrorCode::StaleAuthority
     );
 
     fs::write(directory.path().join("runtime-owner.json"), b"garbage").unwrap();
     let state_before = fs::read(directory.path().join("runtime-state.json")).unwrap();
     assert_eq!(
-        code(store.reset_malformed_owner(id(9), false)),
+        code(store.reset_malformed_owner(id(9), RuntimeHost::ApkRuntime, false)),
         ErrorCode::IoError
     );
 
-    fs::write(directory.path().join("runtime-transition.json"), b"{}").unwrap();
+    fs::write(directory.path().join("runtime-reset-intent.json"), b"{}").unwrap();
     assert_eq!(
-        code(store.reset_malformed_owner(id(9), true)),
+        code(store.reset_malformed_owner(id(9), RuntimeHost::ApkRuntime, true)),
         ErrorCode::StaleAuthority
     );
-    fs::remove_file(directory.path().join("runtime-transition.json")).unwrap();
+    fs::remove_file(directory.path().join("runtime-reset-intent.json")).unwrap();
 
-    let reset = store.reset_malformed_owner(id(9), true).unwrap();
+    let reset = store
+        .reset_malformed_owner(id(9), RuntimeHost::ApkRuntime, true)
+        .unwrap();
     assert_eq!(
         reset,
         RuntimeOwner {
@@ -272,4 +274,32 @@ fn i11_guard_cleanup_evidence_ignores_business_json() {
     // The current boot's proof without a clean frame and without its guard stays unverified.
     write_proof(directory.path(), &current_boot, &id(62), false);
     assert!(!guard_cleanup_verified(directory.path(), &current_boot, &NoLiveProcess).unwrap());
+}
+
+struct LiveGuard;
+
+impl ProcessFacts for LiveGuard {
+    fn is_same_process(&self, _pid: u32, _start_ticks: u64) -> Result<bool, DomainError> {
+        Ok(true)
+    }
+}
+
+#[test]
+fn i11_an_unsettled_guard_may_settle_only_while_it_is_alive() {
+    let directory = TestDirectory::new("settle");
+    let current_boot = id(3);
+    write_proof(directory.path(), &current_boot, &id(70), true);
+    write_proof(directory.path(), &current_boot, &id(71), false);
+    let proofs = GuardProofDirectory::new(directory.path());
+    let state = CanonicalState::default();
+
+    let alive =
+        build_guard_recovery_plan(&state, &id(99), &current_boot, &proofs, &LiveGuard).unwrap();
+    assert!(!alive.guards_are_clean());
+    assert!(alive.may_settle());
+
+    let dead =
+        build_guard_recovery_plan(&state, &id(99), &current_boot, &proofs, &NoLiveProcess).unwrap();
+    assert!(!dead.guards_are_clean());
+    assert!(!dead.may_settle());
 }

@@ -226,6 +226,7 @@ fn environment() -> VerticalEnvironment {
         sdk_int: 35,
         abi: "arm64-v8a".to_owned(),
         timezone: "Asia/Shanghai".to_owned(),
+        name: "OnePlus 12R 5G".to_owned(),
         manufacturer: "OnePlus".to_owned(),
         model: "PJE110".to_owned(),
         device: "OP5D0DL1".to_owned(),
@@ -274,8 +275,9 @@ fn i10_g01_compact_status_exposes_effective_capabilities_without_grants() {
         );
         assert_eq!(
             keys(&compact["device"]),
-            BTreeSet::from(["abi", "sdk_int", "timezone"])
+            BTreeSet::from(["abi", "name", "sdk_int", "timezone"])
         );
+        assert_eq!(compact["device"]["name"], "OnePlus 12R 5G");
         assert_eq!(
             compact["runtime"],
             json!({"host": "apk_runtime", "host_generation": 2, "readiness": "ready"})

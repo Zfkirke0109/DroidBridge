@@ -1,7 +1,6 @@
 use crate::{
-    CanonicalState, FileLock, RuntimeLive, RuntimeOwner, RuntimeResetIntent,
-    RuntimeTransitionIntent, WriterFence, io_error, sync_directory, validate_artifact_record,
-    validate_reset_owner,
+    CanonicalState, FileLock, RuntimeLive, RuntimeOwner, RuntimeResetIntent, WriterFence, io_error,
+    sync_directory, validate_artifact_record, validate_reset_owner,
 };
 use contract::{ErrorCode, RuntimeHost};
 use domain::DomainError;
@@ -11,7 +10,6 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
     time::Instant,
 };
 
@@ -33,50 +31,6 @@ impl MaintenanceBlocker {
             Self::StoreCorrupt => "store_corrupt",
         }
     }
-}
-
-pub fn verify_magisk_metadata_surface(base: &Path) -> Result<(), DomainError> {
-    let source = base.join("runtime-state.json");
-    if !source.is_file() {
-        return Err(DomainError::new(
-            ErrorCode::NotFound,
-            "canonical state is not initialized",
-        ));
-    }
-    let temporary = base.join(".magisk-metadata-self-test");
-    if temporary.exists() {
-        fs::remove_file(&temporary).map_err(io_error)?;
-        sync_directory(base)?;
-    }
-    let file = open_new_private(&temporary)?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
-
-        let metadata = fs::metadata(&source).map_err(io_error)?;
-        if unsafe { libc::fchown(file.as_raw_fd(), metadata.uid(), metadata.gid()) } != 0
-            || unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0
-        {
-            return Err(io_error(std::io::Error::last_os_error()));
-        }
-        preserve_selinux_label(&source, &file)?;
-        let verified = file.metadata().map_err(io_error)?;
-        if verified.uid() != metadata.uid()
-            || verified.gid() != metadata.gid()
-            || verified.mode() & 0o777 != 0o600
-        {
-            return Err(DomainError::new(
-                ErrorCode::IoError,
-                "Magisk metadata self-test verification failed",
-            ));
-        }
-    }
-    file.sync_all().map_err(io_error)?;
-    drop(file);
-    sync_directory(base)?;
-    fs::remove_file(&temporary).map_err(io_error)?;
-    sync_directory(base)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,22 +70,6 @@ pub struct LifetimeLease {
     base: PathBuf,
     live: RuntimeLive,
     _lock: FileLock,
-}
-
-pub struct PendingDeadOwnerTakeover {
-    lease: Arc<LifetimeLease>,
-    intent: RuntimeTransitionIntent,
-    recovery_plan: crate::GuardRecoveryPlan,
-}
-
-impl PendingDeadOwnerTakeover {
-    pub fn lease(&self) -> &Arc<LifetimeLease> {
-        &self.lease
-    }
-
-    pub fn recovery_plan(&self) -> &crate::GuardRecoveryPlan {
-        &self.recovery_plan
-    }
 }
 
 impl LifetimeLease {
@@ -180,53 +118,6 @@ impl StateStore {
         Ok(owner)
     }
 
-    pub fn observe_transition(
-        &self,
-    ) -> Result<Option<(crate::TransitionRecovery, RuntimeTransitionIntent)>, DomainError> {
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        let transition_path = self.base.join("runtime-transition.json");
-        if !transition_path.exists() {
-            return Ok(None);
-        }
-        let intent: RuntimeTransitionIntent = read_json(&transition_path)?;
-        let owner = self.read_owner()?;
-        let recovery = crate::classify_transition(&intent, &owner)?;
-        Ok(Some((recovery, intent)))
-    }
-
-    pub fn record_transition_intent(
-        &self,
-        lease: &LifetimeLease,
-        intent: &RuntimeTransitionIntent,
-    ) -> Result<(), DomainError> {
-        if self.base.join("runtime-reset-intent.json").exists() {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "Runtime reset is pending",
-            ));
-        }
-        self.validate_lease(lease)?;
-        let owner = self.read_owner()?;
-        if intent.schema_version != 1
-            || intent.runtime_epoch != owner.runtime_epoch
-            || intent.from_host != owner.host
-            || intent.from_generation != owner.host_generation
-            || intent.from_instance_id != lease.live.runtime_instance_id
-            || intent.target_host == intent.from_host
-            || intent.target_generation
-                != intent.from_generation.checked_add(1).ok_or_else(|| {
-                    DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-                })?
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "transition intent does not match the live owner",
-            ));
-        }
-        write_new_json(&self.base.join("runtime-transition.json"), intent)?;
-        sync_directory(&self.base)
-    }
-
     pub fn record_reset_intent(
         &self,
         lease: &LifetimeLease,
@@ -238,12 +129,6 @@ impl StateStore {
             return Err(DomainError::new(
                 ErrorCode::IoError,
                 "reset requires zero live work and verified cleanup",
-            ));
-        }
-        if self.base.join("runtime-transition.json").exists() {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "Runtime transition is pending",
             ));
         }
         self.validate_lease(lease)?;
@@ -268,7 +153,7 @@ impl StateStore {
             || intent.schema_version != 1
             || intent.runtime_epoch != owner.runtime_epoch
             || intent.source_host_generation != owner.host_generation
-            || intent.target_host != RuntimeHost::ApkRuntime
+            || intent.target_host != owner.host
             || intent.target_host_generation
                 != intent
                     .source_host_generation
@@ -294,19 +179,6 @@ impl StateStore {
                 ErrorCode::HostTransitionPending,
                 "Runtime reset is pending",
             ));
-        }
-        let transition_path = self.base.join("runtime-transition.json");
-        if transition_path.exists() {
-            let intent: RuntimeTransitionIntent = read_json(&transition_path)?;
-            match crate::classify_transition(&intent, &owner)? {
-                crate::TransitionRecovery::ActivateCommittedTarget => {}
-                crate::TransitionRecovery::RemoveUncommittedIntent => {
-                    return Err(DomainError::new(
-                        ErrorCode::HostTransitionPending,
-                        "Runtime transition recovery is pending",
-                    ));
-                }
-            }
         }
         let fence = WriterFence {
             runtime_epoch: live.runtime_epoch.clone(),
@@ -346,552 +218,6 @@ impl StateStore {
         Ok((state, bytes.len() as u64))
     }
 
-    pub fn commit_owner_transition(
-        &self,
-        intent: &RuntimeTransitionIntent,
-        current_boot_id: &contract::UuidV4,
-        process_facts: &dyn crate::ProcessFacts,
-    ) -> Result<RuntimeOwner, DomainError> {
-        let _lifetime_lock = FileLock::try_acquire(&self.base.join("runtime-live.lock"))?
-            .ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::HostTransitionPending,
-                    "source Runtime still owns the lifetime lock",
-                )
-            })?;
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        if self.base.join("runtime-reset-intent.json").exists() {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "Runtime reset is pending",
-            ));
-        }
-        let owner: RuntimeOwner = read_json(&self.base.join("runtime-owner.json"))?;
-        let live: RuntimeLive = read_json(&self.base.join("runtime-live.json"))?;
-        let recorded: RuntimeTransitionIntent =
-            read_json(&self.base.join("runtime-transition.json"))?;
-        if &recorded != intent
-            || intent.schema_version != 1
-            || intent.runtime_epoch != owner.runtime_epoch
-            || intent.from_host != owner.host
-            || intent.from_generation != owner.host_generation
-            || intent.runtime_epoch != live.runtime_epoch
-            || intent.from_host != live.host
-            || intent.from_generation != live.host_generation
-            || intent.from_instance_id != live.runtime_instance_id
-            || intent.target_host == intent.from_host
-            || intent.target_generation
-                != intent.from_generation.checked_add(1).ok_or_else(|| {
-                    DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-                })?
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "transition intent does not match the live owner",
-            ));
-        }
-        let state = decode_canonical_state(
-            &fs::read(self.base.join("runtime-state.json")).map_err(io_error)?,
-        )?;
-        let task_work = state.tasks.iter().any(|task| {
-            matches!(
-                task.state,
-                contract::TaskState::Created
-                    | contract::TaskState::Queued
-                    | contract::TaskState::Running
-            )
-        });
-        let automation_work = state.automation_executions.iter().any(|execution| {
-            matches!(
-                execution.summary.state,
-                contract::AutomationExecutionState::Queued
-                    | contract::AutomationExecutionState::Running
-            )
-        });
-        if task_work || automation_work || !state.reservations.is_empty() {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "source Runtime still has non-terminal work",
-            ));
-        }
-        if !crate::recovery::transition_guard_cleanup_verified(
-            current_boot_id,
-            &crate::GuardProofDirectory::new(&self.base),
-            process_facts,
-        )? {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "source Runtime cleanup is unverified",
-            ));
-        }
-        let next = RuntimeOwner {
-            schema_version: 1,
-            runtime_epoch: owner.runtime_epoch,
-            host: intent.target_host,
-            host_generation: intent.target_generation,
-        };
-        atomic_replace_json(&self.base, "runtime-owner.json", &next)?;
-        Ok(next)
-    }
-
-    pub fn abort_owner_transition(
-        &self,
-        lease: &LifetimeLease,
-        intent: &RuntimeTransitionIntent,
-    ) -> Result<(), DomainError> {
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        self.validate_lease(lease)?;
-        let recorded: RuntimeTransitionIntent =
-            read_json(&self.base.join("runtime-transition.json"))?;
-        let owner = self.read_owner()?;
-        if &recorded != intent
-            || owner.runtime_epoch != intent.runtime_epoch
-            || owner.host != intent.from_host
-            || owner.host_generation != intent.from_generation
-            || lease.live.runtime_instance_id != intent.from_instance_id
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "transition abort does not match the live source",
-            ));
-        }
-        remove_file_synced(&self.base, "runtime-transition.json")
-    }
-
-    pub fn finish_owner_transition(
-        &self,
-        lease: &LifetimeLease,
-        intent: &RuntimeTransitionIntent,
-    ) -> Result<(), DomainError> {
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        self.validate_lease(lease)?;
-        let recorded: RuntimeTransitionIntent =
-            read_json(&self.base.join("runtime-transition.json"))?;
-        let owner = self.read_owner()?;
-        if &recorded != intent
-            || owner.runtime_epoch != intent.runtime_epoch
-            || owner.host != intent.target_host
-            || owner.host_generation != intent.target_generation
-            || lease.live.runtime_epoch != intent.runtime_epoch
-            || lease.live.host != intent.target_host
-            || lease.live.host_generation != intent.target_generation
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "transition completion does not match the live target",
-            ));
-        }
-        remove_file_synced(&self.base, "runtime-transition.json")
-    }
-
-    pub fn finish_remote_owner_transition(
-        &self,
-        intent: &RuntimeTransitionIntent,
-        target_instance_id: &contract::UuidV4,
-    ) -> Result<(), DomainError> {
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        let recorded: RuntimeTransitionIntent =
-            read_json(&self.base.join("runtime-transition.json"))?;
-        let owner = self.read_owner()?;
-        let live: RuntimeLive = read_json(&self.base.join("runtime-live.json"))?;
-        if &recorded != intent
-            || owner.runtime_epoch != intent.runtime_epoch
-            || owner.host != intent.target_host
-            || owner.host_generation != intent.target_generation
-            || live.runtime_epoch != intent.runtime_epoch
-            || live.host != intent.target_host
-            || live.host_generation != intent.target_generation
-            || &live.runtime_instance_id != target_instance_id
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "transition completion does not match the remote target",
-            ));
-        }
-        remove_file_synced(&self.base, "runtime-transition.json")
-    }
-
-    pub fn finish_committed_transition(
-        &self,
-        target_instance_id: &contract::UuidV4,
-    ) -> Result<bool, DomainError> {
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        let transition_path = self.base.join("runtime-transition.json");
-        if !transition_path.exists() {
-            return Ok(false);
-        }
-        let intent: RuntimeTransitionIntent = read_json(&transition_path)?;
-        let owner = self.read_owner()?;
-        let live: RuntimeLive = read_json(&self.base.join("runtime-live.json"))?;
-        let valid = intent.schema_version == 1
-            && intent.target_host != intent.from_host
-            && intent.target_generation
-                == intent.from_generation.checked_add(1).ok_or_else(|| {
-                    DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-                })?
-            && owner.runtime_epoch == intent.runtime_epoch
-            && owner.host == intent.target_host
-            && owner.host_generation == intent.target_generation
-            && live.runtime_epoch == intent.runtime_epoch
-            && live.host == intent.target_host
-            && live.host_generation == intent.target_generation
-            && &live.runtime_instance_id == target_instance_id;
-        if !valid {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "committed transition does not match the live target",
-            ));
-        }
-        remove_file_synced(&self.base, "runtime-transition.json")?;
-        Ok(true)
-    }
-
-    pub fn validate_live_instance(
-        &self,
-        expected_host: RuntimeHost,
-        expected_instance_id: &contract::UuidV4,
-    ) -> Result<RuntimeOwner, DomainError> {
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        if self.base.join("runtime-reset-intent.json").exists()
-            || self.base.join("runtime-transition.json").exists()
-        {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "Runtime transition recovery is pending",
-            ));
-        }
-        let owner = self.read_owner()?;
-        let live: RuntimeLive = read_json(&self.base.join("runtime-live.json"))?;
-        let fence = WriterFence {
-            runtime_epoch: owner.runtime_epoch.clone(),
-            host: expected_host,
-            host_generation: owner.host_generation,
-            runtime_instance_id: expected_instance_id.clone(),
-        };
-        if owner.host != expected_host || !fence.matches(&owner, &live) {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "live instance does not match the current Runtime owner",
-            ));
-        }
-        Ok(owner)
-    }
-
-    pub fn record_remote_transition_intent(
-        &self,
-        intent: &RuntimeTransitionIntent,
-    ) -> Result<(), DomainError> {
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        if self.base.join("runtime-reset-intent.json").exists() {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "Runtime reset is pending",
-            ));
-        }
-        let owner = self.read_owner()?;
-        let live: RuntimeLive = read_json(&self.base.join("runtime-live.json"))?;
-        if intent.schema_version != 1
-            || intent.runtime_epoch != owner.runtime_epoch
-            || intent.from_host != owner.host
-            || intent.from_generation != owner.host_generation
-            || intent.from_instance_id != live.runtime_instance_id
-            || live.runtime_epoch != owner.runtime_epoch
-            || live.host != owner.host
-            || live.host_generation != owner.host_generation
-            || intent.target_host == intent.from_host
-            || intent.target_generation
-                != intent.from_generation.checked_add(1).ok_or_else(|| {
-                    DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-                })?
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "remote transition intent does not match the live owner",
-            ));
-        }
-        write_new_json(&self.base.join("runtime-transition.json"), intent)?;
-        sync_directory(&self.base)
-    }
-
-    pub fn abort_remote_transition_intent(
-        &self,
-        intent: &RuntimeTransitionIntent,
-    ) -> Result<(), DomainError> {
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        let recorded: RuntimeTransitionIntent =
-            read_json(&self.base.join("runtime-transition.json"))?;
-        let owner = self.read_owner()?;
-        let live: RuntimeLive = read_json(&self.base.join("runtime-live.json"))?;
-        if &recorded != intent
-            || owner.runtime_epoch != intent.runtime_epoch
-            || owner.host != intent.from_host
-            || owner.host_generation != intent.from_generation
-            || live.runtime_epoch != intent.runtime_epoch
-            || live.host != intent.from_host
-            || live.host_generation != intent.from_generation
-            || live.runtime_instance_id != intent.from_instance_id
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "remote transition abort does not match the live source",
-            ));
-        }
-        remove_file_synced(&self.base, "runtime-transition.json")
-    }
-
-    pub fn begin_dead_owner_takeover(
-        &self,
-        intent: &RuntimeTransitionIntent,
-        target_live: RuntimeLive,
-        current_boot_id: &contract::UuidV4,
-        process_facts: &dyn crate::ProcessFacts,
-    ) -> Result<PendingDeadOwnerTakeover, DomainError> {
-        let lock =
-            FileLock::try_acquire(&self.base.join("runtime-live.lock"))?.ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::HostTransitionPending,
-                    "source Runtime still owns the lifetime lock",
-                )
-            })?;
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        if self.base.join("runtime-reset-intent.json").exists() {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "Runtime reset is pending",
-            ));
-        }
-        let owner = self.read_owner()?;
-        let previous_live: RuntimeLive = read_json(&self.base.join("runtime-live.json"))?;
-        let valid = intent.schema_version == 1
-            && intent.from_host != intent.target_host
-            && intent.runtime_epoch == owner.runtime_epoch
-            && intent.from_host == owner.host
-            && intent.from_generation == owner.host_generation
-            && intent.from_instance_id == previous_live.runtime_instance_id
-            && previous_live.runtime_epoch == owner.runtime_epoch
-            && previous_live.host == owner.host
-            && previous_live.host_generation == owner.host_generation
-            && intent.target_host == RuntimeHost::ApkRuntime
-            && intent.target_generation
-                == owner.host_generation.checked_add(1).ok_or_else(|| {
-                    DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-                })?
-            && target_live.runtime_epoch == intent.runtime_epoch
-            && target_live.host == intent.target_host
-            && target_live.host_generation == intent.target_generation
-            && target_live.runtime_instance_id != intent.from_instance_id
-            && target_live.boot_id == *current_boot_id;
-        if !valid {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "dead owner takeover identity is stale",
-            ));
-        }
-        let state = decode_canonical_state(
-            &fs::read(self.base.join("runtime-state.json")).map_err(io_error)?,
-        )?;
-        let recovery_plan = crate::await_guard_recovery_plan(
-            &state,
-            &target_live.runtime_instance_id,
-            current_boot_id,
-            &crate::GuardProofDirectory::new(&self.base),
-            process_facts,
-        )?;
-        if !recovery_plan.guards_are_clean() {
-            return Err(DomainError::new(
-                ErrorCode::IoError,
-                "dead owner takeover requires verified source cleanup",
-            ));
-        }
-        let transition_path = self.base.join("runtime-transition.json");
-        if transition_path.exists() {
-            let recorded: RuntimeTransitionIntent = read_json(&transition_path)?;
-            if recorded != *intent {
-                return Err(DomainError::new(
-                    ErrorCode::StaleAuthority,
-                    "another Runtime transition is pending",
-                ));
-            }
-        } else {
-            write_new_json(&transition_path, intent)?;
-            sync_directory(&self.base)?;
-        }
-        let next = RuntimeOwner {
-            schema_version: 1,
-            runtime_epoch: owner.runtime_epoch,
-            host: intent.target_host,
-            host_generation: intent.target_generation,
-        };
-        atomic_replace_json(&self.base, "runtime-owner.json", &next)?;
-        atomic_replace_json(&self.base, "runtime-live.json", &target_live)?;
-        Ok(PendingDeadOwnerTakeover {
-            lease: Arc::new(LifetimeLease {
-                base: self.base.clone(),
-                live: target_live,
-                _lock: lock,
-            }),
-            intent: intent.clone(),
-            recovery_plan,
-        })
-    }
-
-    pub fn resume_dead_owner_takeover(
-        &self,
-        intent: &RuntimeTransitionIntent,
-        target_live: RuntimeLive,
-        current_boot_id: &contract::UuidV4,
-        process_facts: &dyn crate::ProcessFacts,
-    ) -> Result<PendingDeadOwnerTakeover, DomainError> {
-        let lock =
-            FileLock::try_acquire(&self.base.join("runtime-live.lock"))?.ok_or_else(|| {
-                DomainError::new(
-                    ErrorCode::HostTransitionPending,
-                    "takeover target still owns the lifetime lock",
-                )
-            })?;
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        if self.base.join("runtime-reset-intent.json").exists() {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "Runtime reset is pending",
-            ));
-        }
-        let recorded: RuntimeTransitionIntent =
-            read_json(&self.base.join("runtime-transition.json"))?;
-        let owner = self.read_owner()?;
-        let previous_live: RuntimeLive = read_json(&self.base.join("runtime-live.json"))?;
-        let previous_live_is_source = previous_live.runtime_epoch == intent.runtime_epoch
-            && previous_live.host == intent.from_host
-            && previous_live.host_generation == intent.from_generation
-            && previous_live.runtime_instance_id == intent.from_instance_id;
-        let previous_live_is_target = previous_live.runtime_epoch == intent.runtime_epoch
-            && previous_live.host == intent.target_host
-            && previous_live.host_generation == intent.target_generation;
-        let valid = recorded == *intent
-            && intent.schema_version == 1
-            && intent.from_host != intent.target_host
-            && owner.runtime_epoch == intent.runtime_epoch
-            && owner.host == intent.target_host
-            && owner.host_generation == intent.target_generation
-            && intent.target_generation
-                == intent.from_generation.checked_add(1).ok_or_else(|| {
-                    DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-                })?
-            && target_live.runtime_epoch == intent.runtime_epoch
-            && target_live.host == intent.target_host
-            && target_live.host_generation == intent.target_generation
-            && target_live.runtime_instance_id != intent.from_instance_id
-            && target_live.boot_id == *current_boot_id
-            && (!previous_live_is_target
-                || target_live.runtime_instance_id != previous_live.runtime_instance_id)
-            && (previous_live_is_source || previous_live_is_target);
-        if !valid {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "dead owner takeover resume identity is stale",
-            ));
-        }
-        let state = decode_canonical_state(
-            &fs::read(self.base.join("runtime-state.json")).map_err(io_error)?,
-        )?;
-        let recovery_plan = crate::await_guard_recovery_plan(
-            &state,
-            &target_live.runtime_instance_id,
-            current_boot_id,
-            &crate::GuardProofDirectory::new(&self.base),
-            process_facts,
-        )?;
-        if !recovery_plan.guards_are_clean() {
-            return Err(DomainError::new(
-                ErrorCode::IoError,
-                "dead owner takeover resume requires verified cleanup",
-            ));
-        }
-        atomic_replace_json(&self.base, "runtime-live.json", &target_live)?;
-        Ok(PendingDeadOwnerTakeover {
-            lease: Arc::new(LifetimeLease {
-                base: self.base.clone(),
-                live: target_live,
-                _lock: lock,
-            }),
-            intent: intent.clone(),
-            recovery_plan,
-        })
-    }
-
-    pub fn complete_dead_owner_takeover(
-        &self,
-        pending: PendingDeadOwnerTakeover,
-        process_facts: &dyn crate::ProcessFacts,
-    ) -> Result<Arc<LifetimeLease>, DomainError> {
-        let _state_lock = FileLock::acquire(&self.base.join("runtime-state.lock"))?;
-        if self.base.join("runtime-reset-intent.json").exists() {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "Runtime reset is pending",
-            ));
-        }
-        self.validate_lease(&pending.lease)?;
-        let recorded: RuntimeTransitionIntent =
-            read_json(&self.base.join("runtime-transition.json"))?;
-        if recorded != pending.intent {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "dead owner takeover completion intent is stale",
-            ));
-        }
-        let state = decode_canonical_state(
-            &fs::read(self.base.join("runtime-state.json")).map_err(io_error)?,
-        )?;
-        let recovery_plan = crate::await_guard_recovery_plan(
-            &state,
-            &pending.lease.live.runtime_instance_id,
-            &pending.lease.live.boot_id,
-            &crate::GuardProofDirectory::new(&self.base),
-            process_facts,
-        )?;
-        if !recovery_plan.guards_are_clean() {
-            return Err(DomainError::new(
-                ErrorCode::IoError,
-                "dead owner takeover cleanup remains unverified",
-            ));
-        }
-        let task_work = state.tasks.iter().any(|task| {
-            matches!(
-                task.state,
-                contract::TaskState::Created
-                    | contract::TaskState::Queued
-                    | contract::TaskState::Running
-            )
-        });
-        let automation_work = state.automation_executions.iter().any(|execution| {
-            matches!(
-                execution.summary.state,
-                contract::AutomationExecutionState::Queued
-                    | contract::AutomationExecutionState::Running
-            )
-        });
-        let synchronous_work = state
-            .request_records
-            .iter()
-            .filter_map(|request| request.synchronous_execution.as_ref())
-            .any(|execution| execution.state == runtime::SynchronousExecutionState::Running);
-        if !recovery_plan.records().is_empty()
-            || !recovery_plan.prior_instances().is_empty()
-            || task_work
-            || automation_work
-            || synchronous_work
-            || !state.reservations.is_empty()
-        {
-            return Err(DomainError::new(
-                ErrorCode::HostTransitionPending,
-                "dead owner takeover recovery is not complete",
-            ));
-        }
-        remove_file_synced(&self.base, "runtime-transition.json")?;
-        Ok(pending.lease)
-    }
-
     pub fn recover_confirmed_reset(
         &self,
         cleanup_verified: bool,
@@ -903,12 +229,6 @@ impl StateStore {
             ));
         }
         let _lifetime_lock = FileLock::acquire(&self.base.join("runtime-live.lock"))?;
-        if self.base.join("runtime-transition.json").exists() {
-            return Err(DomainError::new(
-                ErrorCode::IoError,
-                "reset and transition intents conflict",
-            ));
-        }
         let intent_path = self.base.join("runtime-reset-intent.json");
         let intent: RuntimeResetIntent = read_json(&intent_path)?;
         let owner: RuntimeOwner = read_json(&self.base.join("runtime-owner.json"))?;
@@ -956,7 +276,7 @@ impl StateStore {
                 owner = RuntimeOwner {
                     schema_version: 1,
                     runtime_epoch: intent.runtime_epoch.clone(),
-                    host: RuntimeHost::ApkRuntime,
+                    host: intent.target_host,
                     host_generation: intent.target_host_generation,
                 };
                 atomic_replace_json(&self.base, "runtime-owner.json", &owner)?;
@@ -1046,11 +366,12 @@ impl StateStore {
     }
 
     /// The S-AUTH-001 malformed-owner reset (S-UI-017): under the live lock it replaces only the
-    /// owner with a fresh epoch at APK generation 1 and leaves the canonical store for ordinary
-    /// interruption reconciliation.
+    /// owner with a fresh epoch at generation 1 of [host] and leaves the canonical store for
+    /// ordinary interruption reconciliation.
     pub fn reset_malformed_owner(
         &self,
         runtime_epoch: contract::UuidV4,
+        host: RuntimeHost,
         cleanup_verified: bool,
     ) -> Result<RuntimeOwner, DomainError> {
         if !cleanup_verified {
@@ -1076,7 +397,7 @@ impl StateStore {
         let owner = RuntimeOwner {
             schema_version: 1,
             runtime_epoch,
-            host: RuntimeHost::ApkRuntime,
+            host,
             host_generation: 1,
         };
         atomic_replace_json(&self.base, "runtime-owner.json", &owner)?;
@@ -1084,9 +405,7 @@ impl StateStore {
     }
 
     fn refuse_pending_intents(&self) -> Result<(), DomainError> {
-        if self.base.join("runtime-transition.json").exists()
-            || self.base.join("runtime-reset-intent.json").exists()
-        {
+        if self.base.join("runtime-reset-intent.json").exists() {
             return Err(DomainError::new(
                 ErrorCode::StaleAuthority,
                 "a pending Runtime intent must be recovered first",
@@ -1191,9 +510,6 @@ impl StateStore {
         let written = file
             .write_all(&bytes)
             .map_err(io_error)
-            .and_then(|()| {
-                preserve_replacement_metadata(&self.base.join("runtime-state.json"), &file)
-            })
             .and_then(|()| file.sync_all().map_err(io_error));
         drop(file);
         if let Err(error) = written {
@@ -1307,7 +623,6 @@ pub(crate) fn atomic_replace_json<T: Serialize>(
     }
     let mut file = open_new_private(&temporary)?;
     file.write_all(&bytes).map_err(io_error)?;
-    preserve_replacement_metadata(&base.join(name), &file)?;
     file.sync_all().map_err(io_error)?;
     drop(file);
     replace_file(&temporary, &base.join(name))?;
@@ -1328,11 +643,6 @@ fn discard_temporary(base: &Path, temporary: &Path) {
     if fs::remove_file(temporary).is_ok() {
         let _ = sync_directory(base);
     }
-}
-
-fn remove_file_synced(base: &Path, name: &str) -> Result<(), DomainError> {
-    fs::remove_file(base.join(name)).map_err(io_error)?;
-    sync_directory(base)
 }
 
 fn open_new_private(path: &Path) -> Result<fs::File, DomainError> {
@@ -1360,71 +670,8 @@ fn open_lock_file(path: &Path) -> Result<(), DomainError> {
         .map_err(io_error)
 }
 
-fn preserve_replacement_metadata(source: &Path, replacement: &fs::File) -> Result<(), DomainError> {
-    if !source.exists() {
-        #[cfg(target_os = "android")]
-        match android_metadata_strategy(unsafe { libc::geteuid() }) {
-            AndroidMetadataStrategy::PlatformAssigned => {
-                verify_android_selinux_label(None, replacement)?;
-            }
-            AndroidMetadataStrategy::CopyCanonical => {
-                return Err(DomainError::new(
-                    ErrorCode::IoError,
-                    "Magisk writer cannot initialize canonical metadata",
-                ));
-            }
-        }
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::MetadataExt;
-
-        let metadata = fs::metadata(source).map_err(io_error)?;
-        if metadata.mode() & 0o777 != 0o600 {
-            return Err(DomainError::new(
-                ErrorCode::IoError,
-                "canonical file metadata is invalid",
-            ));
-        }
-        let replacement_metadata = replacement.metadata().map_err(io_error)?;
-        if replacement_metadata.uid() != metadata.uid()
-            || replacement_metadata.gid() != metadata.gid()
-        {
-            let result =
-                unsafe { libc::fchown(replacement.as_raw_fd(), metadata.uid(), metadata.gid()) };
-            if result != 0 {
-                return Err(io_error(std::io::Error::last_os_error()));
-            }
-        }
-        let result = unsafe { libc::fchmod(replacement.as_raw_fd(), 0o600) };
-        if result != 0 {
-            return Err(io_error(std::io::Error::last_os_error()));
-        }
-        preserve_selinux_label(source, replacement)?;
-        let replacement_metadata = replacement.metadata().map_err(io_error)?;
-        if replacement_metadata.uid() != metadata.uid()
-            || replacement_metadata.gid() != metadata.gid()
-            || replacement_metadata.mode() & 0o777 != 0o600
-        {
-            return Err(DomainError::new(
-                ErrorCode::IoError,
-                "replacement metadata verification failed",
-            ));
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = replacement;
-    }
-    Ok(())
-}
-
-/// Creates each missing directory from the canonical `base` down to `directory`. A Magisk
-/// writer gives every directory on that path the App owner, mode 0700 and the canonical
-/// directory label (S-PERSIST-004), including one an earlier root write left with other
-/// metadata, so the APK Runtime can keep writing the same store after a host transition.
+/// Creates each missing directory from the canonical `base` down to `directory`, each one
+/// readable by its writer alone.
 pub(crate) fn create_canonical_directory(base: &Path, directory: &Path) -> Result<(), DomainError> {
     let relative = directory.strip_prefix(base).map_err(|_| {
         DomainError::new(
@@ -1435,250 +682,19 @@ pub(crate) fn create_canonical_directory(base: &Path, directory: &Path) -> Resul
     let mut current = base.to_path_buf();
     for component in relative.components() {
         current.push(component);
-        match fs::create_dir(&current) {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        match builder.create(&current) {
             Ok(()) => sync_directory(current.parent().expect("created directory has a parent"))?,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(io_error(error)),
         }
-        preserve_magisk_directory_metadata(base, &current)?;
     }
-    Ok(())
-}
-
-/// Gives a file a Magisk writer created inside the store the canonical file metadata before it
-/// is renamed into place (S-PERSIST-004). An App writer's file already has the App owner and
-/// the platform-assigned label.
-pub(crate) fn preserve_magisk_file_metadata(
-    canonical: &Path,
-    file: &fs::File,
-) -> Result<(), DomainError> {
-    #[cfg(unix)]
-    if unsafe { libc::geteuid() } == 0 {
-        return preserve_replacement_metadata(canonical, file);
-    }
-    let _ = (canonical, file);
-    Ok(())
-}
-
-#[cfg(unix)]
-fn preserve_magisk_directory_metadata(base: &Path, directory: &Path) -> Result<(), DomainError> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::MetadataExt;
-
-    if unsafe { libc::geteuid() } != 0 {
-        return Ok(());
-    }
-    let canonical = fs::metadata(base).map_err(io_error)?;
-    let handle = fs::File::open(directory).map_err(io_error)?;
-    let current = handle.metadata().map_err(io_error)?;
-    if !current.is_dir() {
-        return Err(DomainError::new(
-            ErrorCode::IoError,
-            "store path is not a directory",
-        ));
-    }
-    if (current.uid() != canonical.uid() || current.gid() != canonical.gid())
-        && unsafe { libc::fchown(handle.as_raw_fd(), canonical.uid(), canonical.gid()) } != 0
-    {
-        return Err(io_error(std::io::Error::last_os_error()));
-    }
-    if current.mode() & 0o777 != 0o700 && unsafe { libc::fchmod(handle.as_raw_fd(), 0o700) } != 0 {
-        return Err(io_error(std::io::Error::last_os_error()));
-    }
-    preserve_selinux_label(base, &handle)?;
-    let verified = handle.metadata().map_err(io_error)?;
-    if verified.uid() != canonical.uid()
-        || verified.gid() != canonical.gid()
-        || verified.mode() & 0o777 != 0o700
-    {
-        return Err(DomainError::new(
-            ErrorCode::IoError,
-            "store directory metadata verification failed",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn preserve_magisk_directory_metadata(_: &Path, _: &Path) -> Result<(), DomainError> {
-    Ok(())
-}
-
-#[cfg(target_os = "android")]
-fn preserve_selinux_label(source: &Path, replacement: &fs::File) -> Result<(), DomainError> {
-    match android_metadata_strategy(unsafe { libc::geteuid() }) {
-        AndroidMetadataStrategy::PlatformAssigned => {
-            verify_android_selinux_label(Some(source), replacement)
-        }
-        AndroidMetadataStrategy::CopyCanonical => copy_android_selinux_label(source, replacement),
-    }
-}
-
-#[cfg(any(target_os = "android", test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AndroidMetadataStrategy {
-    PlatformAssigned,
-    CopyCanonical,
-}
-
-#[cfg(any(target_os = "android", test))]
-const fn android_metadata_strategy(effective_uid: u32) -> AndroidMetadataStrategy {
-    if effective_uid == 0 {
-        AndroidMetadataStrategy::CopyCanonical
-    } else {
-        AndroidMetadataStrategy::PlatformAssigned
-    }
-}
-
-#[cfg(target_os = "android")]
-fn copy_android_selinux_label(source: &Path, replacement: &fs::File) -> Result<(), DomainError> {
-    use std::ffi::CString;
-    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
-
-    let source_path = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| DomainError::new(ErrorCode::IoError, "canonical path is invalid"))?;
-    let name = c"security.selinux";
-    let source_label = read_required_xattr(|value, length| unsafe {
-        libc::getxattr(source_path.as_ptr(), name.as_ptr(), value, length)
-    })?;
-    let result = unsafe {
-        libc::fsetxattr(
-            replacement.as_raw_fd(),
-            name.as_ptr(),
-            source_label.as_ptr().cast(),
-            source_label.len(),
-            0,
-        )
-    };
-    if result != 0 {
-        return Err(io_error(std::io::Error::last_os_error()));
-    }
-    verify_android_selinux_label(Some(source), replacement)
-}
-
-#[cfg(target_os = "android")]
-fn verify_android_selinux_label(
-    source: Option<&Path>,
-    replacement: &fs::File,
-) -> Result<(), DomainError> {
-    use std::ffi::CString;
-    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
-
-    let name = c"security.selinux";
-    let replacement_label = read_required_xattr(|value, length| unsafe {
-        libc::fgetxattr(replacement.as_raw_fd(), name.as_ptr(), value, length)
-    })?;
-    let source_label = source
-        .map(|path| {
-            let path = CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| DomainError::new(ErrorCode::IoError, "canonical path is invalid"))?;
-            read_required_xattr(|value, length| unsafe {
-                libc::getxattr(path.as_ptr(), name.as_ptr(), value, length)
-            })
-        })
-        .transpose()?;
-    validate_platform_selinux_labels(source_label.as_deref(), &replacement_label)
-}
-
-#[cfg(target_os = "android")]
-fn read_required_xattr(
-    read: impl Fn(*mut libc::c_void, usize) -> isize,
-) -> Result<Vec<u8>, DomainError> {
-    let length = read(std::ptr::null_mut(), 0);
-    if length <= 0 {
-        return Err(if length < 0 {
-            io_error(std::io::Error::last_os_error())
-        } else {
-            DomainError::new(ErrorCode::IoError, "SELinux metadata is empty")
-        });
-    }
-    let mut value = vec![0_u8; length as usize];
-    let actual = read(value.as_mut_ptr().cast(), value.len());
-    if actual != length {
-        return Err(DomainError::new(
-            ErrorCode::IoError,
-            "SELinux metadata changed while being verified",
-        ));
-    }
-    Ok(value)
-}
-
-#[cfg(any(target_os = "android", test))]
-fn validate_platform_selinux_labels(
-    source: Option<&[u8]>,
-    replacement: &[u8],
-) -> Result<(), DomainError> {
-    if replacement.is_empty() || source.is_some_and(|value| value != replacement) {
-        return Err(DomainError::new(
-            ErrorCode::IoError,
-            "replacement SELinux metadata verification failed",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
-fn preserve_selinux_label(source: &Path, replacement: &fs::File) -> Result<(), DomainError> {
-    use std::ffi::CString;
-    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
-
-    let source = CString::new(source.as_os_str().as_bytes())
-        .map_err(|_| DomainError::new(ErrorCode::IoError, "canonical path is invalid"))?;
-    let name = c"security.selinux";
-    let length = unsafe { libc::getxattr(source.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
-    if length < 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENODATA)
-            || error.raw_os_error() == Some(libc::ENOTSUP)
-        {
-            return Ok(());
-        }
-        return Err(io_error(error));
-    }
-    let mut value = vec![0_u8; length as usize];
-    let read = unsafe {
-        libc::getxattr(
-            source.as_ptr(),
-            name.as_ptr(),
-            value.as_mut_ptr().cast(),
-            value.len(),
-        )
-    };
-    if read != length {
-        return Err(io_error(std::io::Error::last_os_error()));
-    }
-    let result = unsafe {
-        libc::fsetxattr(
-            replacement.as_raw_fd(),
-            name.as_ptr(),
-            value.as_ptr().cast(),
-            value.len(),
-            0,
-        )
-    };
-    if result != 0 {
-        return Err(io_error(std::io::Error::last_os_error()));
-    }
-    let mut verified = vec![0_u8; value.len()];
-    let verified_length = unsafe {
-        libc::fgetxattr(
-            replacement.as_raw_fd(),
-            name.as_ptr(),
-            verified.as_mut_ptr().cast(),
-            verified.len(),
-        )
-    };
-    if verified_length != length || verified != value {
-        return Err(DomainError::new(
-            ErrorCode::IoError,
-            "replacement SELinux metadata verification failed",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(all(unix, not(any(target_os = "android", target_os = "linux"))))]
-fn preserve_selinux_label(_: &Path, _: &fs::File) -> Result<(), DomainError> {
     Ok(())
 }
 
@@ -2106,38 +1122,4 @@ pub fn clear_stranded_executions(
     decode_canonical_state(&encoded)?;
     atomic_replace_json(base, "runtime-state.json", &state)?;
     Ok(requests.len() + tasks.len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        AndroidMetadataStrategy, android_metadata_strategy, validate_platform_selinux_labels,
-    };
-
-    #[test]
-    fn platform_assigned_selinux_label_requires_nonempty_exact_match() {
-        let label = b"u:object_r:app_data_file:s0:c1,c2\0";
-        assert!(validate_platform_selinux_labels(None, label).is_ok());
-        assert!(validate_platform_selinux_labels(Some(label), label).is_ok());
-        assert!(validate_platform_selinux_labels(None, b"").is_err());
-        assert!(
-            validate_platform_selinux_labels(
-                Some(b"u:object_r:app_data_file:s0:c1,c2\0"),
-                b"u:object_r:app_data_file:s0:c3,c4\0",
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn magisk_root_writer_copies_canonical_android_metadata() {
-        assert_eq!(
-            android_metadata_strategy(0),
-            AndroidMetadataStrategy::CopyCanonical,
-        );
-        assert_eq!(
-            android_metadata_strategy(10_123),
-            AndroidMetadataStrategy::PlatformAssigned,
-        );
-    }
 }

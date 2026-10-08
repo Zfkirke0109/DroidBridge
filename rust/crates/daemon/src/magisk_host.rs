@@ -1,11 +1,10 @@
 use crate::{
-    CompanionCapabilityRegistration, HelperFamily, HelperHello, HelperRegistry, HostCoordinator,
-    HostPreparation, MagiskExecutorFence, MagiskExecutorHandle, ModuleIdentity, ModuleObservation,
-    SourceGeneration, WakeAlarmProbe,
+    HelperFamily, HelperHello, HelperRegistry, MagiskExecutorFence, MagiskExecutorHandle,
+    ModuleIdentity, ModuleObservation, SourceGeneration, WakeAlarmProbe,
     android::{HelperConnection, HelperPort, MagiskAndroidPort, run_clipboard_child},
     automation_wake::RealtimeAlarmWake,
     command::{CommandQuarantine, MagiskCommandProcessPort, RootCommandGuard},
-    companion::CompanionPort,
+    content::RootContentPort,
     helper_family_facts,
     magisk_guard_recovery::{
         FilesystemMagiskGuardRecovery, ProcFacts, execute_guard_recovery, probe_root_guard,
@@ -15,7 +14,8 @@ use crate::{
         MagiskCaptureBackend, MagiskNetworkSource, NativeNetworkDefaultEventSource,
         NativeNetworkPort,
     },
-    process_network::ProcessNetworkAttachment,
+    recycle::CleanupWatch,
+    reprobe_families,
     unix_transport::{peer_uid, receive_json},
     visual::MagiskVisualPort,
 };
@@ -24,19 +24,16 @@ use contract::{
     Availability, CapabilityState, ContextCall, ErrorCode, PublicPayload, RunAs, RuntimeHost,
     UuidV4,
 };
-use domain::{DomainError, OutstandingWork};
+use domain::DomainError;
 use persistence::{
     JsonPersistencePort, LifetimeLease, RuntimeArtifactPort, RuntimeLive, RuntimeOwner, StateStore,
-    await_guard_recovery_plan, verify_magisk_metadata_surface,
+    await_guard_recovery_plan,
 };
 use runtime::{
-    AndroidFrameworkFilesystemPort, AndroidNetworkDefaultEventSource, ApkCapabilityPort,
-    ApkRuntimeVertical, AutomationScheduler, BoottimeClock, CapabilityPort,
+    ApkCapabilityPort, ApkRuntimeVertical, AutomationScheduler, BoottimeClock, CapabilityPort,
     CompositeExecutionSurface, HostControlPort, NativeAndroidExecutionSurface,
     NativeCommandExecutionSurface, NativeFilesystemExecutionSurface, NativeNetworkExecutionSurface,
-    NativeVisualExecutionSurface, NetworkDefaultChangedEvent, NetworkDefaultEventSource,
-    NetworkDefaultSourceRegistration, NetworkEventDelivery, ProviderToken, RecoveryProof,
-    RuntimeCore, VerticalEnvironment,
+    NativeVisualExecutionSurface, ProviderToken, RecoveryProof, RuntimeCore, VerticalEnvironment,
 };
 use std::{
     fs, io,
@@ -57,34 +54,126 @@ use std::{
 pub(crate) use crate::VERSION_CODE;
 
 pub(crate) struct MagiskHost {
+    submitter: HostSubmitter,
     store: Arc<StateStore>,
     lease: Arc<LifetimeLease>,
     instance_id: UuidV4,
     vertical: ApkRuntimeVertical,
-    coordinator: HostCoordinator,
     helper: Option<FrameworkHelper>,
     helper_port: HelperPort,
     family_probes: [bool; 3],
-    published_denials: [bool; 3],
+    family_probed_at: Instant,
     guard_ready: bool,
     module_ready: bool,
     wake_alarm_ready: bool,
     capability_generation: SourceGeneration,
     helper_generation: SourceGeneration,
     command_quarantine: Arc<CommandQuarantine>,
+    cleanup_watch: CleanupWatch,
     executor: MagiskExecutorHandle,
-    companion_network_events: Arc<MagiskCompanionNetworkEventSource>,
-    native_network_events: Arc<NativeNetworkDefaultEventSource>,
-    companion_network_events_selected: AtomicBool,
-    /// This instance's own process binding to the default network the companion reported.
-    process_network: ProcessNetworkAttachment,
     /// The fault that ended this instance's resident Automation scheduler, published as explicit
     /// capability loss by the next runtime fact refresh.
     automation_fault: Arc<StdMutex<Option<DomainError>>>,
-    /// The ArtifactStore this instance owns, which answers S-MCP-006 internal artifact queries.
-    artifacts: RuntimeArtifactPort,
-    core: MagiskCore,
     async_runtime: tokio::runtime::Runtime,
+}
+
+/// The one path from a public request to this host's Core, shared by the frontend and this
+/// daemon's MCP ingress.
+#[derive(Clone)]
+pub(crate) struct HostSubmitter {
+    core: MagiskCore,
+    vertical: ApkRuntimeVertical,
+    admission_open: Arc<AtomicBool>,
+    store: Arc<StateStore>,
+    lease: Arc<LifetimeLease>,
+    artifacts: RuntimeArtifactPort,
+    handle: tokio::runtime::Handle,
+}
+
+impl HostSubmitter {
+    async fn submit(&self, encoded: Vec<u8>) -> Result<Vec<u8>, DomainError> {
+        self.store.validate_lease(&self.lease)?;
+        let now = Utc::now();
+        let now_ms = u64::try_from(now.timestamp_millis())
+            .map_err(|_| DomainError::new(ErrorCode::InternalError, "system time is invalid"))?;
+        let admission_open = self.admission_open.load(Ordering::SeqCst);
+        let vertical = &self.vertical;
+        Ok(runtime::submit_public(
+            &self.core,
+            &encoded,
+            now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            now_ms,
+            admission_open,
+            |request| {
+                std::future::ready(
+                    if admission_open
+                        || matches!(
+                            &request.payload,
+                            PublicPayload::Context {
+                                call: ContextCall::Status(_)
+                            }
+                        )
+                    {
+                        vertical.dispatch_installed(request)
+                    } else {
+                        Err(DomainError::new(
+                            ErrorCode::HostTransitionPending,
+                            "Runtime maintenance is in progress",
+                        ))
+                    },
+                )
+            },
+        )
+        .await)
+    }
+
+    /// Submits one public envelope from a thread outside this host's reactor.
+    pub(crate) fn submit_blocking(&self, encoded: Vec<u8>) -> Result<Vec<u8>, DomainError> {
+        let submitter = self.clone();
+        self.handle
+            .block_on(
+                self.handle
+                    .spawn(async move { submitter.submit(encoded).await }),
+            )
+            .map_err(|_| {
+                DomainError::new(ErrorCode::InternalError, "Magisk Runtime submission ended")
+            })?
+    }
+
+    fn answer_artifact_query(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<runtime::McpArtifactReply, DomainError> {
+        self.store.validate_lease(&self.lease)?;
+        let now_ms = u64::try_from(Utc::now().timestamp_millis())
+            .map_err(|_| DomainError::new(ErrorCode::InternalError, "system time is invalid"))?;
+        self.artifacts.answer_mcp_query(payload, now_ms)
+    }
+}
+
+impl runtime::McpHost for HostSubmitter {
+    fn submit<'a>(
+        &'a self,
+        envelope: Vec<u8>,
+    ) -> runtime::PortFuture<'a, Result<Vec<u8>, DomainError>> {
+        let submitter = self.clone();
+        Box::pin(async move {
+            // The Core runs on this host's own reactor, whatever reactor the caller serves on.
+            self.handle
+                .spawn(async move { submitter.submit(envelope).await })
+                .await
+                .map_err(|_| {
+                    DomainError::new(ErrorCode::InternalError, "Magisk Runtime submission ended")
+                })?
+        })
+    }
+
+    fn artifact_query<'a>(
+        &'a self,
+        query: serde_json::Value,
+    ) -> runtime::PortFuture<'a, Result<runtime::McpArtifactReply, DomainError>> {
+        Box::pin(async move { self.answer_artifact_query(&query) })
+    }
 }
 
 type MagiskCore = RuntimeCore<
@@ -95,15 +184,13 @@ type MagiskCore = RuntimeCore<
     MagiskHostControl,
 >;
 
-type MagiskFilesystemSurface = NativeFilesystemExecutionSurface<
-    RuntimeArtifactPort,
-    ApkCapabilityPort,
-    AndroidFrameworkFilesystemPort<CompanionPort>,
->;
+type MagiskFilesystemSurface =
+    NativeFilesystemExecutionSurface<RuntimeArtifactPort, ApkCapabilityPort, RootContentPort>;
 
-/// The identities this host surface owns: the daemon runs `root` itself and forwards the
-/// two identities the APK surface owns instead of impersonating them.
-const COMMAND_IDENTITIES: &[RunAs] = &[RunAs::Root, RunAs::App, RunAs::Shell];
+/// The root edition runs commands as root only.
+const COMMAND_IDENTITIES: &[RunAs] = &[RunAs::Root];
+/// How often a helper family whose probe failed is probed again while the helper lives.
+const FAMILY_REPROBE_EVERY: Duration = Duration::from_secs(60);
 
 /// The Magisk host's own capture backend and observation source, so this host owns every
 /// `network.inspect` field family and the raw capture/injection primitive (S-NET-001, S-NET-005).
@@ -129,54 +216,15 @@ type MagiskExecutionSurface = CompositeExecutionSurface<
     MagiskAndroidSurface,
 >;
 
-struct MagiskCompanionNetworkEventSource {
-    delegate: AndroidNetworkDefaultEventSource<CompanionPort, ApkCapabilityPort>,
-    connected: AtomicBool,
-}
-
-impl MagiskCompanionNetworkEventSource {
-    fn new(companion: CompanionPort, capabilities: ApkCapabilityPort) -> Self {
-        Self {
-            delegate: AndroidNetworkDefaultEventSource::new(companion, capabilities),
-            connected: AtomicBool::new(false),
-        }
-    }
-}
-
-impl NetworkDefaultEventSource for MagiskCompanionNetworkEventSource {
-    fn start(
-        &self,
-        registration: &NetworkDefaultSourceRegistration,
-        ingress: runtime::NetworkDefaultEventIngress,
-    ) -> Result<(), DomainError> {
-        if !self.connected.load(Ordering::Acquire) {
-            return Err(DomainError::new(
-                ErrorCode::CapabilityUnavailable,
-                "authenticated companion network source is unavailable",
-            ));
-        }
-        self.delegate.start(registration, ingress)
-    }
-
-    fn stop(&self, registration: &NetworkDefaultSourceRegistration) -> Result<(), DomainError> {
-        if !self.connected.load(Ordering::Acquire) {
-            // The APK connection-loss owner unregisters its callback locally. The old source
-            // generation is already invalidated here, so any retained callback is stale.
-            return Ok(());
-        }
-        self.delegate.stop(registration)
-    }
-}
-
 impl MagiskHost {
     pub(crate) fn activate(
         store: Arc<StateStore>,
+        identity: &ModuleIdentity,
         module_root: &Path,
         canonical_base: &Path,
         sdk_int: u32,
         owner: RuntimeOwner,
-        companion: CompanionPort,
-        task_activity: Arc<crate::app_keepalive::TaskActivityBeacon>,
+        recycle: Arc<crate::recycle::Recycle>,
     ) -> Result<Self, DomainError> {
         let instance_id = new_uuid()?;
         let boot_id = read_boot_id()?;
@@ -198,12 +246,14 @@ impl MagiskHost {
             &persistence::GuardProofDirectory::new(canonical_base),
             &ProcFacts,
         )?;
+        let model = fixed_property("ro.product.model")?;
         let environment = VerticalEnvironment {
             sdk_int,
             abi: fixed_property("ro.product.cpu.abi")?,
             timezone: fixed_property("persist.sys.timezone")?,
+            name: model.clone(),
             manufacturer: fixed_property("ro.product.manufacturer")?,
-            model: fixed_property("ro.product.model")?,
+            model,
             device: fixed_property("ro.product.device")?,
             build_fingerprint: fixed_property("ro.build.fingerprint")?,
             version_name: env!("CARGO_PKG_VERSION").to_owned(),
@@ -260,6 +310,7 @@ impl MagiskHost {
         let helper_port = HelperPort::default();
         let family_probes = helper.as_ref().map_or([false; 3], |helper| {
             helper_port.publish(Arc::clone(&helper.connection), helper.jar.clone());
+            name_device(&vertical);
             probe_families(helper)
         });
         register(
@@ -270,11 +321,9 @@ impl MagiskHost {
             helper.is_some(),
             capability_generation.current(),
         )?;
-        for fact in helper_family_facts(
-            helper.is_some(),
-            |family| family_probes[family_index(family)],
-            |_| false,
-        ) {
+        for fact in helper_family_facts(helper.is_some(), |family| {
+            family_probes[family_index(family)]
+        }) {
             register(
                 &vertical,
                 fact.family.key(),
@@ -288,11 +337,23 @@ impl MagiskHost {
             vertical.set_unavailable("CLEANUP_UNVERIFIED")?;
         }
         let capabilities = vertical.capability_port(instance_id.clone());
+        let cleanup_watch = CleanupWatch::new(
+            Arc::clone(&store),
+            Arc::clone(&lease),
+            canonical_base.to_path_buf(),
+            boot_id.clone(),
+            capabilities.clone(),
+            recycle,
+        );
+        // Guards this start found unsettled may still write their verdicts.
+        if !recovery.guards_are_clean() {
+            cleanup_watch.start()?;
+        }
         let host_control = MagiskHostControl {
             store: Arc::clone(&store),
             lease: Arc::clone(&lease),
+            cleanup_watch: cleanup_watch.clone(),
             capabilities: capabilities.clone(),
-            task_activity,
             recovery_proof: if recovery.guards_are_clean() {
                 RecoveryProof::Clean
             } else {
@@ -311,12 +372,7 @@ impl MagiskHost {
             boot_id.clone(),
             Arc::clone(&command_quarantine),
         ));
-        let companion_network_events = Arc::new(MagiskCompanionNetworkEventSource::new(
-            companion.clone(),
-            capabilities.clone(),
-        ));
-        let native_network_events = Arc::new(NativeNetworkDefaultEventSource::default());
-        let process_network = ProcessNetworkAttachment::device();
+        let content = RootContentPort::new(canonical_base.to_path_buf(), command_root.clone());
         let executions = CompositeExecutionSurface::new(
             NativeFilesystemExecutionSurface::new(
                 canonical_base.to_path_buf(),
@@ -324,33 +380,29 @@ impl MagiskHost {
                 capabilities.clone(),
                 ProviderToken::MagiskNative,
             )
-            .with_framework(AndroidFrameworkFilesystemPort::new(companion.clone())),
+            .with_framework(content.clone()),
         )
         .with_command(NativeCommandExecutionSurface::new(
             artifacts.clone(),
             capabilities.clone(),
             COMMAND_IDENTITIES,
-            MagiskCommandProcessPort::new(command_root.clone(), companion.clone()),
+            MagiskCommandProcessPort::new(command_root.clone()),
         ))
         .with_network(NativeNetworkExecutionSurface::new(
             artifacts.clone(),
             capabilities.clone(),
             NativeNetworkPort::new(
-                MagiskNetworkSource::new(companion.clone()),
+                MagiskNetworkSource::new(helper_port.clone()),
                 MagiskCaptureBackend,
                 artifacts.clone(),
             ),
         ))
         .with_android(
-            NativeAndroidExecutionSurface::new(
-                capabilities.clone(),
-                crate::process::build_identity().package,
-            )
-            .with_primitives(MagiskAndroidPort::new(
-                command_root.clone(),
-                companion.clone(),
-                helper_port.clone(),
-            )),
+            NativeAndroidExecutionSurface::new(capabilities.clone(), identity.frontend_package)
+                .with_primitives(MagiskAndroidPort::new(
+                    command_root.clone(),
+                    helper_port.clone(),
+                )),
         )
         .with_visual(
             NativeVisualExecutionSurface::new(artifacts.clone(), capabilities.clone())
@@ -358,8 +410,9 @@ impl MagiskHost {
                     canonical_base.to_path_buf(),
                     capabilities.clone(),
                     command_root,
-                    companion,
+                    content,
                     helper_port.clone(),
+                    crate::framework_jar(module_root, sdk_int),
                 )),
         );
         let core = RuntimeCore::new(
@@ -369,7 +422,7 @@ impl MagiskHost {
             capabilities,
             host_control,
         )
-        .with_network_default_event_source(native_network_events.clone());
+        .with_network_default_event_source(Arc::new(NativeNetworkDefaultEventSource::default()));
         let async_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -427,34 +480,34 @@ impl MagiskHost {
             wake_alarm_ready,
             Arc::clone(&automation_fault),
         );
+        let submitter = HostSubmitter {
+            core,
+            vertical: vertical.clone(),
+            admission_open: Arc::new(AtomicBool::new(true)),
+            store: Arc::clone(&store),
+            lease: Arc::clone(&lease),
+            artifacts,
+            handle: async_runtime.handle().clone(),
+        };
         Ok(Self {
+            submitter,
             store,
             lease,
-            instance_id: instance_id.clone(),
+            instance_id,
             vertical,
-            coordinator: HostCoordinator::new(
-                RuntimeHost::MagiskBackend,
-                owner.host_generation,
-                instance_id,
-            ),
             helper,
             helper_port,
             family_probes,
-            published_denials: [false; 3],
+            family_probed_at: Instant::now(),
             guard_ready,
             module_ready: true,
             wake_alarm_ready,
             capability_generation,
             helper_generation,
             command_quarantine,
+            cleanup_watch,
             executor,
-            companion_network_events,
-            native_network_events,
-            companion_network_events_selected: AtomicBool::new(false),
-            process_network,
             automation_fault,
-            artifacts,
-            core,
             async_runtime,
         })
     }
@@ -463,186 +516,46 @@ impl MagiskHost {
         &self.instance_id
     }
 
-    pub(crate) fn observe_network_default(
-        &self,
-        registration: NetworkDefaultSourceRegistration,
-        event: NetworkDefaultChangedEvent,
-    ) -> Result<NetworkEventDelivery, DomainError> {
-        self.core.observe_network_default_event(registration, event)
-    }
-
-    /// Applies the default network the companion states its own process runs under. The companion
-    /// is this host's only authority for the device's default network, so its own attachment is
-    /// also the attachment this process takes.
-    pub(crate) fn apply_network_attachment(
-        &self,
-        network_id: Option<&str>,
-    ) -> Result<(), DomainError> {
-        self.process_network.apply(network_id)
-    }
-
-    /// Ends this instance's process binding. The binding is part of the Magisk host instance,
-    /// so it must not outlive the instance that acquired it.
-    pub(crate) fn clear_process_network(&self) -> Result<(), DomainError> {
-        self.process_network.clear()
-    }
-
-    pub(crate) fn use_companion_network_events(&self) -> Result<(), DomainError> {
-        self.companion_network_events
-            .connected
-            .store(true, Ordering::Release);
-        if self
-            .companion_network_events_selected
-            .swap(true, Ordering::AcqRel)
-        {
-            return Ok(());
-        }
-        self.core.replace_network_default_event_source(
-            self.companion_network_events.clone() as Arc<dyn NetworkDefaultEventSource>
-        )?;
-        // A subscription that failed on the previous source is retried on the new one.
-        self.core.canonical_changes().notify_one();
-        Ok(())
-    }
-
-    pub(crate) fn use_native_network_events(&self) -> Result<(), DomainError> {
-        self.companion_network_events
-            .connected
-            .store(false, Ordering::Release);
-        // The deselected companion is the only authority for the handle this process was bound
-        // to, so the native source starts from an unbound process.
-        self.process_network.clear()?;
-        if !self
-            .companion_network_events_selected
-            .swap(false, Ordering::AcqRel)
-        {
-            return Ok(());
-        }
-        self.core.replace_network_default_event_source(
-            self.native_network_events.clone() as Arc<dyn NetworkDefaultEventSource>
-        )?;
-        self.core.canonical_changes().notify_one();
-        Ok(())
+    pub(crate) fn submitter(&self) -> HostSubmitter {
+        self.submitter.clone()
     }
 
     pub(crate) fn guard_ready(&self) -> bool {
         self.guard_ready
     }
 
-    pub(crate) fn wake_alarm_ready(&self) -> bool {
-        self.wake_alarm_ready
-    }
-
     pub(crate) fn helper_ready(&self) -> bool {
         self.helper.is_some()
     }
 
-    pub(crate) fn prepare_transition(
-        &mut self,
-        transition_id: UuidV4,
-        target_host: RuntimeHost,
-    ) -> Result<HostPreparation, DomainError> {
-        let outstanding_work = self.outstanding_work()?;
-        let store_revision = self.store_revision()?;
-        self.coordinator
-            .prepare(transition_id, target_host, outstanding_work, store_revision)
-    }
-
-    pub(crate) fn abort_transition(&mut self, transition_id: &UuidV4) -> Result<(), DomainError> {
-        self.coordinator.abort(transition_id)
-    }
-
-    pub(crate) fn release_transition(&mut self, transition_id: &UuidV4) -> Result<(), DomainError> {
-        self.coordinator.release(transition_id)
-    }
-
-    pub(crate) fn validate_lease(&self) -> Result<(), DomainError> {
-        self.store.validate_lease(&self.lease)
-    }
-
-    pub(crate) fn set_app_execution_surface(
+    /// Closes public admission and records the reset intent under this instance's lease, once the
+    /// store holds no live work. A refused reset reopens admission unchanged.
+    pub(crate) fn record_reset_intent(
         &self,
-        state: CapabilityState,
+        intent: &persistence::RuntimeResetIntent,
     ) -> Result<(), DomainError> {
-        self.vertical.set_app_execution_surface(state)
+        self.submitter.admission_open.store(false, Ordering::SeqCst);
+        let recorded = self
+            .store
+            .record_reset_intent(&self.lease, intent, true, self.guard_ready);
+        if recorded.is_err() {
+            self.submitter.admission_open.store(true, Ordering::SeqCst);
+        }
+        recorded
     }
 
-    pub(crate) fn withdraw_capabilities(
-        &self,
-        keys: &[&str],
-        reason: &str,
-    ) -> Result<(), DomainError> {
-        self.vertical.withdraw_capabilities(keys, reason)
-    }
-
-    pub(crate) fn register_companion_capability(
-        &self,
-        registration: &CompanionCapabilityRegistration,
-    ) -> Result<(), DomainError> {
-        self.vertical
-            .register_capability(
-                &registration.key,
-                Availability {
-                    state: registration.state,
-                    reason: registration.reason.clone(),
-                },
-                registration.source_generation,
-                registration.has_executor,
-            )
-            .map(|_| ())
-    }
-
-    pub(crate) fn forward_runtime(
-        &self,
-        payload: &serde_json::Value,
-    ) -> Result<serde_json::Value, DomainError> {
-        self.validate_lease()?;
-        let encoded = serde_json::to_vec(payload)
-            .map_err(|_| DomainError::invalid("RuntimeForward payload is invalid"))?;
-        let now = Utc::now();
-        let now_ms = u64::try_from(now.timestamp_millis())
-            .map_err(|_| DomainError::new(ErrorCode::InternalError, "system time is invalid"))?;
-        let admission_open = self.coordinator.admission_open();
-        let response = self.async_runtime.block_on(runtime::submit_public(
-            &self.core,
-            &encoded,
-            now.to_rfc3339_opts(SecondsFormat::Millis, true),
-            now_ms,
-            admission_open,
-            |request| {
-                std::future::ready(
-                    if admission_open
-                        || matches!(
-                            &request.payload,
-                            PublicPayload::Context {
-                                call: ContextCall::Status(_)
-                            }
-                        )
-                    {
-                        self.vertical.dispatch_installed(request)
-                    } else {
-                        Err(DomainError::new(
-                            ErrorCode::HostTransitionPending,
-                            "Runtime host transition is pending",
-                        ))
-                    },
-                )
-            },
-        ));
-        serde_json::from_slice(&response)
-            .map_err(|_| io_error("Magisk Runtime response is invalid"))
-    }
-
-    /// Answers one S-MCP-006 internal artifact query forwarded by the APK facade. It never enters
-    /// public ingress, so it stays answerable while business admission is closed.
-    pub(crate) fn answer_artifact_query(
-        &self,
-        payload: &serde_json::Value,
-    ) -> Result<runtime::McpArtifactReply, DomainError> {
-        self.validate_lease()?;
-        let now_ms = u64::try_from(Utc::now().timestamp_millis())
-            .map_err(|_| DomainError::new(ErrorCode::InternalError, "system time is invalid"))?;
-        self.artifacts.answer_mcp_query(payload, now_ms)
+    /// Ends this instance: its reactor stops first so no Task still holds the lease, which is
+    /// released with the last reference.
+    pub(crate) fn shutdown(self) {
+        let Self {
+            submitter,
+            lease,
+            async_runtime,
+            ..
+        } = self;
+        drop(submitter);
+        async_runtime.shutdown_timeout(Duration::from_secs(5));
+        drop(lease);
     }
 
     pub(crate) fn refresh_runtime_facts(
@@ -670,7 +583,10 @@ impl MagiskHost {
         }
         if self.guard_ready && self.command_quarantine.is_flagged() {
             self.guard_ready = false;
-            self.vertical.set_unavailable("CLEANUP_UNVERIFIED")?;
+            // A replacement already under way keeps reporting that it is recovering.
+            if !self.cleanup_watch.active() {
+                self.vertical.set_unavailable("CLEANUP_UNVERIFIED")?;
+            }
             let generation = self.capability_generation.advance()?;
             for key in ["magisk.root", "execution.root_guard"] {
                 register(
@@ -714,10 +630,21 @@ impl MagiskHost {
         }
 
         if self.helper.as_mut().is_some_and(FrameworkHelper::is_alive) {
-            let denials = HelperFamily::ALL.map(|family| self.helper_port.operation_denied(family));
-            if denials != self.published_denials {
-                self.published_denials = denials;
-                self.publish_helper_state(true)?;
+            let retry_failed = self.family_probed_at.elapsed() >= FAMILY_REPROBE_EVERY;
+            if retry_failed {
+                self.family_probed_at = Instant::now();
+            }
+            if let Some(helper) = self.helper.as_ref() {
+                let probes = reprobe_families(
+                    self.family_probes,
+                    |family| self.helper_port.take_denial(family),
+                    retry_failed,
+                    |family| probe_family(helper, family),
+                );
+                if probes != self.family_probes {
+                    self.family_probes = probes;
+                    self.publish_helper_state(true)?;
+                }
             }
             return Ok(());
         }
@@ -735,57 +662,13 @@ impl MagiskHost {
         if let Ok(helper) = FrameworkHelper::start(module_root, sdk_int, helper_generation) {
             self.helper_port
                 .publish(Arc::clone(&helper.connection), helper.jar.clone());
+            name_device(&self.vertical);
             self.family_probes = probe_families(&helper);
-            self.published_denials = [false; 3];
+            self.family_probed_at = Instant::now();
             self.helper = Some(helper);
             self.publish_helper_state(true)?;
         }
         Ok(())
-    }
-
-    pub(crate) fn companion_available(&self) -> bool {
-        self.vertical
-            .capability_port(self.instance_id.clone())
-            .current()
-            .is_ok_and(|snapshot| {
-                snapshot.context.app_execution_surface == CapabilityState::Available
-            })
-    }
-
-    fn outstanding_work(&self) -> Result<OutstandingWork, DomainError> {
-        let state = self.store.load(&self.lease)?;
-        let tasks = state
-            .tasks
-            .iter()
-            .filter(|task| {
-                matches!(
-                    task.state,
-                    contract::TaskState::Created
-                        | contract::TaskState::Queued
-                        | contract::TaskState::Running
-                )
-            })
-            .count();
-        let automation_executions = state
-            .automation_executions
-            .iter()
-            .filter(|execution| {
-                matches!(
-                    execution.summary.state,
-                    contract::AutomationExecutionState::Queued
-                        | contract::AutomationExecutionState::Running
-                )
-            })
-            .count();
-        Ok(OutstandingWork {
-            tasks: u32::try_from(tasks).unwrap_or(u32::MAX),
-            automation_executions: u32::try_from(automation_executions).unwrap_or(u32::MAX),
-            synchronous_executions: u32::from(!state.reservations.is_empty()),
-        })
-    }
-
-    fn store_revision(&self) -> Result<u64, DomainError> {
-        Ok(self.store.load(&self.lease)?.store_revision)
     }
 
     fn publish_helper_state(&mut self, available: bool) -> Result<(), DomainError> {
@@ -798,11 +681,9 @@ impl MagiskHost {
             available,
             generation,
         )?;
-        for fact in helper_family_facts(
-            available,
-            |family| self.family_probes[family_index(family)],
-            |family| self.published_denials[family_index(family)],
-        ) {
+        for fact in
+            helper_family_facts(available, |family| self.family_probes[family_index(family)])
+        {
             register(
                 &self.vertical,
                 fact.family.key(),
@@ -830,7 +711,6 @@ impl MagiskHost {
 
 pub(crate) fn observe_module(
     module_root: &Path,
-    canonical_base: &Path,
     identity: &ModuleIdentity,
 ) -> Result<ModuleObservation, DomainError> {
     let stable = Path::new("/data/adb/modules/droidbridge");
@@ -842,9 +722,6 @@ pub(crate) fn observe_module(
         enabled: !module_root.join("disable").exists() && !module_root.join("remove").exists(),
         module_version_code: property,
         daemon_version_code: VERSION_CODE,
-        protocol_version: crate::PROTOCOL_VERSION,
-        metadata_self_test: verify_magisk_metadata_surface(canonical_base).is_ok(),
-        excluded: canonical_base.join("module-exclusion.json").exists(),
     })
 }
 
@@ -852,6 +729,38 @@ pub(crate) fn observe_module(
 /// only after the Android system services it probes have finished booting.
 fn framework_boot_completed() -> bool {
     fixed_property("sys.boot_completed").is_ok_and(|value| value == "1")
+}
+
+/// Names the device after its Settings name once the framework answers, which the helper's start
+/// proves; until then, and when it has none, the model stands.
+fn name_device(vertical: &ApkRuntimeVertical) {
+    if let Some(name) = device_name()
+        && let Err(failed) = vertical.set_device_name(name)
+    {
+        eprintln!(
+            "droidbridged: cannot set the device name: {:?}",
+            failed.code
+        );
+    }
+}
+
+/// The name the owner gave this phone in Settings, bounded to the status contract's 256 bytes.
+fn device_name() -> Option<String> {
+    let output = Command::new("/system/bin/settings")
+        .args(["get", "global", "device_name"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let mut name = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    if name.is_empty() || name == "null" {
+        return None;
+    }
+    let mut end = name.len().min(256);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name.truncate(end);
+    Some(name)
 }
 
 pub(crate) fn fixed_property(name: &str) -> Result<String, DomainError> {
@@ -906,8 +815,8 @@ fn spawn_automation_scheduler(
     let scheduler = AutomationScheduler::new(core, Arc::new(BoottimeClock)).reporting_faults(
         Arc::new(|error: &DomainError| {
             eprintln!(
-                "droidbridged: automation scheduler pass failed: {:?} {}",
-                error.code, error.reason
+                "droidbridged: automation scheduler pass failed: {:?} {} errno={:?}",
+                error.code, error.reason, error.os_error
             );
         }),
     );
@@ -1051,7 +960,7 @@ impl FrameworkHelper {
         listener
             .set_nonblocking(true)
             .map_err(|_| io_error("cannot bound helper accept"))?;
-        let jar = module_root.join("framework").join(registry.jar_name());
+        let jar = registry.jar(module_root);
         let listener_fd = listener.as_raw_fd();
         let mut command = Command::new("/system/bin/app_process");
         command
@@ -1136,7 +1045,11 @@ impl FrameworkHelper {
 /// Runs each S-MAGISK-005 family probe once for this helper generation. A failed probe
 /// records only its own family.
 fn probe_families(helper: &FrameworkHelper) -> [bool; 3] {
-    HelperFamily::ALL.map(|family| match family {
+    HelperFamily::ALL.map(|family| probe_family(helper, family))
+}
+
+fn probe_family(helper: &FrameworkHelper, family: HelperFamily) -> bool {
+    match family {
         HelperFamily::Launch => helper
             .connection
             .request(&serde_json::json!({"operation": "probe_launch"}))
@@ -1148,7 +1061,7 @@ fn probe_families(helper: &FrameworkHelper) -> [bool; 3] {
         HelperFamily::Clipboard => {
             run_clipboard_child(&helper.jar, "probe", &serde_json::json!({}), None).is_ok()
         }
-    })
+    }
 }
 
 const fn family_index(family: HelperFamily) -> usize {
@@ -1167,9 +1080,9 @@ impl Drop for FrameworkHelper {
 struct MagiskHostControl {
     store: Arc<StateStore>,
     lease: Arc<LifetimeLease>,
-    capabilities: runtime::ApkCapabilityPort,
     recovery_proof: RecoveryProof,
-    task_activity: Arc<crate::app_keepalive::TaskActivityBeacon>,
+    cleanup_watch: CleanupWatch,
+    capabilities: ApkCapabilityPort,
 }
 
 impl HostControlPort for MagiskHostControl {
@@ -1179,7 +1092,7 @@ impl HostControlPort for MagiskHostControl {
         _execution_id: &UuidV4,
     ) -> Result<(), DomainError> {
         self.activate(fence)?;
-        self.capabilities.withdraw_readiness()
+        self.cleanup_watch.start()
     }
 
     fn prepare(&self) -> Result<(), DomainError> {
@@ -1204,20 +1117,35 @@ impl HostControlPort for MagiskHostControl {
     fn recover(&self, _: &UuidV4) -> Result<RecoveryProof, DomainError> {
         self.store.validate_lease(&self.lease)?;
         if self.recovery_proof == RecoveryProof::CleanupUnverified {
-            self.capabilities.withdraw_readiness()?;
+            self.cleanup_watch.start()?;
         }
         Ok(self.recovery_proof)
     }
 
-    /// The App executes the Android primitives these Tasks need, so the count is carried to it
-    /// and held there. Publishing never fails a committed mutation: the beacon only records the
-    /// count, and the wake it leads to is reported on this daemon's own log.
-    fn task_activity_changed(&self, active_tasks: usize, canonical_revision: u64) {
-        self.task_activity.publish(
-            self.lease.live().runtime_epoch.as_str(),
-            active_tasks as u64,
-            canonical_revision,
+    fn store_write_failed(&self, error: &DomainError) {
+        eprintln!(
+            "droidbridged: canonical commit failed: {:?} {} errno={:?}",
+            error.code, error.reason, error.os_error
         );
+        if let Err(failed) = self.capabilities.withdraw_readiness_as("STORE_UNAVAILABLE") {
+            eprintln!("droidbridged: cannot withdraw readiness: {:?}", failed.code);
+        }
+        if let Err(failed) = self.store.record_store_write_fault(&self.lease) {
+            eprintln!(
+                "droidbridged: cannot record the store fault: {:?}",
+                failed.code
+            );
+        }
+    }
+
+    fn store_write_recovered(&self) {
+        eprintln!("droidbridged: canonical store takes writes again");
+        if let Err(failed) = self
+            .capabilities
+            .restore_readiness_from("STORE_UNAVAILABLE")
+        {
+            eprintln!("droidbridged: cannot restore readiness: {:?}", failed.code);
+        }
     }
 }
 
@@ -1241,7 +1169,7 @@ fn register(
     Ok(())
 }
 
-fn new_uuid() -> Result<UuidV4, DomainError> {
+pub(crate) fn new_uuid() -> Result<UuidV4, DomainError> {
     UuidV4::parse(uuid::Uuid::new_v4().hyphenated().to_string())
         .map_err(|_| DomainError::new(ErrorCode::InternalError, "UUID generation failed"))
 }

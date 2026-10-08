@@ -72,6 +72,38 @@ pub struct FaultFileStore {
     role: FaultRole,
 }
 
+impl crate::StateStore {
+    /// Records that a canonical commit of [lease]'s instance could not be written.
+    pub fn record_store_write_fault(
+        &self,
+        lease: &crate::LifetimeLease,
+    ) -> Result<(), DomainError> {
+        let now = Utc::now();
+        let now_ms = u64::try_from(now.timestamp_millis())
+            .map_err(|_| DomainError::new(ErrorCode::InternalError, "clock is before epoch"))?;
+        let live = lease.live();
+        FaultFileStore::new(self.base_path(), FaultRole::Runtime).append(
+            FaultRecord {
+                record_id: UuidV4::parse(uuid::Uuid::new_v4().hyphenated().to_string()).map_err(
+                    |_| DomainError::new(ErrorCode::InternalError, "UUID generation failed"),
+                )?,
+                at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                component: "runtime_store".to_owned(),
+                code: "STORE_WRITE_FAILED".to_owned(),
+                phase: "commit".to_owned(),
+                product_version: env!("CARGO_PKG_VERSION").to_owned(),
+                boot_id: live.boot_id.clone(),
+                runtime_instance_id: Some(live.runtime_instance_id.clone()),
+                execution_id: None,
+                exit_code: None,
+                signal: None,
+                repeat_count: 1,
+            },
+            now_ms,
+        )
+    }
+}
+
 impl FaultFileStore {
     pub fn new(canonical_base: &Path, role: FaultRole) -> Self {
         Self {

@@ -10,8 +10,7 @@ use contract::{ErrorCode, RunAs, RuntimeHost, RuntimeReadiness, UuidV4};
 use domain::{AdmissionFence, DomainError};
 use persistence::{
     CanonicalState, FaultFileStore, FaultRecord, FaultRole, GuardProofDirectory,
-    JsonPersistencePort, LifetimeLease, PendingDeadOwnerTakeover, RuntimeArtifactPort, RuntimeLive,
-    RuntimeOwner, RuntimeTransitionIntent, StateStore, TransitionRecovery,
+    JsonPersistencePort, LifetimeLease, RuntimeArtifactPort, RuntimeLive, RuntimeOwner, StateStore,
     await_guard_recovery_plan,
 };
 use runtime::{
@@ -72,6 +71,32 @@ impl HostControlPort for AppHostControl {
             self.capabilities.withdraw_readiness()?;
         }
         Ok(self.recovery_proof)
+    }
+
+    fn store_write_failed(&self, error: &DomainError) {
+        eprintln!(
+            "DroidBridge canonical commit failed: {:?} {} errno={:?}",
+            error.code, error.reason, error.os_error
+        );
+        if let Err(failed) = self.capabilities.withdraw_readiness_as("STORE_UNAVAILABLE") {
+            eprintln!("DroidBridge cannot withdraw readiness: {:?}", failed.code);
+        }
+        if let Err(failed) = self.store.record_store_write_fault(&self.lease) {
+            eprintln!(
+                "DroidBridge cannot record the store fault: {:?}",
+                failed.code
+            );
+        }
+    }
+
+    fn store_write_recovered(&self) {
+        eprintln!("DroidBridge: canonical store takes writes again");
+        if let Err(failed) = self
+            .capabilities
+            .restore_readiness_from("STORE_UNAVAILABLE")
+        {
+            eprintln!("DroidBridge: cannot restore readiness: {:?}", failed.code);
+        }
     }
 
     fn task_activity_changed(&self, active_tasks: usize, canonical_revision: u64) {
@@ -141,97 +166,6 @@ pub(super) fn start_host(
         lease,
         boot_id,
         runtime_instance_id,
-        None,
-    )
-}
-
-pub(super) fn recover_dead_magisk_host(
-    base: PathBuf,
-    environment_json: &str,
-) -> Result<StartResult, DomainError> {
-    let mut slot = host_slot()
-        .lock()
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?;
-    if let Some(host) = slot.as_ref() {
-        return existing_host_result(host);
-    }
-    let environment: VerticalEnvironment = serde_json::from_str(environment_json)
-        .map_err(|_| DomainError::invalid("invalid platform environment"))?;
-    let store = Arc::new(StateStore::new(base.clone()));
-    let owner = store.read_owner()?;
-    let observed_transition = store.observe_transition()?;
-    let (intent, resume) = match (owner.host, observed_transition) {
-        (RuntimeHost::MagiskBackend, None) => {
-            let previous_live = read_previous_live(&base)?.ok_or_else(|| {
-                DomainError::new(ErrorCode::IoError, "dead Magisk owner has no live identity")
-            })?;
-            let target_generation = owner.host_generation.checked_add(1).ok_or_else(|| {
-                DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-            })?;
-            (
-                RuntimeTransitionIntent {
-                    schema_version: 1,
-                    transition_id: new_uuid()?,
-                    runtime_epoch: owner.runtime_epoch.clone(),
-                    from_host: owner.host,
-                    from_generation: owner.host_generation,
-                    from_instance_id: previous_live.runtime_instance_id,
-                    target_host: RuntimeHost::ApkRuntime,
-                    target_generation,
-                },
-                false,
-            )
-        }
-        (
-            RuntimeHost::MagiskBackend,
-            Some((TransitionRecovery::RemoveUncommittedIntent, intent)),
-        ) if intent.from_host == RuntimeHost::MagiskBackend
-            && intent.target_host == RuntimeHost::ApkRuntime =>
-        {
-            (intent, false)
-        }
-        (RuntimeHost::ApkRuntime, Some((TransitionRecovery::ActivateCommittedTarget, intent)))
-            if intent.from_host == RuntimeHost::MagiskBackend
-                && intent.target_host == RuntimeHost::ApkRuntime =>
-        {
-            (intent, true)
-        }
-        _ => {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "dead Magisk takeover state is not recoverable",
-            ));
-        }
-    };
-    let boot_id = read_boot_id()?;
-    let runtime_instance_id = new_uuid()?;
-    let target_live = RuntimeLive {
-        runtime_epoch: intent.runtime_epoch.clone(),
-        host: RuntimeHost::ApkRuntime,
-        host_generation: intent.target_generation,
-        runtime_instance_id: runtime_instance_id.clone(),
-        boot_id: boot_id.clone(),
-        pid: std::process::id(),
-        start_ticks: read_start_ticks(Path::new("/proc/self/stat"))?,
-    };
-    let pending = if resume {
-        store.resume_dead_owner_takeover(&intent, target_live, &boot_id, &ProcFacts)?
-    } else {
-        store.begin_dead_owner_takeover(&intent, target_live, &boot_id, &ProcFacts)?
-    };
-    let lease = Arc::clone(pending.lease());
-    FaultFileStore::initialize_all_by_apk(&base)?;
-    let target_owner = store.read_owner()?;
-    activate_app_host(
-        &mut slot,
-        base,
-        environment,
-        store,
-        target_owner,
-        lease,
-        boot_id,
-        runtime_instance_id,
-        Some(pending),
     )
 }
 
@@ -245,20 +179,15 @@ fn activate_app_host(
     lease: Arc<LifetimeLease>,
     boot_id: UuidV4,
     runtime_instance_id: UuidV4,
-    takeover: Option<PendingDeadOwnerTakeover>,
 ) -> Result<StartResult, DomainError> {
-    let recovery = if let Some(pending) = takeover.as_ref() {
-        pending.recovery_plan().clone()
-    } else {
-        let state = store.load(&lease)?;
-        await_guard_recovery_plan(
-            &state,
-            &runtime_instance_id,
-            &boot_id,
-            &GuardProofDirectory::new(&base),
-            &ProcFacts,
-        )?
-    };
+    let state = store.load(&lease)?;
+    let recovery = await_guard_recovery_plan(
+        &state,
+        &runtime_instance_id,
+        &boot_id,
+        &GuardProofDirectory::new(&base),
+        &ProcFacts,
+    )?;
     environment.runtime_epoch = owner.runtime_epoch.clone();
     environment.host_generation = owner.host_generation;
     let product_version = environment.version_name.clone();
@@ -342,10 +271,6 @@ fn activate_app_host(
         &async_runtime,
         &recovery,
     )?;
-    let lease = match takeover {
-        Some(pending) => verification.complete_takeover(&store, pending, &ProcFacts)?,
-        None => lease,
-    };
     let committed = store.load(&lease)?;
     let active_tasks = committed
         .tasks
@@ -530,15 +455,4 @@ fn record_scheduler_fault(
         now_ms,
     )?;
     Ok(())
-}
-
-fn read_previous_live(base: &Path) -> Result<Option<RuntimeLive>, DomainError> {
-    let path = base.join("runtime-live.json");
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|_| DomainError::new(ErrorCode::IoError, "runtime live record is invalid")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(io_error(error)),
-    }
 }

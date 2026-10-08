@@ -122,9 +122,16 @@ where
         outcome: AutomationExecutionOutcome,
         timestamp: String,
     ) -> Result<AutomationExecutionSummary, DomainError> {
-        self.state_transition(|state, _| {
-            settle_automation_in_state(state, execution_id, outcome, &timestamp)
-                .map(|summary| (summary, true))
+        self.until_stored(|| {
+            let outcome = outcome.clone();
+            let timestamp = timestamp.clone();
+            async move {
+                self.state_transition(|state, _| {
+                    settle_automation_in_state(state, execution_id, outcome, &timestamp)
+                        .map(|summary| (summary, true))
+                })
+                .await
+            }
         })
         .await
     }

@@ -15,17 +15,25 @@ use tokio::sync::Semaphore;
 #[derive(Clone, Default)]
 pub struct FakePersistence {
     state: Arc<Mutex<RuntimeState>>,
+    unwritable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FakePersistence {
     pub fn with_state(state: RuntimeState) -> Self {
         Self {
             state: Arc::new(Mutex::new(state)),
+            unwritable: Arc::default(),
         }
     }
 
     pub fn snapshot(&self) -> RuntimeState {
         self.state.lock().expect("fake store lock").clone()
+    }
+
+    /// While set, every commit fails as an I/O fault, as a full or read-only store does.
+    pub fn set_unwritable(&self, unwritable: bool) {
+        self.unwritable
+            .store(unwritable, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -39,6 +47,12 @@ impl PersistencePort for FakePersistence {
         expected_revision: u64,
         candidate: RuntimeState,
     ) -> Result<(), DomainError> {
+        if self.unwritable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::new(
+                ErrorCode::IoError,
+                "fake store unwritable",
+            ));
+        }
         let mut state = self.state.lock().expect("fake store lock");
         if state.revision != expected_revision {
             return Err(DomainError::new(
@@ -373,6 +387,7 @@ pub struct FakeHostControl {
     capabilities: Option<FakeCapabilities>,
     cleanup_reports: Arc<Mutex<Vec<(domain::AdmissionFence, UuidV4)>>>,
     task_activity: Arc<Mutex<Vec<usize>>>,
+    store_write_failures: Arc<Mutex<Vec<DomainError>>>,
 }
 
 impl FakeHostControl {
@@ -382,7 +397,15 @@ impl FakeHostControl {
             capabilities: None,
             cleanup_reports: Arc::default(),
             task_activity: Arc::default(),
+            store_write_failures: Arc::default(),
         }
+    }
+
+    pub fn store_write_failures(&self) -> Vec<DomainError> {
+        self.store_write_failures
+            .lock()
+            .expect("fake store failure lock")
+            .clone()
     }
 
     pub fn with_capabilities(mut self, capabilities: FakeCapabilities) -> Self {
@@ -445,6 +468,25 @@ impl HostControlPort for FakeHostControl {
             self.withdraw_readiness()?;
         }
         Ok(proof)
+    }
+
+    fn store_write_failed(&self, error: &DomainError) {
+        self.store_write_failures
+            .lock()
+            .expect("fake store failure lock")
+            .push(error.clone());
+        let _ = self.withdraw_readiness();
+    }
+
+    fn store_write_recovered(&self) {
+        if let Some(capabilities) = &self.capabilities {
+            capabilities
+                .snapshot
+                .lock()
+                .expect("fake capability lock")
+                .context
+                .readiness = contract::RuntimeReadiness::Ready;
+        }
     }
 
     fn task_activity_changed(&self, active_tasks: usize, _canonical_revision: u64) {

@@ -264,16 +264,15 @@ impl ArtifactStore {
         let target = directory.join(publish.id.as_str());
         let temporary = directory.join(format!(".{}.tmp", publish.id.as_str()));
         let publication = (|| {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(io_error)?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary).map_err(io_error)?;
             file.write_all(&publish.bytes).map_err(io_error)?;
-            crate::atomic::preserve_magisk_file_metadata(
-                &self.base.join("runtime-state.json"),
-                &file,
-            )?;
             file.sync_all().map_err(io_error)?;
             drop(file);
             crate::atomic::replace_file_exclusive(&temporary, &target)?;
@@ -908,10 +907,11 @@ pub(crate) fn sync_directory(path: &std::path::Path) -> Result<(), DomainError> 
 }
 
 pub(crate) fn io_error(error: std::io::Error) -> DomainError {
-    // The public error carries only the code; the OS error is the one fact that tells a denied
-    // label from a full disk, so it goes to stderr, which the root supervisor keeps in its log.
+    // The OS error is the one fact that tells a denied label from a full disk. It travels with
+    // the error and also goes to stderr, which the root supervisor keeps, for the failures no
+    // request reports.
     eprintln!("droidbridge persistence: I/O failed: {error}");
-    DomainError::new(ErrorCode::IoError, "persistence I/O failed")
+    DomainError::os(ErrorCode::IoError, "persistence I/O failed", &error)
 }
 
 #[cfg(test)]

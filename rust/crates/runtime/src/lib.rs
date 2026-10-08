@@ -14,9 +14,11 @@ pub mod fakes;
 mod filesystem;
 mod ingress;
 mod mcp;
+mod mcp_listener;
 mod network;
 mod ports;
 mod state;
+mod tunnel;
 mod vertical;
 mod visual;
 mod visual_input;
@@ -33,11 +35,16 @@ pub use context::*;
 pub use core::*;
 pub use execution::*;
 pub use filesystem::*;
-pub use ingress::submit_public;
+pub use ingress::{ToolFailure, submit_public};
 pub use mcp::*;
+pub use mcp_listener::McpListener;
 pub use network::*;
 pub use ports::*;
 pub use state::*;
+pub use tunnel::{
+    TunnelClient, TunnelError, TunnelRuntime, read_bounded, tunnel_transport,
+    validate_tunnel_credentials,
+};
 pub use vertical::*;
 pub use visual::*;
 pub use visual_input::*;

@@ -34,10 +34,9 @@ use std::{
     time::Duration as StdDuration,
 };
 
-/// The APK surface owns `app` and `shell`; the Magisk surface owns `root` and forwards the
-/// other two (S-AUTH-CMD-001).
+/// The APK surface owns `app` and `shell`; the root edition's Magisk surface owns `root` alone.
 static APK_IDENTITIES: [RunAs; 2] = [RunAs::App, RunAs::Shell];
-static MAGISK_IDENTITIES: [RunAs; 3] = [RunAs::Root, RunAs::App, RunAs::Shell];
+static MAGISK_IDENTITIES: [RunAs; 1] = [RunAs::Root];
 
 const APK_INSTANCE: u64 = 0x11;
 const MAGISK_INSTANCE: u64 = 0x22;
@@ -167,11 +166,12 @@ fn provider_generation(facts: Facts, provider: ProviderToken) -> u64 {
     }
 }
 
-fn provider_of(run_as: RunAs) -> ProviderToken {
-    match run_as {
-        RunAs::App => ProviderToken::AppNative,
-        RunAs::Shell => ProviderToken::Shizuku,
-        RunAs::Root => ProviderToken::MagiskNative,
+/// The identity each host runs as itself, which the shared semantics are compared through.
+fn native_identity(facts: Facts) -> RunAs {
+    if facts.host == RuntimeHost::MagiskBackend {
+        RunAs::Root
+    } else {
+        RunAs::App
     }
 }
 
@@ -224,7 +224,7 @@ fn mismatched(
     provider: ProviderToken,
     instance: u64,
 ) -> AdmittedExecution {
-    let mut execution = admitted(facts, &run_call(RunAs::App, false), instance);
+    let mut execution = admitted(facts, &run_call(native_identity(facts), false), instance);
     execution.payload = ExecutionPayload::CommandCall(call.clone());
     execution.executor.provider = provider;
     execution
@@ -396,6 +396,15 @@ fn comparable(value: &serde_json::Value) -> serde_json::Value {
     value
 }
 
+/// The result without the identity fields, which differ by host while every other field must not.
+fn without_identity(mut value: serde_json::Value) -> serde_json::Value {
+    let object = value.as_object_mut().expect("command result is an object");
+    for key in ["requested_run_as", "actual_run_as", "execution_class"] {
+        object.remove(key);
+    }
+    value
+}
+
 /// Gate 01: both host Command surfaces project one public result and error semantics.
 #[tokio::test]
 async fn i8_cmd_g01_both_host_surfaces_share_one_public_result_and_error_semantics() {
@@ -418,9 +427,10 @@ async fn i8_cmd_g01_both_host_surfaces_share_one_public_result_and_error_semanti
         let apk_port = ScriptedPort::new();
         apk_port.script(run_as, Ok(scripted.clone()));
         let magisk_port = ScriptedPort::new();
-        magisk_port.script(run_as, Ok(scripted.clone()));
+        magisk_port.script(RunAs::Root, Ok(scripted.clone()));
 
         let call = run_call(run_as, false);
+        let root_call = run_call(RunAs::Root, false);
         let apk_surface = surface(apk_capabilities(), &APK_IDENTITIES, apk_port.clone());
         let magisk_surface = surface(
             magisk_capabilities(),
@@ -429,12 +439,12 @@ async fn i8_cmd_g01_both_host_surfaces_share_one_public_result_and_error_semanti
         );
 
         let from_apk = start(&apk_surface, admitted(apk, &call, 1)).await.unwrap();
-        let from_magisk = start(&magisk_surface, admitted(magisk, &call, 2))
+        let from_magisk = start(&magisk_surface, admitted(magisk, &root_call, 2))
             .await
             .unwrap();
         assert_eq!(
-            comparable(public_result(&from_apk)),
-            comparable(public_result(&from_magisk)),
+            without_identity(comparable(public_result(&from_apk))),
+            without_identity(comparable(public_result(&from_magisk))),
             "the two host surfaces diverged on the public result for {run_as:?}"
         );
 
@@ -470,10 +480,10 @@ async fn i8_cmd_g01_both_host_surfaces_share_one_public_result_and_error_semanti
 
         // The program, the argv and every remaining bound are fixed by the shared handler
         // on both surfaces, so neither host can reinterpret the shell text.
-        for port in [apk_port, magisk_port] {
+        for (port, identity) in [(apk_port, run_as), (magisk_port, RunAs::Root)] {
             let requests = port.requests();
             assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0].run_as, run_as);
+            assert_eq!(requests[0].run_as, identity);
             assert_eq!(requests[0].program, "/system/bin/sh");
             assert_eq!(requests[0].arguments, vec!["-c", "printf 'hello'"]);
             assert_eq!(requests[0].cwd.as_deref(), Some("/data/local/tmp"));
@@ -487,6 +497,7 @@ async fn i8_cmd_g01_both_host_surfaces_share_one_public_result_and_error_semanti
     // structured failure on both surfaces and never a terminal command result.
     for run_as in [RunAs::App, RunAs::Shell] {
         let call = run_call(run_as, false);
+        let root_call = run_call(RunAs::Root, false);
         let unverified_causes = [CommandProcessCause::Exited, CommandProcessCause::OwnerLost];
         for cause in unverified_causes {
             let unverified = CommandProcessSettlement {
@@ -496,13 +507,13 @@ async fn i8_cmd_g01_both_host_surfaces_share_one_public_result_and_error_semanti
             let apk_port = ScriptedPort::new();
             apk_port.script(run_as, Ok(unverified.clone()));
             let magisk_port = ScriptedPort::new();
-            magisk_port.script(run_as, Ok(unverified));
+            magisk_port.script(RunAs::Root, Ok(unverified));
             let apk_surface = surface(apk_capabilities(), &APK_IDENTITIES, apk_port);
             let magisk_surface = surface(magisk_capabilities(), &MAGISK_IDENTITIES, magisk_port);
             let from_apk = start(&apk_surface, admitted(apk, &call, 3))
                 .await
                 .unwrap_err();
-            let from_magisk = start(&magisk_surface, admitted(magisk, &call, 4))
+            let from_magisk = start(&magisk_surface, admitted(magisk, &root_call, 4))
                 .await
                 .unwrap_err();
             assert_eq!(from_apk.error.code, ErrorCode::IoError);
@@ -520,11 +531,11 @@ async fn i8_cmd_g01_both_host_surfaces_share_one_public_result_and_error_semanti
         let apk_port = ScriptedPort::new();
         apk_port.script(run_as, Ok(unverified.clone()));
         let magisk_port = ScriptedPort::new();
-        magisk_port.script(run_as, Ok(unverified));
+        magisk_port.script(RunAs::Root, Ok(unverified));
         let apk_surface = surface(apk_capabilities(), &APK_IDENTITIES, apk_port);
         let magisk_surface = surface(magisk_capabilities(), &MAGISK_IDENTITIES, magisk_port);
         let from_apk = start(&apk_surface, admitted(apk, &call, 7)).await.unwrap();
-        let from_magisk = start(&magisk_surface, admitted(magisk, &call, 8))
+        let from_magisk = start(&magisk_surface, admitted(magisk, &root_call, 8))
             .await
             .unwrap();
         for completion in [&from_apk, &from_magisk] {
@@ -618,21 +629,15 @@ async fn i8_cmd_g02_requested_and_actual_identity_are_exact_on_each_surface() {
         assert_eq!(port.requests()[0].run_as, run_as);
     }
 
-    // The Magisk surface forwards the two APK identities with their own execution class
-    // instead of reporting its own.
-    for (run_as, class) in [(RunAs::App, "app"), (RunAs::Shell, "shizuku")] {
-        let call = run_call(run_as, false);
-        let port = ScriptedPort::new();
-        port.script(run_as, Ok(exited(0)));
-        let runner = surface(magisk_capabilities(), &MAGISK_IDENTITIES, port);
-        let result =
-            public_result(&start(&runner, admitted(magisk, &call, 11)).await.unwrap()).clone();
+    // `app` and `shell` are unavailable on the root edition's Magisk surface, refused rather
+    // than run as root.
+    for run_as in [RunAs::App, RunAs::Shell] {
         assert_eq!(
-            result["requested_run_as"],
-            format!("{run_as:?}").to_lowercase()
+            command_executor_request(&capability(magisk), &run_call(run_as, false))
+                .unwrap_err()
+                .code,
+            ErrorCode::RunAsUnavailable
         );
-        assert_eq!(result["actual_run_as"], result["requested_run_as"]);
-        assert_eq!(result["execution_class"], class);
     }
 
     // `root` is unavailable on the APK surface, and it is refused rather than falling
@@ -659,15 +664,15 @@ async fn i8_cmd_g02_requested_and_actual_identity_are_exact_on_each_surface() {
     let mismatches = [
         (apk, run_call(RunAs::App, false), ProviderToken::Shizuku, 13),
         (
-            magisk,
+            apk,
             run_call(RunAs::App, false),
             ProviderToken::MagiskNative,
             14,
         ),
         (
             magisk,
-            run_call(RunAs::Shell, false),
-            ProviderToken::AppNative,
+            run_call(RunAs::Root, false),
+            ProviderToken::Shizuku,
             15,
         ),
         (
@@ -703,22 +708,19 @@ async fn i8_cmd_g03_shizuku_is_only_the_apk_surfaces_shell_primitive_provider() 
     let apk = apk_facts(APK_INSTANCE);
     let magisk = magisk_facts(MAGISK_INSTANCE);
 
-    // `run_as=shell` admits the Shizuku provider on both hosts, and nothing else.
-    for facts in [apk, magisk] {
-        let execution = admitted(facts, &run_call(RunAs::Shell, false), 20);
-        assert_eq!(execution.executor.provider, ProviderToken::Shizuku);
-        assert_eq!(execution.executor.execution_class, ExecutionClass::Shizuku);
-        assert_eq!(
-            execution.executor.capability_generation,
-            provider_generation(facts, ProviderToken::Shizuku)
-        );
-    }
+    // `run_as=shell` admits the Shizuku provider on the APK host, and nothing else.
+    let execution = admitted(apk, &run_call(RunAs::Shell, false), 20);
+    assert_eq!(execution.executor.provider, ProviderToken::Shizuku);
+    assert_eq!(execution.executor.execution_class, ExecutionClass::Shizuku);
+    assert_eq!(
+        execution.executor.capability_generation,
+        provider_generation(apk, ProviderToken::Shizuku)
+    );
 
-    // Without `shizuku.shell`, `run_as=shell` is unavailable even where `root` is
-    // available: the Magisk surface never impersonates the shell identity itself.
+    // Without `shizuku.shell`, `run_as=shell` is unavailable on the APK host.
     let without_shizuku = Facts {
         shizuku: CapabilityState::Unavailable,
-        ..magisk
+        ..apk
     };
     assert_eq!(
         command_executor_request(&capability(without_shizuku), &run_call(RunAs::Shell, false))
@@ -726,48 +728,15 @@ async fn i8_cmd_g03_shizuku_is_only_the_apk_surfaces_shell_primitive_provider() 
             .code,
         ErrorCode::CapabilityUnavailable
     );
-    assert!(
-        command_executor_request(&capability(without_shizuku), &run_call(RunAs::Root, false))
-            .is_ok()
-    );
 
-    // Without `execution.app_guard` (and therefore no live App execution surface),
-    // `run_as=app` is unavailable even though the root provider is available.
-    let without_app = Facts {
-        app_native: CapabilityState::Unavailable,
-        app_execution_surface: CapabilityState::Unavailable,
-        ..magisk
-    };
+    // The root host never impersonates the shell identity, even with Shizuku facts present.
     assert_eq!(
-        command_executor_request(&capability(without_app), &run_call(RunAs::App, false))
+        command_executor_request(&capability(magisk), &run_call(RunAs::Shell, false))
             .unwrap_err()
             .code,
-        ErrorCode::CapabilityUnavailable
+        ErrorCode::RunAsUnavailable
     );
-    assert!(
-        command_executor_request(&capability(without_app), &run_call(RunAs::Root, false)).is_ok()
-    );
-
-    // Withdrawing a forwarded identity's authority after admission is stale authority
-    // rather than a fallback to `root`, which is still available on that host.
-    for run_as in [RunAs::App, RunAs::Shell] {
-        let withdrawn = Facts {
-            app_native: CapabilityState::Unavailable,
-            app_execution_surface: CapabilityState::Unavailable,
-            shizuku: CapabilityState::Unavailable,
-            ..magisk
-        };
-        let port = ScriptedPort::new();
-        port.script(run_as, Ok(exited(0)));
-        port.script(RunAs::Root, Ok(exited(0)));
-        let runner = surface(capabilities_of(withdrawn), &MAGISK_IDENTITIES, port.clone());
-        let call = run_call(run_as, false);
-        let execution = admitted(magisk, &call, 21);
-        assert_eq!(execution.executor.provider, provider_of(run_as));
-        let failure = start(&runner, execution).await.unwrap_err();
-        assert_eq!(failure.error.code, ErrorCode::StaleAuthority);
-        assert!(port.requests().is_empty());
-    }
+    assert!(command_executor_request(&capability(magisk), &run_call(RunAs::Root, false)).is_ok());
 
     // No host surface realizes `Shizuku` for a non-shell identity, and the APK surface
     // realizes neither `root` nor a Shizuku identity it was not admitted for.
@@ -812,19 +781,12 @@ async fn i8_cmd_g03_shizuku_is_only_the_apk_surfaces_shell_primitive_provider() 
     // stale `shizuku.shell` generation is stale authority rather than a fresh primitive.
     let port = ScriptedPort::new();
     port.script(RunAs::Shell, Ok(exited(0)));
-    let mut stale = capability(magisk);
+    let mut stale = capability(apk);
     stale.resolver_facts.generations.shizuku += 1;
-    let runner = surface(
-        FakeCapabilities::new(stale),
-        &MAGISK_IDENTITIES,
-        port.clone(),
-    );
-    let failure = start(
-        &runner,
-        admitted(magisk, &run_call(RunAs::Shell, false), 26),
-    )
-    .await
-    .unwrap_err();
+    let runner = surface(FakeCapabilities::new(stale), &APK_IDENTITIES, port.clone());
+    let failure = start(&runner, admitted(apk, &run_call(RunAs::Shell, false), 26))
+        .await
+        .unwrap_err();
     assert_eq!(failure.error.code, ErrorCode::StaleAuthority);
     assert!(port.requests().is_empty());
 }
@@ -839,7 +801,7 @@ async fn i8_cmd_g04_cancellation_reaches_the_runner_and_emits_no_competing_resul
     for facts in [apk, magisk] {
         let port = ScriptedPort::new();
         port.hold();
-        let call = run_call(RunAs::App, false);
+        let call = run_call(native_identity(facts), false);
         let execution = admitted(facts, &call, 31);
         let execution_id = execution.execution_id.clone();
         let runner = Arc::new(surface(
@@ -948,7 +910,7 @@ async fn i8_cmd_g04_retained_output_has_one_artifact_owner_beyond_the_inline_bou
         let artifacts = FakeArtifacts::default();
         let port = ScriptedPort::new();
         port.script(
-            RunAs::App,
+            native_identity(facts),
             Ok(CommandProcessSettlement {
                 outcome: CommandProcessOutcome {
                     cause: CommandProcessCause::Exited,
@@ -967,7 +929,7 @@ async fn i8_cmd_g04_retained_output_has_one_artifact_owner_beyond_the_inline_bou
             identities_of(facts),
             port,
         );
-        let call = run_call(RunAs::App, false);
+        let call = run_call(native_identity(facts), false);
         let execution = admitted(facts, &call, 40);
         let execution_id = execution.execution_id.clone();
         let completion = start(&runner, execution).await.unwrap();
@@ -1178,4 +1140,86 @@ async fn i8_cmd_g04_cleanup_uncertainty_is_explicit_for_sync_and_task_results() 
         serde_json::to_value(task_error).unwrap()["details"]["cleanup_unverified"],
         true
     );
+}
+
+/// A failure below the Runtime reaches the caller with the step that failed and the system's
+/// own error, and unprovable cleanup keeps them beside its own marker.
+#[tokio::test]
+async fn i8_cmd_g04_failures_carry_their_step_and_system_error() {
+    let facts = apk_facts(APK_INSTANCE);
+    let os_error = std::io::Error::from_raw_os_error(2).to_string();
+    for (cleanup_verified, code) in [
+        (true, ErrorCode::ExecutionFailed),
+        (false, ErrorCode::IoError),
+    ] {
+        let capabilities = capabilities_of(facts);
+        let executions = FakeExecutions::default();
+        let host =
+            FakeHostControl::new(RecoveryProof::Clean).with_capabilities(capabilities.clone());
+        let core = RuntimeCore::new(
+            FakePersistence::default(),
+            FakeArtifacts::default(),
+            executions.clone(),
+            capabilities,
+            host,
+        );
+        let mut cause = DomainError::os(
+            ErrorCode::ExecutionFailed,
+            "cannot launch the execution guard",
+            &std::io::Error::from_raw_os_error(2),
+        );
+        cause.peer_reason = Some("cannot create command pipe".to_owned());
+        executions.push(Err(ExecutionFailure {
+            error: cause,
+            cleanup_verified,
+        }));
+        let error = core
+            .run_synchronous(
+                SynchronousAdmission {
+                    request_id: uuid(0x8710_0000, 1),
+                    payload_sha256: "33".repeat(32),
+                    execution_id: uuid(0x8710_0000, 2),
+                    operation: "command.run".to_owned(),
+                    route: ExecutorRequest::Command(RunAs::App),
+                    payload: ExecutionPayload::CommandCall(run_call(RunAs::App, false)),
+                    settlement_bound_bytes: RESERVE_FLOOR_BYTES,
+                    now_ms: 1,
+                },
+                "2026-09-13T00:00:00.000Z".to_owned(),
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, code);
+        let details = &serde_json::to_value(&error).unwrap()["details"];
+        assert_eq!(details["reason"], "cannot launch the execution guard");
+        assert_eq!(details["os_error"], os_error.as_str());
+        assert_eq!(details["peer_reason"], "cannot create command pipe");
+        assert_eq!(
+            details.get("cleanup_unverified").is_some(),
+            !cleanup_verified
+        );
+    }
+}
+
+#[test]
+fn i8_cmd_published_input_limits_are_the_enforced_ones() {
+    let schema = serde_json::to_value(schemars::schema_for!(contract::CommandRunInput)).unwrap();
+    let described = |field: &str| {
+        schema["properties"][field]["description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(described("command").contains(&format!(
+        "at most {} bytes",
+        runtime::COMMAND_MAX_COMMAND_BYTES
+    )));
+    assert!(
+        described("cwd").contains(&format!("at most {} bytes", runtime::COMMAND_MAX_CWD_BYTES))
+    );
+    assert!(described("stdin").contains(&format!(
+        "at most {} bytes",
+        runtime::COMMAND_MAX_STDIN_BYTES
+    )));
 }

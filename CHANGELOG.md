@@ -1,5 +1,145 @@
 # Changelog / 更新日志
 
+## 0.5.1
+
+### English
+
+**Changed**
+- Status now reports the phone's name (the device name set in Android Settings, else its model) as
+  `device.name`, so several phones connected to one ChatGPT account can be told apart. The ChatGPT
+  setup page suggests this name for the plugin instead of the fixed `DroidBridge`.
+- The command tool's schema now says that the default timeout is 30 seconds (root allows up to one
+  hour), that `as_task` suits long work, and that every process a command starts, background ones
+  included, ends with the command.
+
+**Fixed**
+- When the Runtime's store could not be written for a moment while a task or automation was
+  finishing, the task stayed `running` and the Runtime stayed `STORE_UNAVAILABLE` until it was
+  restarted. The finished result is now written again until the store takes it, after which the
+  Runtime is ready again by itself.
+- In the root edition, one denied launch, clipboard or notification call marked that whole function
+  family unavailable until the backend restarted. A denial now only answers that call; the family is
+  checked again at once and stays available unless the check fails too, and a family whose check
+  failed is checked again every minute.
+- Wake alarm and store write failures in the root edition's log now include the system error number.
+
+### 中文
+
+**变更**
+- 状态中新增 `device.name`，即手机名称（Android 设置中的设备名称，未设置时为型号），同一个 ChatGPT 账号连接多台手机时可以区分。
+  ChatGPT 设置页建议的插件名称改为这个手机名称，不再固定为 `DroidBridge`。
+- 命令工具的说明现在写明：默认超时 30 秒（Root 最长一小时）；耗时的工作适合用 `as_task`；命令启动的所有进程（包括后台进程）都会随命令结束。
+
+**修复**
+- 任务或自动化结束时，如果 Runtime 的存储恰好暂时无法写入，任务会一直停在 `running`，Runtime 也一直是 `STORE_UNAVAILABLE`，
+  只能重启恢复。现在结束结果会重试写入直到存储恢复，之后 Runtime 自动回到就绪。
+- Root 版中，启动、剪贴板或通知只要被拒绝一次，整个功能族就会被标为不可用，直到后端重启。现在一次拒绝只影响那一次调用：
+  会立即重新检测该功能族，只有检测也失败才标为不可用；检测失败的功能族每分钟重新检测一次。
+- Root 版日志中的唤醒闹钟和存储写入失败现在附带系统错误码。
+
+## 0.5.0
+
+### English
+
+**Changed**
+- DroidBridge now comes in two editions, released separately at the same version:
+  - **DroidBridge** is the app for phones without root. It runs everything itself, uses Shizuku
+    when it is running, and updates itself from its Updates page. Releases are tagged
+    `apk-v<version>`.
+  - **The root edition** is a module for Magisk, KernelSU or APatch. Its backend runs as root on
+    its own, serves ChatGPT and local MCP itself and starts at boot without any app. Installing the
+    module also installs the **DroidBridge Root** app, which shows the backend's state and settings
+    but runs nothing itself. Module updates come through the root manager. Releases are tagged
+    `magisk-v<version>`.
+- Both editions are new packages, so settings, tasks and automations from 0.4.x are not carried
+  over. Uninstall the 0.4.x app before installing either edition; it would otherwise offer to put
+  its own module back. Then set up the ChatGPT tunnel and local MCP again.
+- The root edition serves local MCP on port 8766, so it can run next to DroidBridge on 8765.
+- In the root edition, commands run as root only; `run_as` `app` and `shell` report
+  `RUN_AS_UNAVAILABLE`.
+
+- Tapping right after reading the screen works on pages that keep changing (rotating banners,
+  changing hints, running timers). A tap now checks only the app in front and the element it aims
+  at; a change to that element, something covering it, another window or a new display still
+  refuses it. A stale reference is now reported as retryable and says what changed.
+- DroidBridge reads only what is on screen, as the root edition does, so long pages no longer use
+  up the node budget with content off screen.
+
+**Fixed**
+- Once a request had expired, its record could make every later change to the Runtime's store fail
+  with `IO_ERROR` until the Runtime data was reset. Expired requests are now cleared first, and a
+  store that cannot be written takes the Runtime out of ready with `STORE_UNAVAILABLE` instead of
+  leaving it ready while every call fails.
+- Reading a file with more than 16 KB returned inline, including the default 64 KB read, failed
+  with `RESOURCE_LIMIT`.
+- In DroidBridge, creating a file that already exists reported `CAPABILITY_UNAVAILABLE` instead of
+  `ALREADY_EXISTS`.
+- Shell commands through Shizuku longer than 16 KB failed, although commands up to 32 KB are allowed.
+- The root edition could not read the screen while it kept changing (for example a running
+  stopwatch); it now reads it as it is.
+- `resources/read` on a capture reference now says to use the network capture reader, and the
+  command tool's schema states its size limits.
+
+### 中文
+
+**变更**
+- 卓爱桥现在分为两个版本，以相同版本号分别发布：
+  - **卓爱桥** 是面向未 Root 手机的 App，自己完成所有工作；Shizuku 运行时会使用 Shizuku，并在「更新」页自行更新。
+    发布标签为 `apk-v<版本>`。
+  - **Root 版** 是适用于 Magisk、KernelSU 或 APatch 的模块。它的后端以 Root 身份独立运行，直接提供 ChatGPT 和本地 MCP，
+    开机自启，不依赖任何 App。安装模块时会一并安装 **DroidBridge Root** App，用于查看后端状态和修改设置，本身不承担运行。
+    模块更新由 Root 管理器提供。发布标签为 `magisk-v<版本>`。
+- 两个版本都是新的应用包，0.4.x 的设置、任务和自动化不会迁移。安装任一版本前请先卸载 0.4.x 的 App，否则它会提示装回它自带的模块；
+  之后重新设置 ChatGPT 隧道和本地 MCP。
+- Root 版的本地 MCP 使用 8766 端口，可以和使用 8765 端口的卓爱桥同时运行。
+- Root 版只以 Root 身份运行命令；`run_as` 为 `app` 或 `shell` 时返回 `RUN_AS_UNAVAILABLE`。
+
+- 在一直变化的页面上（轮播广告、变化的提示词、正在走的计时器），读屏后立即点击不再被判过期。点击现在只核对前台 App 和要点的那个元素；
+  该元素本身变了、被遮挡、换了窗口或显示参数变了，仍会拒绝。过期错误现在标为可重试，并说明是什么变了。
+- 卓爱桥读屏只返回屏幕上可见的内容（与 Root 版一致），长页面不再被屏幕外的节点占满节点预算。
+
+**修复**
+- 某个请求过期后，它的记录可能让运行时存储之后的每次修改都失败并报 `IO_ERROR`，直到重置运行时数据。现在会先清理过期请求；
+  存储无法写入时，运行时会以 `STORE_UNAVAILABLE` 退出就绪状态，而不是保持就绪却让每次调用都失败。
+- 读取文件时内联返回超过 16 KB（包括默认的 64 KB）会报 `RESOURCE_LIMIT`。
+- 卓爱桥中创建已存在的文件时报 `CAPABILITY_UNAVAILABLE`，现在报 `ALREADY_EXISTS`。
+- 通过 Shizuku 运行超过 16 KB 的 shell 命令会失败，而接口允许最长 32 KB。
+- Root 版在屏幕持续变化时（例如秒表在走）读不到屏幕元素，现在会按当前画面读取。
+- 对抓包引用调用 `resources/read` 时会提示改用网络抓包读取；命令工具的 schema 写明了大小上限。
+
+## 0.4.3
+
+### English
+
+**New**
+- Opening the app checks that the installed root module matches the app. When it does not, the app
+  offers to install the module it carries. Updates now installs the app only; the module comes
+  inside it.
+- Errors say what failed. A failed call names the step that failed and, when the system refused
+  it, the system's own error; a command run as the App also reports the App's step. A command that
+  could not be started reports `EXECUTION_FAILED` and running out of files, memory or storage
+  reports `RESOURCE_LIMIT`, instead of `IO_ERROR` for everything.
+
+**Fixed**
+- When a command's cleanup could not be confirmed, the root backend stayed unavailable until it
+  was restarted by hand. It now shows that it is recovering and comes back by itself once cleanup
+  is confirmed; if cleanup can never be confirmed, it says a reboot is needed.
+- The root backend could stay unavailable after it restarted while the app was finishing a command.
+- Some calls replaced the details of a failure with a generic message.
+
+### 中文
+
+**新增**
+- 打开应用时会检查已安装的 Root 模块是否与应用版本一致，不一致时直接提示安装应用内置的模块。「更新」页现在只更新应用，模块随应用一起提供。
+- 报错会说明哪里出错：失败时会给出出错的步骤，系统拒绝时附带系统给出的错误；以 App 身份运行的命令也会带上 App 端的出错步骤。
+  命令未能启动时报 `EXECUTION_FAILED`，文件句柄、内存或存储耗尽时报 `RESOURCE_LIMIT`，不再一律报 `IO_ERROR`。
+
+**修复**
+- 某条命令的清理无法确认后，Root 后端会一直不可用，只能手动重启。现在会显示「正在自动恢复」，确认清理完成后自动恢复；
+  如果清理永远无法确认，会提示需要重启手机。
+- Root 后端在应用正好结束一条命令时重启，可能一直停在不可用。
+- 部分调用失败时，具体原因被替换成笼统的提示。
+
 ## 0.4.2
 
 ### English

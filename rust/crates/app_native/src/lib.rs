@@ -8,10 +8,11 @@ mod command;
 mod guard;
 mod mcp_listener;
 mod network;
+mod remote_relay;
 mod tunnel;
 mod visual;
 
-use app_host::{AppHostControl, recover_dead_magisk_host, start_host};
+use app_host::{AppHostControl, start_host};
 
 #[cfg(target_os = "android")]
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -40,8 +41,7 @@ use persistence::await_guard_recovery_plan;
 use persistence::{
     CanonicalState, FIXTURE_2_MIB, FIXTURE_8_MIB, FaultFileStore, FaultRecord, FaultRole,
     JsonPersistencePort, LifetimeLease, ProcessFacts, RuntimeArtifactPort, RuntimeLive,
-    RuntimeOwner, RuntimeTransitionIntent, StateStore, TransitionRecovery, decode_canonical_state,
-    read_json, realistic_store_fixture,
+    RuntimeOwner, StateStore, decode_canonical_state, realistic_store_fixture,
 };
 #[cfg(unix)]
 use persistence::{GuardIdentity, GuardRecovery, classify_guard_proof, encode_guard_frame};
@@ -137,7 +137,8 @@ fn validate_shizuku_arguments(
     arguments
         .iter()
         .try_fold(0_usize, |total, argument| {
-            if argument.len() > 16_384 || argument.contains('\0') {
+            // A shell command is one argument, and the Command contract admits it up to its bound.
+            if argument.len() > runtime::COMMAND_MAX_COMMAND_BYTES || argument.contains('\0') {
                 None
             } else {
                 total.checked_add(argument.len())
@@ -930,22 +931,6 @@ struct StartResult {
 
 #[derive(Serialize)]
 #[serde(deny_unknown_fields)]
-struct TransitionPrepareResult {
-    prepared: bool,
-    store_revision: u64,
-    intent: RuntimeTransitionIntent,
-}
-
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
-struct RemoteTransitionPrepareResult {
-    prepared: bool,
-    recovery: bool,
-    intent: RuntimeTransitionIntent,
-}
-
-#[derive(Serialize)]
-#[serde(deny_unknown_fields)]
 struct DeviceBenchmarkResult {
     two_mib_p95_ms: u64,
     two_mib_p99_ms: u64,
@@ -967,7 +952,7 @@ fn initialize_android_execution_dispatcher(env: &mut Env<'_>) -> jni::errors::Re
         return Ok(());
     }
     let class = env.find_class(jni_str!(
-        "com/droidbridge/android/execution/android/NativeAndroidExecutionDispatcher"
+        "com/droidbridge/standalone/execution/android/NativeAndroidExecutionDispatcher"
     ))?;
     let global = env.new_global_ref(class)?;
     let _ = ANDROID_EXECUTION_DISPATCHER.set(global);
@@ -1073,11 +1058,14 @@ fn dispatch_android_execution_for_with_descriptor(
             )
         })
         .map_err(|_| DomainError::new(ErrorCode::IoError, "Android execution bridge failed"))?;
-    if let Some(error_code) = error_code {
-        return Err(DomainError::new(
-            android_execution_error_code(&error_code),
-            "Android execution adapter rejected the request",
-        ));
+    if let Some((error_code, error_reason)) = error_code {
+        return Err(DomainError {
+            peer_reason: error_reason,
+            ..DomainError::new(
+                android_execution_error_code(&error_code),
+                "Android execution adapter rejected the request",
+            )
+        });
     }
     result.ok_or_else(|| {
         DomainError::new(
@@ -1101,6 +1089,10 @@ fn dispatch_android_execution_for_with_descriptor(
     ))
 }
 
+/// The error code a Kotlin executor answered, with the step it names when it named one.
+#[cfg(target_os = "android")]
+type AndroidExecutionError = (String, Option<String>);
+
 #[cfg(target_os = "android")]
 fn dispatch_android_execution_jni(
     env: &mut Env<'_>,
@@ -1110,7 +1102,10 @@ fn dispatch_android_execution_jni(
     payload: &[u8],
     execution: &AdmittedExecution,
     descriptor: Option<(&str, i32)>,
-) -> jni::errors::Result<(Option<String>, Option<AndroidPrimitiveResult>)> {
+) -> jni::errors::Result<(
+    Option<AndroidExecutionError>,
+    Option<AndroidPrimitiveResult>,
+)> {
     let key = env.new_string(key)?;
     let primitive = env.new_string(primitive)?;
     let payload = env.byte_array_from_slice(payload)?;
@@ -1127,7 +1122,7 @@ fn dispatch_android_execution_jni(
         env.call_static_method(
             &**dispatcher,
             jni_str!("executeWithDescriptor"),
-            jni_sig!("(Ljava/lang/String;JLjava/lang/String;[BLjava/lang/String;Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;I)Lcom/droidbridge/android/execution/android/AndroidExecutionResult;"),
+            jni_sig!("(Ljava/lang/String;JLjava/lang/String;[BLjava/lang/String;Ljava/lang/String;JLjava/lang/String;Ljava/lang/String;I)Lcom/droidbridge/standalone/execution/android/AndroidExecutionResult;"),
             &[
                 JValue::Object(key.as_ref()),
                 JValue::Long(generation),
@@ -1145,7 +1140,7 @@ fn dispatch_android_execution_jni(
         env.call_static_method(
             &**dispatcher,
             jni_str!("execute"),
-            jni_sig!("(Ljava/lang/String;JLjava/lang/String;[BLjava/lang/String;Ljava/lang/String;JLjava/lang/String;)Lcom/droidbridge/android/execution/android/AndroidExecutionResult;"),
+            jni_sig!("(Ljava/lang/String;JLjava/lang/String;[BLjava/lang/String;Ljava/lang/String;JLjava/lang/String;)Lcom/droidbridge/standalone/execution/android/AndroidExecutionResult;"),
             &[
                 JValue::Object(key.as_ref()),
                 JValue::Long(generation),
@@ -1170,14 +1165,32 @@ fn dispatch_android_execution_jni(
             &[],
         )?
         .into_object()?;
-    let error_code = if error.is_null() {
-        None
-    } else {
-        let error = env.cast_local::<JString>(error)?;
-        Some(error.mutf8_chars(env)?.to_str().into_owned())
-    };
-    if error_code.is_some() {
-        return Ok((error_code, None));
+    if !error.is_null() {
+        let code = env
+            .cast_local::<JString>(error)?
+            .mutf8_chars(env)?
+            .to_str()
+            .into_owned();
+        // The step the Kotlin executor names, so two failures sharing a code stay distinct.
+        let reason = env
+            .call_method(
+                &result,
+                jni_str!("getErrorReason"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )?
+            .into_object()?;
+        let reason = if reason.is_null() {
+            None
+        } else {
+            Some(
+                env.cast_local::<JString>(reason)?
+                    .mutf8_chars(env)?
+                    .to_str()
+                    .into_owned(),
+            )
+        };
+        return Ok((Some((code, reason)), None));
     }
     let payload = env
         .call_method(&result, jni_str!("getPayload"), jni_sig!("()[B"), &[])?
@@ -1252,7 +1265,7 @@ fn host_slot() -> &'static Mutex<Option<Arc<NativeHost>>> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeStart(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeStart(
     mut env: EnvUnowned,
     _class: JClass,
     canonical_base: JString,
@@ -1282,35 +1295,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeRecoverDeadMagiskHost(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-    environment_json: JString,
-) -> jstring {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jstring> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let environment = environment_json.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded = match recover_dead_magisk_host(PathBuf::from(base), &environment) {
-                Ok(value) => serde_json::to_string(&value),
-                Err(error) => serde_json::to_string(&serde_json::json!({
-                    "ready": false,
-                    "code": error_code_token(error.code),
-                })),
-            }
-            .unwrap_or_else(|_| "{\"ready\":false,\"code\":\"INTERNAL_ERROR\"}".to_owned());
-            Ok(owned.new_string(encoded)?.into_raw())
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeSubmit(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeSubmit(
     mut env: EnvUnowned,
     _class: JClass,
     envelope: JByteArray,
@@ -1367,7 +1352,7 @@ fn submit_apk_public(host: &NativeHost, encoded: &[u8]) -> Result<Vec<u8>, Domai
 /// is the host payload; a `read` also stores its one read-only descriptor in `descriptor[0]`, whose
 /// ownership passes to the caller. A host failure is the typed `{error:{code}}` reply.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeQueryArtifacts(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeQueryArtifacts(
     mut env: EnvUnowned,
     _class: JClass,
     query: JByteArray,
@@ -1403,7 +1388,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 
 /// S-UI-017 `getMaintenanceState` facts, read from the canonical files and guard proofs alone.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeMaintenanceState(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeMaintenanceState(
     mut env: EnvUnowned,
     _class: JClass,
     canonical_base: JString,
@@ -1424,7 +1409,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 
 /// The S-AUTH-001 malformed-owner reset behind S-UI-017 `resetRuntimeHostToApk`.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeResetRuntimeHostToApk(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeResetRuntimeHostToApk(
     mut env: EnvUnowned,
     _class: JClass,
     canonical_base: JString,
@@ -1436,7 +1421,11 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
             let encoded = read_boot_id()
                 .and_then(|boot_id| persistence::guard_cleanup_verified(base, &boot_id, &ProcFacts))
                 .and_then(|cleanup| {
-                    StateStore::new(base.to_path_buf()).reset_malformed_owner(new_uuid()?, cleanup)
+                    StateStore::new(base.to_path_buf()).reset_malformed_owner(
+                        new_uuid()?,
+                        RuntimeHost::ApkRuntime,
+                        cleanup,
+                    )
                 })
                 .map(|_| serde_json::json!({"reset": true}).to_string())
                 .unwrap_or_else(|error| maintenance_failure(error.code, false));
@@ -1449,11 +1438,10 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
     }
 }
 
-/// The S-UPD-006 Runtime-data reset behind S-UI-017 `resetRuntimeData`. A failure reports whether
 /// How many executions a lost Runtime instance left running (zero while a live Runtime owns the
 /// store); -1 when the store cannot be read.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeStrandedExecutions(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeStrandedExecutions(
     mut env: EnvUnowned,
     _class: JClass,
     canonical_base: JString,
@@ -1475,7 +1463,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 
 /// Settles the stranded executions as interrupted: `{"cleared":n}` or `{"code":...}`.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeClearStrandedExecutions(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeClearStrandedExecutions(
     mut env: EnvUnowned,
     _class: JClass,
     canonical_base: JString,
@@ -1506,9 +1494,10 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
     }
 }
 
+/// The S-UPD-006 Runtime-data reset behind S-UI-017 `resetRuntimeData`. A failure reports whether
 /// the live APK instance was already released, so HostController knows whether it may restore it.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeResetRuntimeData(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeResetRuntimeData(
     mut env: EnvUnowned,
     _class: JClass,
     canonical_base: JString,
@@ -1675,250 +1664,7 @@ fn query_apk_artifacts(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeObserveOwner(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-) -> jstring {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jstring> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded = StateStore::new(PathBuf::from(base))
-                .read_owner()
-                .and_then(|owner| {
-                    serde_json::to_string(&owner).map_err(|_| {
-                        DomainError::new(ErrorCode::InternalError, "owner encoding failed")
-                    })
-                })
-                .unwrap_or_else(|error| transition_error(error.code));
-            Ok(owned.new_string(encoded)?.into_raw())
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeObserveHostTransition(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-) -> jstring {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jstring> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded = StateStore::new(PathBuf::from(base))
-                .observe_transition()
-                .and_then(|observation| {
-                    serde_json::to_string(&match observation {
-                        None => serde_json::json!({"state":"none"}),
-                        Some((TransitionRecovery::RemoveUncommittedIntent, intent)) => {
-                            serde_json::json!({"state":"source_pending","intent":intent})
-                        }
-                        Some((TransitionRecovery::ActivateCommittedTarget, intent)) => {
-                            serde_json::json!({"state":"target_committed","intent":intent})
-                        }
-                    })
-                    .map_err(|_| {
-                        DomainError::new(ErrorCode::InternalError, "transition encoding failed")
-                    })
-                })
-                .unwrap_or_else(|error| transition_error(error.code));
-            Ok(owned.new_string(encoded)?.into_raw())
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativePrepareHostTransition(
-    mut env: EnvUnowned,
-    _class: JClass,
-    target_host: JString,
-) -> jstring {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jstring> {
-            let target = target_host.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded = prepare_host_transition(&target)
-                .and_then(|value| {
-                    serde_json::to_string(&value).map_err(|_| {
-                        DomainError::new(ErrorCode::InternalError, "transition encoding failed")
-                    })
-                })
-                .unwrap_or_else(|error| transition_error(error.code));
-            Ok(owned.new_string(encoded)?.into_raw())
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativePrepareRemoteHostTransition(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-    target_host: JString,
-) -> jstring {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jstring> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let target = target_host.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded = prepare_remote_host_transition(Path::new(&base), &target)
-                .and_then(|value| {
-                    serde_json::to_string(&value).map_err(|_| {
-                        DomainError::new(ErrorCode::InternalError, "transition encoding failed")
-                    })
-                })
-                .unwrap_or_else(|error| transition_error(error.code));
-            Ok(owned.new_string(encoded)?.into_raw())
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeAbortRemoteHostTransition(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-    intent_json: JString,
-) -> jboolean {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jboolean> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded = intent_json.mutf8_chars(owned)?.to_str().into_owned();
-            let result = serde_json::from_str::<RuntimeTransitionIntent>(&encoded)
-                .map_err(|_| DomainError::invalid("invalid transition intent"))
-                .and_then(|intent| {
-                    StateStore::new(PathBuf::from(base)).abort_remote_transition_intent(&intent)
-                });
-            Ok(if result.is_ok() { JNI_TRUE } else { JNI_FALSE })
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeAbortHostTransition(
-    mut env: EnvUnowned,
-    _class: JClass,
-    intent_json: JString,
-) -> jboolean {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jboolean> {
-            let encoded = intent_json.mutf8_chars(owned)?.to_str().into_owned();
-            let intent = serde_json::from_str(&encoded).ok();
-            let result = intent.is_some_and(|intent| abort_host_transition(&intent).is_ok());
-            Ok(if result { JNI_TRUE } else { JNI_FALSE })
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeReleaseHostTransition(
-    mut env: EnvUnowned,
-    _class: JClass,
-    intent_json: JString,
-) -> jboolean {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jboolean> {
-            let encoded = intent_json.mutf8_chars(owned)?.to_str().into_owned();
-            let intent = serde_json::from_str(&encoded).ok();
-            let result = intent.is_some_and(|intent| release_host_transition(&intent).is_ok());
-            Ok(if result { JNI_TRUE } else { JNI_FALSE })
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeCommitHostTransition(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-    intent_json: JString,
-) -> jstring {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jstring> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded = intent_json.mutf8_chars(owned)?.to_str().into_owned();
-            let result = serde_json::from_str::<RuntimeTransitionIntent>(&encoded)
-                .map_err(|_| DomainError::invalid("invalid transition intent"))
-                .and_then(|intent| {
-                    StateStore::new(PathBuf::from(base)).commit_owner_transition(
-                        &intent,
-                        &read_boot_id()?,
-                        &ProcFacts,
-                    )
-                })
-                .and_then(|owner| {
-                    serde_json::to_string(&owner).map_err(|_| {
-                        DomainError::new(ErrorCode::InternalError, "owner encoding failed")
-                    })
-                })
-                .unwrap_or_else(|error| transition_error(error.code));
-            Ok(owned.new_string(result)?.into_raw())
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => ptr::null_mut(),
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeFinishHostTransition(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-    intent_json: JString,
-    target_instance_id: JString,
-) -> jboolean {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jboolean> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded = intent_json.mutf8_chars(owned)?.to_str().into_owned();
-            let instance = target_instance_id.mutf8_chars(owned)?.to_str().into_owned();
-            let result = serde_json::from_str::<RuntimeTransitionIntent>(&encoded)
-                .map_err(|_| DomainError::invalid("invalid transition intent"))
-                .and_then(|intent| {
-                    let instance = UuidV4::parse(instance)
-                        .map_err(|_| DomainError::invalid("invalid target instance id"))?;
-                    StateStore::new(PathBuf::from(base))
-                        .finish_remote_owner_transition(&intent, &instance)
-                });
-            Ok(if result.is_ok() { JNI_TRUE } else { JNI_FALSE })
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeProbeAppGuard(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeProbeAppGuard(
     mut env: EnvUnowned,
     _class: JClass,
     guard_path: JString,
@@ -1954,7 +1700,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativePrepareShizukuGuardProof(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativePrepareShizukuGuardProof(
     mut env: EnvUnowned,
     _class: JClass,
     execution_id: JString,
@@ -1972,7 +1718,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeSettleShizukuGuardProof(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeSettleShizukuGuardProof(
     mut env: EnvUnowned,
     _class: JClass,
     execution_id: JString,
@@ -2009,7 +1755,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeAbortShizukuGuardProof(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeAbortShizukuGuardProof(
     mut env: EnvUnowned,
     _class: JClass,
     execution_id: JString,
@@ -2027,64 +1773,8 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
     }
 }
 
-/// Proves the App guard for the Magisk host this APK serves as a companion. The adopted
-/// companion scope owns the probe proofs; failure or uncertainty quarantines that scope.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeProbeCompanionAppGuard(
-    mut env: EnvUnowned,
-    _class: JClass,
-    guard_path: JString,
-) -> jboolean {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jboolean> {
-            let path = guard_path.mutf8_chars(owned)?.to_str().into_owned();
-            let clean = guard::scope().is_ok_and(|scope| {
-                scope.bind_guard_path(PathBuf::from(&path));
-                let clean = matches!(verify_app_guard(Path::new(&path)), Ok(true));
-                if !clean {
-                    scope.quarantine();
-                }
-                clean
-            });
-            Ok(if clean { JNI_TRUE } else { JNI_FALSE })
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeAdoptCompanionGuardScope(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-    runtime_epoch: JString,
-    runtime_instance_id: JString,
-    guard_path: JString,
-) -> jboolean {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jboolean> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let epoch = runtime_epoch.mutf8_chars(owned)?.to_str().into_owned();
-            let instance = runtime_instance_id
-                .mutf8_chars(owned)?
-                .to_str()
-                .into_owned();
-            let path = guard_path.mutf8_chars(owned)?.to_str().into_owned();
-            let adopted = adopt_companion_guard_scope(&base, &epoch, &instance, &path).is_ok();
-            Ok(if adopted { JNI_TRUE } else { JNI_FALSE })
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeRunAppCommand(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeRunAppCommand(
     mut env: EnvUnowned,
     _class: JClass,
     execution_id: JString,
@@ -2105,7 +1795,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeCancelAppCommand(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeCancelAppCommand(
     mut env: EnvUnowned,
     _class: JClass,
     execution_id: JString,
@@ -2124,61 +1814,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeFinishCommittedHostTransition(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-    target_instance_id: JString,
-) -> jboolean {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jboolean> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded_instance = target_instance_id.mutf8_chars(owned)?.to_str().into_owned();
-            let result = UuidV4::parse(encoded_instance)
-                .map_err(|_| DomainError::invalid("invalid target Runtime instance"))
-                .and_then(|instance| {
-                    StateStore::new(PathBuf::from(base))
-                        .finish_committed_transition(&instance)
-                        .map(|_| ())
-                });
-            Ok(if result.is_ok() { JNI_TRUE } else { JNI_FALSE })
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeValidateLiveMagiskHost(
-    mut env: EnvUnowned,
-    _class: JClass,
-    canonical_base: JString,
-    target_instance_id: JString,
-) -> jboolean {
-    match env
-        .with_env(|owned| -> jni::errors::Result<jboolean> {
-            let base = canonical_base.mutf8_chars(owned)?.to_str().into_owned();
-            let encoded_instance = target_instance_id.mutf8_chars(owned)?.to_str().into_owned();
-            let result = UuidV4::parse(encoded_instance)
-                .map_err(|_| DomainError::invalid("invalid target Runtime instance"))
-                .and_then(|instance| {
-                    StateStore::new(PathBuf::from(base))
-                        .validate_live_instance(RuntimeHost::MagiskBackend, &instance)
-                        .map(|_| ())
-                });
-            Ok(if result.is_ok() { JNI_TRUE } else { JNI_FALSE })
-        })
-        .into_outcome()
-    {
-        Outcome::Ok(value) => value,
-        Outcome::Err(_) | Outcome::Panic(_) => JNI_FALSE,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeRegisterCapability(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeRegisterCapability(
     mut env: EnvUnowned,
     _class: JClass,
     key: JString,
@@ -2229,7 +1865,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeAutomationWake(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeAutomationWake(
     _env: EnvUnowned,
     _class: JClass,
 ) -> jboolean {
@@ -2243,7 +1879,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeNetworkDefaultChanged(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeNetworkDefaultChanged(
     mut env: EnvUnowned,
     _class: JClass,
     runtime_epoch: JString,
@@ -2302,7 +1938,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeRecordHostFault(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeRecordHostFault(
     mut env: EnvUnowned,
     _class: JClass,
     code: JString,
@@ -2345,17 +1981,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeStop(
-    _env: EnvUnowned,
-    _class: JClass,
-) {
-    if let Ok(mut host) = host_slot().lock() {
-        *host = None;
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNativeLauncher_nativeStart(
+pub extern "system" fn Java_com_droidbridge_standalone_execution_shizuku_ShizukuNativeLauncher_nativeStart(
     mut env: EnvUnowned,
     _class: JClass,
     client_id: JString,
@@ -2410,7 +2036,7 @@ pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNat
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNativeLauncher_nativeCloseLifetime(
+pub extern "system" fn Java_com_droidbridge_standalone_execution_shizuku_ShizukuNativeLauncher_nativeCloseLifetime(
     mut env: EnvUnowned,
     _class: JClass,
     client_id: JString,
@@ -2434,7 +2060,7 @@ pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNat
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNativeLauncher_nativeCancel(
+pub extern "system" fn Java_com_droidbridge_standalone_execution_shizuku_ShizukuNativeLauncher_nativeCancel(
     mut env: EnvUnowned,
     _class: JClass,
     client_id: JString,
@@ -2451,7 +2077,7 @@ pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNat
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNativeLauncher_nativeTimeout(
+pub extern "system" fn Java_com_droidbridge_standalone_execution_shizuku_ShizukuNativeLauncher_nativeTimeout(
     mut env: EnvUnowned,
     _class: JClass,
     client_id: JString,
@@ -2468,7 +2094,7 @@ pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNat
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNativeLauncher_nativeWait(
+pub extern "system" fn Java_com_droidbridge_standalone_execution_shizuku_ShizukuNativeLauncher_nativeWait(
     mut env: EnvUnowned,
     _class: JClass,
     client_id: JString,
@@ -2493,7 +2119,7 @@ pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNat
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNativeLauncher_nativeCloseClient(
+pub extern "system" fn Java_com_droidbridge_standalone_execution_shizuku_ShizukuNativeLauncher_nativeCloseClient(
     mut env: EnvUnowned,
     _class: JClass,
     client_id: JString,
@@ -2512,7 +2138,7 @@ pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNat
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNativeLauncher_nativeRename(
+pub extern "system" fn Java_com_droidbridge_standalone_execution_shizuku_ShizukuNativeLauncher_nativeRename(
     mut env: EnvUnowned,
     _class: JClass,
     source: JString,
@@ -2585,7 +2211,7 @@ fn read_shizuku_directory(
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNativeLauncher_nativeReadDirectory(
+pub extern "system" fn Java_com_droidbridge_standalone_execution_shizuku_ShizukuNativeLauncher_nativeReadDirectory(
     mut env: EnvUnowned,
     _class: JClass,
     path: JString,
@@ -2626,7 +2252,7 @@ pub extern "system" fn Java_com_droidbridge_android_execution_shizuku_ShizukuNat
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeRunI5DeviceBenchmark(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeRunI5DeviceBenchmark(
     mut env: EnvUnowned,
     _class: JClass,
     benchmark_base: JString,
@@ -2694,7 +2320,7 @@ fn require_idle_apk_runtime(host: &NativeHost) -> Result<CanonicalState, DomainE
 /// S-UPD-002 barrier: closes new business admission on the active APK instance and proves zero
 /// work. A refusal reopens the unchanged instance; success leaves admission closed for the record.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeCloseAdmissionForMaintenance(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeCloseAdmissionForMaintenance(
     mut env: EnvUnowned,
     _class: JClass,
 ) -> jstring {
@@ -2714,7 +2340,7 @@ pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_na
 
 /// Reopens APK business admission only once no maintenance record remains.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_droidbridge_android_runtimehost_NativeRuntime_nativeReopenAdmission(
+pub extern "system" fn Java_com_droidbridge_standalone_runtimehost_NativeRuntime_nativeReopenAdmission(
     mut env: EnvUnowned,
     _class: JClass,
     canonical_base: JString,
@@ -2779,173 +2405,7 @@ fn refuse_recorded_maintenance() -> Result<(), DomainError> {
     Ok(())
 }
 
-fn prepare_host_transition(target: &str) -> Result<TransitionPrepareResult, DomainError> {
-    if target != "magisk_backend" {
-        return Err(DomainError::invalid(
-            "unsupported Runtime transition target",
-        ));
-    }
-    refuse_recorded_maintenance()?;
-    let slot = host_slot()
-        .lock()
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?;
-    let host = slot.as_ref().ok_or_else(|| {
-        DomainError::new(
-            ErrorCode::CapabilityUnavailable,
-            "APK Runtime is not active",
-        )
-    })?;
-    host.store.validate_lease(&host._lease)?;
-    host.admission_open.store(false, Ordering::SeqCst);
-    let result = (|| {
-        let state = require_idle_apk_runtime(host)?;
-        let owner = host.store.read_owner()?;
-        if owner.host != RuntimeHost::ApkRuntime
-            || owner.runtime_epoch != host.runtime_instance_fence().runtime_epoch
-            || owner.host_generation != host.runtime_instance_fence().host_generation
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "APK Runtime owner fence is stale",
-            ));
-        }
-        let intent = RuntimeTransitionIntent {
-            schema_version: 1,
-            transition_id: new_uuid()?,
-            runtime_epoch: owner.runtime_epoch,
-            from_host: RuntimeHost::ApkRuntime,
-            from_generation: owner.host_generation,
-            from_instance_id: host.runtime_instance_id.clone(),
-            target_host: RuntimeHost::MagiskBackend,
-            target_generation: owner.host_generation.checked_add(1).ok_or_else(|| {
-                DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-            })?,
-        };
-        host.store.record_transition_intent(&host._lease, &intent)?;
-        Ok(TransitionPrepareResult {
-            prepared: true,
-            store_revision: state.store_revision,
-            intent,
-        })
-    })();
-    if result.is_err() {
-        host.admission_open.store(true, Ordering::SeqCst);
-    }
-    result
-}
-
-fn prepare_remote_host_transition(
-    base: &Path,
-    target: &str,
-) -> Result<RemoteTransitionPrepareResult, DomainError> {
-    if target != "apk_runtime" {
-        return Err(DomainError::invalid(
-            "unsupported remote Runtime transition target",
-        ));
-    }
-    let store = StateStore::new(base.to_path_buf());
-    let owner = store.read_owner()?;
-    let live: RuntimeLive = read_json(&base.join("runtime-live.json"))?;
-    if owner.host != RuntimeHost::MagiskBackend
-        || live.runtime_epoch != owner.runtime_epoch
-        || live.host != owner.host
-        || live.host_generation != owner.host_generation
-    {
-        return Err(DomainError::new(
-            ErrorCode::StaleAuthority,
-            "remote Runtime source identity is stale",
-        ));
-    }
-    let transition_path = base.join("runtime-transition.json");
-    if transition_path.exists() {
-        let intent: RuntimeTransitionIntent = read_json(&transition_path)?;
-        if intent.schema_version != 1
-            || intent.runtime_epoch != owner.runtime_epoch
-            || intent.from_host != owner.host
-            || intent.from_generation != owner.host_generation
-            || intent.from_instance_id != live.runtime_instance_id
-            || intent.target_host != RuntimeHost::ApkRuntime
-            || intent.target_generation
-                != owner.host_generation.checked_add(1).ok_or_else(|| {
-                    DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-                })?
-        {
-            return Err(DomainError::new(
-                ErrorCode::StaleAuthority,
-                "pending remote Runtime transition is stale",
-            ));
-        }
-        return Ok(RemoteTransitionPrepareResult {
-            prepared: true,
-            recovery: true,
-            intent,
-        });
-    }
-    let intent = RuntimeTransitionIntent {
-        schema_version: 1,
-        transition_id: new_uuid()?,
-        runtime_epoch: owner.runtime_epoch,
-        from_host: owner.host,
-        from_generation: owner.host_generation,
-        from_instance_id: live.runtime_instance_id,
-        target_host: RuntimeHost::ApkRuntime,
-        target_generation: owner.host_generation.checked_add(1).ok_or_else(|| {
-            DomainError::new(ErrorCode::ResourceLimit, "host generation exhausted")
-        })?,
-    };
-    store.record_remote_transition_intent(&intent)?;
-    Ok(RemoteTransitionPrepareResult {
-        prepared: true,
-        recovery: false,
-        intent,
-    })
-}
-
-fn abort_host_transition(intent: &RuntimeTransitionIntent) -> Result<(), DomainError> {
-    let slot = host_slot()
-        .lock()
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?;
-    let host = slot
-        .as_ref()
-        .ok_or_else(|| DomainError::new(ErrorCode::StaleAuthority, "APK Runtime is not active"))?;
-    host.store.abort_owner_transition(&host._lease, intent)?;
-    host.admission_open.store(true, Ordering::SeqCst);
-    Ok(())
-}
-
-fn release_host_transition(intent: &RuntimeTransitionIntent) -> Result<(), DomainError> {
-    let mut slot = host_slot()
-        .lock()
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "native host lock failed"))?;
-    let host = slot
-        .as_ref()
-        .ok_or_else(|| DomainError::new(ErrorCode::StaleAuthority, "APK Runtime is not active"))?;
-    host.store.validate_lease(&host._lease)?;
-    if host.admission_open.load(Ordering::SeqCst)
-        || intent.runtime_epoch != host._lease.live().runtime_epoch
-        || intent.from_host != RuntimeHost::ApkRuntime
-        || intent.from_generation != host._lease.live().host_generation
-        || intent.from_instance_id != host.runtime_instance_id
-        || intent.target_host != RuntimeHost::MagiskBackend
-    {
-        return Err(DomainError::new(
-            ErrorCode::StaleAuthority,
-            "APK Runtime release fence is stale",
-        ));
-    }
-    *slot = None;
-    Ok(())
-}
-
-impl NativeHost {
-    fn runtime_instance_fence(&self) -> AdmissionFence {
-        AdmissionFence {
-            runtime_epoch: self._lease.live().runtime_epoch.clone(),
-            host_generation: self._lease.live().host_generation,
-            runtime_instance_id: self.runtime_instance_id.clone(),
-        }
-    }
-}
+impl NativeHost {}
 
 #[cfg(unix)]
 fn local_execution_guards_idle() -> bool {
@@ -2957,14 +2417,6 @@ fn local_execution_guards_idle() -> bool {
 #[cfg(not(unix))]
 fn local_execution_guards_idle() -> bool {
     true
-}
-
-fn transition_error(code: ErrorCode) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "prepared": false,
-        "code": error_code_token(code),
-    }))
-    .unwrap_or_else(|_| "{\"prepared\":false,\"code\":\"INTERNAL_ERROR\"}".to_owned())
 }
 
 /// Runs `operation` against the published APK Runtime host. The slot lock only publishes
@@ -3022,27 +2474,6 @@ fn abort_shizuku_guard_proof(execution_id: &str) -> Result<bool, DomainError> {
     let execution_id = UuidV4::parse(execution_id.to_owned())
         .map_err(|_| DomainError::invalid("invalid execution ID"))?;
     guard::abort_proof(&execution_id)
-}
-
-/// The guard scope of the Magisk host this APK serves as an authenticated companion
-/// (S-AUTH-CMD-001, S-EXEC-001). A companion that was never the Runtime host still runs
-/// the App/Shizuku commands the Magisk host forwards to it, so it runs them under the
-/// guard identity of the Runtime instance that admitted them.
-fn adopt_companion_guard_scope(
-    canonical_base: &str,
-    runtime_epoch: &str,
-    runtime_instance_id: &str,
-    guard_path: &str,
-) -> Result<(), DomainError> {
-    let scope = guard::GuardScope::new(
-        PathBuf::from(canonical_base),
-        UuidV4::parse(runtime_epoch.to_owned())
-            .map_err(|_| DomainError::invalid("invalid Runtime epoch"))?,
-        UuidV4::parse(runtime_instance_id.to_owned())
-            .map_err(|_| DomainError::invalid("invalid Runtime instance"))?,
-    )?;
-    scope.bind_guard_path(PathBuf::from(guard_path));
-    guard::publish_scope(scope)
 }
 
 #[cfg(unix)]
@@ -3513,8 +2944,12 @@ fn parse_capability_state(value: &str) -> Result<CapabilityState, DomainError> {
     }
 }
 
-fn io_error(_: std::io::Error) -> DomainError {
-    DomainError::new(ErrorCode::IoError, "native filesystem operation failed")
+fn io_error(error: std::io::Error) -> DomainError {
+    DomainError::os(
+        ErrorCode::IoError,
+        "native filesystem operation failed",
+        &error,
+    )
 }
 
 fn error_code_token(code: ErrorCode) -> &'static str {
@@ -3564,8 +2999,7 @@ fn native_error_envelope(code: ErrorCode, encoded: &[u8]) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-/// Runs the S-EXEC-001 App-identity guard probe under the published guard scope. It needs
-/// no Runtime host, so the Magisk-host companion proves the same App guard.
+/// Runs the S-EXEC-001 App-identity guard probe under the published guard scope.
 #[cfg(unix)]
 fn verify_app_guard(guard_path: &Path) -> Result<bool, DomainError> {
     if guard::is_quarantined() {
@@ -4093,11 +3527,21 @@ mod tests {
             &[],
             "/",
         ));
+        assert!(validate_shizuku_arguments(
+            client_id,
+            execution_id,
+            "/system/bin/sh",
+            &[
+                "-c".to_owned(),
+                "x".repeat(runtime::COMMAND_MAX_COMMAND_BYTES)
+            ],
+            "/",
+        ));
         assert!(!validate_shizuku_arguments(
             client_id,
             execution_id,
             "/system/bin/id",
-            &["x".repeat(16_385)],
+            &["x".repeat(runtime::COMMAND_MAX_COMMAND_BYTES + 1)],
             "/",
         ));
         assert!(!validate_shizuku_arguments(

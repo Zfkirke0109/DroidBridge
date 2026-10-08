@@ -225,11 +225,12 @@ pub fn resolve_executor(
         (RuntimeHost::MagiskBackend, ExecutorRequest::Command(RunAs::Root)) => {
             vec![(facts.magisk_native, Provider::MagiskNative)]
         }
-        (RuntimeHost::MagiskBackend, ExecutorRequest::Command(RunAs::App)) => {
-            vec![(facts.app_native, Provider::AppNative)]
-        }
-        (RuntimeHost::MagiskBackend, ExecutorRequest::Command(RunAs::Shell)) => {
-            vec![(facts.shizuku, Provider::Shizuku)]
+        // The root edition has no App process to run as, and no Shizuku.
+        (RuntimeHost::MagiskBackend, ExecutorRequest::Command(RunAs::App | RunAs::Shell)) => {
+            return Err(DomainError::new(
+                ErrorCode::RunAsUnavailable,
+                "only the root identity is available on the root host",
+            ));
         }
         (
             RuntimeHost::MagiskBackend,
@@ -251,6 +252,8 @@ pub fn resolve_executor(
                 "content URI mutation is unsupported in protocol v1",
             ));
         }
+        // The root host reaches content providers through the platform `content` command it
+        // runs under its own root guard.
         (
             RuntimeHost::MagiskBackend,
             ExecutorRequest::Filesystem {
@@ -258,7 +261,7 @@ pub fn resolve_executor(
                 target_type: FileTargetType::ContentUri,
                 ..
             },
-        ) => vec![(facts.app_framework, Provider::AppFramework)],
+        ) => vec![(facts.magisk_native, Provider::MagiskNative)],
         (
             RuntimeHost::ApkRuntime,
             ExecutorRequest::Filesystem {
@@ -309,26 +312,17 @@ pub fn resolve_executor(
         ) => {
             return Err(DomainError::new(
                 ErrorCode::CapabilityUnavailable,
-                "raw network operations require the Magisk host",
+                "raw network operations require the root edition",
             ));
         }
+        // The root host observes through uiautomator, whose nodes carry bounds but no node_ref, so
+        // a node target has nothing to address there; callers tap the bounds by coordinate.
         (RuntimeHost::MagiskBackend, ExecutorRequest::Visual(VisualRoute::AccessibilityNode)) => {
-            vec![(facts.accessibility, Provider::Accessibility)]
+            Vec::new()
         }
         (RuntimeHost::MagiskBackend, ExecutorRequest::Visual(VisualRoute::Transform)) => {
-            vec![(facts.app_framework, Provider::AppFramework)]
+            vec![(facts.magisk_native, Provider::MagiskNative)]
         }
-        (
-            RuntimeHost::MagiskBackend,
-            ExecutorRequest::Visual(VisualRoute::Hierarchy | VisualRoute::CoordinateInput),
-        ) => vec![
-            (facts.accessibility, Provider::Accessibility),
-            (facts.magisk_native, Provider::MagiskNative),
-        ],
-        (RuntimeHost::MagiskBackend, ExecutorRequest::Visual(VisualRoute::FocusedText)) => vec![
-            (facts.accessibility, Provider::Accessibility),
-            (facts.magisk_native, Provider::MagiskNative),
-        ],
         (RuntimeHost::MagiskBackend, ExecutorRequest::Visual(_)) => {
             vec![(facts.magisk_native, Provider::MagiskNative)]
         }
@@ -369,19 +363,14 @@ pub fn resolve_executor(
             ),
         ) => vec![(facts.magisk_native, Provider::MagiskNative)],
         (RuntimeHost::MagiskBackend, ExecutorRequest::Android(AndroidRoute::LaunchOrIntent)) => {
-            vec![
-                (facts.magisk_launch, Provider::MagiskFramework),
-                (facts.app_framework, Provider::AppFramework),
-            ]
+            vec![(facts.magisk_launch, Provider::MagiskFramework)]
         }
-        (RuntimeHost::MagiskBackend, ExecutorRequest::Android(AndroidRoute::Clipboard)) => vec![
-            (facts.magisk_clipboard, Provider::MagiskFramework),
-            (facts.app_framework, Provider::AppFramework),
-        ],
-        (RuntimeHost::MagiskBackend, ExecutorRequest::Android(AndroidRoute::Notification)) => vec![
-            (facts.magisk_notifications, Provider::MagiskFramework),
-            (facts.notification_listener, Provider::NotificationListener),
-        ],
+        (RuntimeHost::MagiskBackend, ExecutorRequest::Android(AndroidRoute::Clipboard)) => {
+            vec![(facts.magisk_clipboard, Provider::MagiskFramework)]
+        }
+        (RuntimeHost::MagiskBackend, ExecutorRequest::Android(AndroidRoute::Notification)) => {
+            vec![(facts.magisk_notifications, Provider::MagiskFramework)]
+        }
         (
             RuntimeHost::ApkRuntime,
             ExecutorRequest::Android(AndroidRoute::PackageInspect(

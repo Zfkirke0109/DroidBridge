@@ -99,6 +99,18 @@ final class HelperOperations implements NotificationSink {
                     requireKeys(request);
                     FrameworkServices.probeLaunch();
                     return success(new JSONObject());
+                case "display_snapshot":
+                    requireKeys(request);
+                    return success(VisualFramework.displaySnapshot());
+                case "network_dns":
+                    requireKeys(request);
+                    return success(NetworkFramework.dnsServers());
+                case "image_transform":
+                    requireKeys(request, "source", "output", "region");
+                    return success(VisualFramework.transform(
+                        request.getString("source"),
+                        request.getString("output"),
+                        request.isNull("region") ? null : request.getJSONObject("region")));
                 case "probe_notifications":
                     requireKeys(request);
                     binding.probeListener();

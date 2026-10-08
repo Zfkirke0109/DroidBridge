@@ -686,3 +686,77 @@ async fn i8_task_g03_admitted_executor_and_host_generation_never_change() {
     assert_eq!(settled_executor.fence.host_generation, 1);
     assert_eq!(settled_executor.capability_generation, 2);
 }
+
+/// A settlement the store refuses is repeated until the store takes writes again; the Task then
+/// ends instead of staying running, and readiness withdrawn for the fault is restored (issue #1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i8_task_a_settlement_refused_by_the_store_lands_once_the_store_recovers() {
+    let (core, persistence, executions, capabilities, host) = make_core();
+    let core = Arc::new(core);
+    let release_effect = executions.pause_before_effect();
+    let base = instant("2026-09-08T02:00:00.000Z");
+    let request = admission(60, base, millis(base));
+    core.admit_task(request.clone()).await.unwrap();
+    let runner = {
+        let core = Arc::clone(&core);
+        let task_id = request.task_id.clone();
+        tokio::spawn(async move {
+            core.run_task(
+                &task_id,
+                "2026-09-08T02:00:01.000Z".to_owned(),
+                millis(base) + 1_000,
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(StdDuration::from_secs(1), async {
+        while executions.started().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("execution claim was established");
+
+    persistence.set_unwritable(true);
+    release_effect.add_permits(1);
+    tokio::time::timeout(StdDuration::from_secs(5), async {
+        while host.store_write_failures().is_empty() {
+            tokio::time::sleep(StdDuration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the settlement met the unwritable store");
+    assert_eq!(
+        capabilities.current().unwrap().context.readiness,
+        RuntimeReadiness::Unavailable
+    );
+    assert!(!runner.is_finished(), "the settlement waits for the store");
+    assert_eq!(
+        persistence
+            .snapshot()
+            .task(&request.task_id)
+            .unwrap()
+            .state(),
+        TaskState::Running
+    );
+
+    persistence.set_unwritable(false);
+    let settled = tokio::time::timeout(StdDuration::from_secs(10), runner)
+        .await
+        .expect("the settlement landed once the store took writes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.state, TaskState::Failed);
+    assert_eq!(
+        persistence
+            .snapshot()
+            .task(&request.task_id)
+            .unwrap()
+            .state(),
+        settled.state
+    );
+    assert_eq!(
+        capabilities.current().unwrap().context.readiness,
+        RuntimeReadiness::Ready
+    );
+}

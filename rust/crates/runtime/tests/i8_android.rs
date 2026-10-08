@@ -753,19 +753,14 @@ async fn i8_android_g05_magisk_clipboard_serves_the_same_action_without_app_elig
         CapabilityState::Unavailable
     );
 
+    // The root host has no App process to fall back to.
     let (core, port, _) = fixture_core(Facts {
         magisk_clipboard: CapabilityState::Unavailable,
         ..Facts::magisk()
     });
-    let fallback = submit(&core, 3, "clipboard", json!({"operation": "clear"}), NOW_MS).await;
-    assert_eq!(
-        success(&fallback),
-        &json!({"operation": "clear", "cleared": true})
-    );
-    assert_eq!(
-        port.calls(),
-        vec![(ProviderToken::AppFramework, "clipboard_clear")]
-    );
+    let missing = submit(&core, 3, "clipboard", json!({"operation": "clear"}), NOW_MS).await;
+    assert_eq!(error_code(&missing), "CAPABILITY_UNAVAILABLE");
+    assert!(port.calls().is_empty());
 }
 
 #[tokio::test]
@@ -1024,22 +1019,20 @@ async fn i8_android_g09_each_magisk_family_routes_independently_of_a_failed_sibl
         )
         .await,
     );
-    success(
-        &submit(
-            &core,
-            3,
-            "intent",
-            json!({"operation": "view", "data_uri": "https://example.com"}),
-            NOW_MS,
-        )
-        .await,
-    );
+    let intent = submit(
+        &core,
+        3,
+        "intent",
+        json!({"operation": "view", "data_uri": "https://example.com"}),
+        NOW_MS,
+    )
+    .await;
+    assert_eq!(error_code(&intent), "CAPABILITY_UNAVAILABLE");
     assert_eq!(
         port.calls(),
         vec![
             (ProviderToken::MagiskFramework, "clipboard_read"),
             (ProviderToken::MagiskFramework, "notification_snapshot"),
-            (ProviderToken::AppFramework, "intent"),
         ]
     );
 

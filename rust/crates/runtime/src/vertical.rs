@@ -25,6 +25,7 @@ pub struct VerticalEnvironment {
     pub sdk_int: u32,
     pub abi: String,
     pub timezone: String,
+    pub name: String,
     pub manufacturer: String,
     pub model: String,
     pub device: String,
@@ -42,12 +43,15 @@ struct Registration {
     has_executor: bool,
 }
 
+#[derive(Clone)]
 pub struct ApkRuntimeVertical {
     environment: VerticalEnvironment,
     host: RuntimeHost,
     registrations: Arc<Mutex<BTreeMap<String, Registration>>>,
     condition: Arc<Mutex<(RuntimeReadiness, Option<String>)>>,
     app_execution_surface: Arc<Mutex<CapabilityState>>,
+    /// Seeded from the environment; a host that can read the Settings name only later sets it.
+    device_name: Arc<Mutex<String>>,
 }
 
 impl ApkRuntimeVertical {
@@ -71,13 +75,14 @@ impl ApkRuntimeVertical {
             registrations.insert(
                 (*key).to_owned(),
                 Registration {
-                    availability: unavailable_or_unknown(key),
+                    availability: initial_availability(host, key),
                     source_generation: 0,
                     has_executor: false,
                 },
             );
         }
         Ok(Self {
+            device_name: Arc::new(Mutex::new(environment.name.clone())),
             environment,
             host,
             registrations: Arc::new(Mutex::new(registrations)),
@@ -185,6 +190,22 @@ impl ApkRuntimeVertical {
         }
     }
 
+    pub fn set_device_name(&self, name: String) -> Result<(), DomainError> {
+        *self.device_name.lock().map_err(|_| {
+            DomainError::new(ErrorCode::InternalError, "Runtime device name lock failed")
+        })? = name;
+        Ok(())
+    }
+
+    fn device_name(&self) -> Result<String, DomainError> {
+        self.device_name
+            .lock()
+            .map(|name| name.clone())
+            .map_err(|_| {
+                DomainError::new(ErrorCode::InternalError, "Runtime device name lock failed")
+            })
+    }
+
     pub fn capability_port(&self, runtime_instance_id: UuidV4) -> ApkCapabilityPort {
         ApkCapabilityPort {
             environment: self.environment.clone(),
@@ -231,6 +252,7 @@ impl ApkRuntimeVertical {
                     sdk_int: self.environment.sdk_int,
                     abi: self.environment.abi.clone(),
                     timezone: self.environment.timezone.clone(),
+                    name: self.device_name()?,
                 },
                 runtime,
                 capabilities,
@@ -268,6 +290,7 @@ impl ApkRuntimeVertical {
                         sdk_int: self.environment.sdk_int,
                         abi: self.environment.abi.clone(),
                         timezone: self.environment.timezone.clone(),
+                        name: self.device_name()?,
                         manufacturer: self.environment.manufacturer.clone(),
                         model: self.environment.model.clone(),
                         device: self.environment.device.clone(),
@@ -339,12 +362,24 @@ pub struct ApkCapabilityPort {
 
 impl ApkCapabilityPort {
     pub fn withdraw_readiness(&self) -> Result<(), DomainError> {
+        self.withdraw_readiness_as("CLEANUP_UNVERIFIED")
+    }
+
+    pub fn withdraw_readiness_as(&self, reason: &str) -> Result<(), DomainError> {
         *self.condition.lock().map_err(|_| {
             DomainError::new(ErrorCode::InternalError, "Runtime condition lock failed")
-        })? = (
-            RuntimeReadiness::Unavailable,
-            Some("CLEANUP_UNVERIFIED".to_owned()),
-        );
+        })? = (RuntimeReadiness::Unavailable, Some(reason.to_owned()));
+        Ok(())
+    }
+
+    /// Restores readiness withdrawn for exactly `reason`; any other withdrawal stands.
+    pub fn restore_readiness_from(&self, reason: &str) -> Result<(), DomainError> {
+        let mut condition = self.condition.lock().map_err(|_| {
+            DomainError::new(ErrorCode::InternalError, "Runtime condition lock failed")
+        })?;
+        if condition.0 == RuntimeReadiness::Unavailable && condition.1.as_deref() == Some(reason) {
+            *condition = (RuntimeReadiness::Ready, None);
+        }
         Ok(())
     }
 }
@@ -424,8 +459,16 @@ impl crate::CapabilityPort for ApkCapabilityPort {
     }
 }
 
-fn unavailable_or_unknown(key: &str) -> Availability {
-    if key == "visual.media_projection_session" {
+/// A grant the host's edition never provides is unavailable from the start; one it does provide
+/// is unknown until its adapter reports.
+fn initial_availability(host: RuntimeHost, key: &str) -> Availability {
+    let root_grant = key.starts_with("magisk.") || key == "execution.root_guard";
+    if root_grant != (host == RuntimeHost::MagiskBackend) {
+        Availability {
+            state: CapabilityState::Unavailable,
+            reason: Some("NOT_PROVIDED_BY_HOST".to_owned()),
+        }
+    } else if key == "visual.media_projection_session" {
         Availability {
             state: CapabilityState::Unavailable,
             reason: Some("USER_CONSENT_REQUIRED".to_owned()),
@@ -448,6 +491,7 @@ mod tests {
             sdk_int: 37,
             abi: "x86_64".to_owned(),
             timezone: "UTC".to_owned(),
+            name: "test".to_owned(),
             manufacturer: "test".to_owned(),
             model: "test".to_owned(),
             device: "test".to_owned(),

@@ -1,0 +1,216 @@
+// @ts-check
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { MAX_IN_FLIGHT } from '../src/relay.js';
+import { ORIGIN, makeRelay, mcp, obtainTokens, poll, promptly, respond, toolsCall, waitFor } from './helpers.js';
+
+const CHALLENGE = `Bearer resource_metadata="${ORIGIN}/.well-known/oauth-protected-resource", scope="droidbridge"`;
+
+test('/mcp 401 challenge without a token', async () => {
+  const t = makeRelay();
+  const res = await mcp(t, null, toolsCall());
+  assert.equal(res.status, 401);
+  assert.equal(res.headers.get('www-authenticate'), CHALLENGE);
+  // Auth comes before the method check.
+  const get = await mcp(t, null, undefined, { method: 'GET' });
+  assert.equal(get.status, 401);
+  assert.equal(get.headers.get('www-authenticate'), CHALLENGE);
+  // A non-bearer scheme is not a presented bearer token.
+  const basic = await mcp(t, null, toolsCall(), { headers: { authorization: 'Basic dXNlcjpwYXNz' } });
+  assert.equal(basic.headers.get('www-authenticate'), CHALLENGE);
+});
+
+test('/mcp 401 challenge with an invalid token', async () => {
+  const t = makeRelay();
+  for (const token of ['dbra_not-a-real-token', 'x'.repeat(600)]) {
+    const res = await mcp(t, token, toolsCall());
+    assert.equal(res.status, 401);
+    assert.equal(res.headers.get('www-authenticate'), `${CHALLENGE}, error="invalid_token"`);
+    assert.equal((await res.json()).error, 'invalid_token');
+  }
+  const malformed = await mcp(t, null, toolsCall(), { headers: { authorization: 'Bearer a b c' } });
+  assert.equal(malformed.headers.get('www-authenticate'), `${CHALLENGE}, error="invalid_token"`);
+});
+
+test('a token issued for another resource is rejected', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t, { origin: 'https://a.relay.example' });
+  // Valid on the origin it was issued for (device offline: 503 means it got past auth).
+  assert.equal((await mcp(t, tokens.access_token, toolsCall(), { origin: 'https://a.relay.example' })).status, 503);
+  const res = await mcp(t, tokens.access_token, toolsCall(), { origin: 'https://b.relay.example' });
+  assert.equal(res.status, 401);
+  assert.equal(
+    res.headers.get('www-authenticate'),
+    'Bearer resource_metadata="https://b.relay.example/.well-known/oauth-protected-resource", scope="droidbridge", error="invalid_token"',
+  );
+});
+
+test('an expired access token is rejected', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  assert.equal((await mcp(t, tokens.access_token, toolsCall())).status, 503);
+  await t.clock.advance(60 * 60 * 1000);
+  const res = await mcp(t, tokens.access_token, toolsCall());
+  assert.equal(res.status, 401);
+  assert.match(res.headers.get('www-authenticate') ?? '', /error="invalid_token"$/);
+});
+
+test('GET and DELETE /mcp are 405 with Allow: POST once authenticated, 401 before', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  for (const method of ['GET', 'DELETE', 'PUT']) {
+    const body = method === 'GET' ? undefined : toolsCall();
+    const res = await mcp(t, token, body, { method });
+    assert.equal(res.status, 405, method);
+    assert.equal(res.headers.get('allow'), 'POST');
+    // The token is checked first, whatever the method (DESIGN: "Claude side: MCP endpoint").
+    for (const [presented, challenge] of [
+      [null, CHALLENGE],
+      ['dbra_not-a-real-token', `${CHALLENGE}, error="invalid_token"`],
+    ]) {
+      const refused = await mcp(t, presented, body, { method });
+      assert.equal(refused.status, 401, `${method} ${presented}`);
+      assert.equal(refused.headers.get('www-authenticate'), challenge);
+      assert.equal(refused.headers.get('allow'), null);
+    }
+  }
+});
+
+test('wrong content type is 415; JSON with parameters is fine', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  for (const type of ['text/plain', 'application/x-www-form-urlencoded', 'application/jsonx']) {
+    const res = await mcp(t, token, toolsCall(), { headers: { 'content-type': type } });
+    assert.equal(res.status, 415, type);
+  }
+  const res = await mcp(t, token, toolsCall(), { headers: { 'content-type': 'Application/JSON; charset=utf-8' } });
+  assert.equal(res.status, 503, 'passes validation; device offline');
+});
+
+test('body over 262144 bytes is 413', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const big = JSON.stringify({ ...toolsCall(), params: { pad: 'x'.repeat(262_144) } });
+  const res = await mcp(t, token, big);
+  assert.equal(res.status, 413);
+  /** A valid message of exactly `bytes` bytes, with id 5. */
+  const sized = (/** @type {number} */ bytes) => {
+    const exact = JSON.stringify({ jsonrpc: '2.0', id: 5, method: 'x', pad: '' });
+    const padded = exact.replace('"pad":""', `"pad":"${'y'.repeat(bytes - exact.length)}"`);
+    assert.equal(new TextEncoder().encode(padded).byteLength, bytes);
+    return padded;
+  };
+  assert.equal((await mcp(t, token, sized(262_144))).status, 503, 'exactly the limit is accepted');
+  const over = await mcp(t, token, sized(262_145));
+  assert.equal(over.status, 413, 'one byte over the limit is refused');
+  // The relay stops reading at the limit and never parses the body, so even a valid id is not
+  // known: the 413 answer always carries id null.
+  const text = await over.text();
+  assert.ok(text.startsWith('{"jsonrpc":"2.0","id":null,"error":{"code":-32600,'), text);
+  assert.equal(t.relay.hub.inspect().inFlight, 0);
+});
+
+test('invalid JSON and non-request bodies are 400 JSON-RPC errors, with the id when the phone would answer it', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204); // online: a delivered message would wait
+  // [body, JSON-RPC code, the id member of the answer as JSON text]
+  const cases = [
+    ['{not json', -32700, 'null'],
+    ['[{"jsonrpc":"2.0","id":1,"method":"ping"}]', -32600, 'null'],
+    ['"text"', -32600, 'null'],
+    ['{"jsonrpc":"1.0","id":1,"method":"ping"}', -32600, '1'],
+    ['{"jsonrpc":"1.0","id":"A\\/b","method":"ping"}', -32600, '"A\\/b"'],
+    ['{"jsonrpc":"1.0","id":9007199254740993,"method":"ping"}', -32600, '9007199254740993'],
+    ['{"jsonrpc":"2.0","id":77,"method":5}', -32600, '77'],
+    ['{"jsonrpc":"2.0","id":1}', -32600, '1'],
+    ['{"jsonrpc":"2.0","id":1,"result":{}}', -32600, '1'],
+    ['{"jsonrpc":"2.0","id":null,"method":"ping"}', -32600, 'null'],
+    ['{"jsonrpc":"2.0","id":1.5,"method":"ping"}', -32600, 'null'],
+    ['{"jsonrpc":"2.0","id":{"a":1},"method":"ping"}', -32600, 'null'],
+    ['{"jsonrpc":"1.0","id":1.5,"method":"ping"}', -32600, 'null'],
+    ['{"jsonrpc":"1.0","method":"notifications/initialized"}', -32600, 'null'],
+    // The phone refuses a message that carries result or error besides its method before it
+    // runs anything, so the relay refuses it before delivery.
+    ['{"jsonrpc":"2.0","id":9,"method":"tools/list","result":{}}', -32600, '9'],
+    ['{"jsonrpc":"2.0","id":"e","method":"tools/list","error":{"code":1,"message":"x"}}', -32600, '"e"'],
+    ['{"jsonrpc":"2.0","method":"notifications/initialized","result":null}', -32600, 'null'],
+  ];
+  for (const [body, code, idText] of cases) {
+    const res = await promptly(mcp(t, token, body), String(body));
+    assert.equal(res.status, 400, String(body));
+    const text = await res.text();
+    assert.ok(text.startsWith(`{"jsonrpc":"2.0","id":${idText},"error":{"code":${code},`), text);
+    assert.equal(typeof JSON.parse(text).error.message, 'string');
+  }
+  assert.equal(t.relay.hub.inspect().inFlight, 0, 'nothing was offered to the phone');
+  const bad = new Uint8Array([0x7b, 0xff, 0x7d]);
+  const res = await t.relay.fetch(
+    new Request(`${ORIGIN}/mcp`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: bad,
+    }),
+  );
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error.code, -32700);
+});
+
+test('an over-long allowlisted header is refused, not truncated', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  const res = await mcp(t, token, toolsCall(9), { headers: { 'mcp-name': 'n'.repeat(4097) } });
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).id, 9);
+  const note = await mcp(t, token, { jsonrpc: '2.0', method: 'notifications/x' }, { headers: { 'mcp-method': 'm'.repeat(4097) } });
+  assert.equal(note.status, 400);
+  assert.equal(await note.text(), '');
+
+  // A value of exactly 4096 bytes is forwarded whole.
+  const pollPromise = poll(t);
+  await waitFor(() => t.relay.hub.inspect().parked);
+  const answer = mcp(t, token, toolsCall(10), { headers: { 'mcp-name': 'n'.repeat(4096) } });
+  const polled = await promptly(pollPromise, 'the request with a 4096-byte header was handed to the poll');
+  const [command] = (await polled.json()).commands;
+  assert.deepEqual(command.headers['Mcp-Name'], ['n'.repeat(4096)]);
+  await respond(t, command);
+  assert.equal((await answer).status, 200);
+});
+
+test('in-flight cap: the 17th concurrent request is 429 and not delivered', async () => {
+  const t = makeRelay();
+  const { access_token: token } = await obtainTokens(t);
+  // Device online (poll just ended) but not polling: requests wait in the hand-off list.
+  assert.equal((await poll(t, 0)).status, 204);
+  const waiting = [];
+  for (let i = 0; i < MAX_IN_FLIGHT; i += 1) waiting.push(mcp(t, token, toolsCall(i)));
+  await waitFor(() => t.relay.hub.inspect().handoff === MAX_IN_FLIGHT);
+  const busy = await mcp(t, token, toolsCall('over'));
+  assert.equal(busy.status, 429);
+  assert.equal(busy.headers.get('retry-after'), '1');
+  const body = await busy.json();
+  assert.equal(body.id, 'over');
+  assert.equal(body.error.code, -32001);
+  assert.deepEqual(body.error.data.droidbridge_relay, { state: 'busy', delivered: false });
+  assert.match(body.error.message, /not delivered/);
+
+  // A busy notification gets the status and no body.
+  const busyNote = await mcp(t, token, { jsonrpc: '2.0', method: 'notifications/cancelled' });
+  assert.equal(busyNote.status, 429);
+  assert.equal(await busyNote.text(), '');
+
+  // The phone polls: it gets 8, then 8 more; never the refused one.
+  const first = await (await poll(t)).json();
+  const second = await (await poll(t)).json();
+  assert.equal(first.commands.length, 8);
+  assert.equal(second.commands.length, 8);
+  const ids = [...first.commands, ...second.commands].map((command) => command.jsonrpc.id);
+  assert.ok(!ids.includes('over'));
+  assert.deepEqual(new Set(ids).size, MAX_IN_FLIGHT);
+  assert.equal(t.relay.hub.inspect().handoff, 0);
+  // Let the delivered requests settle as unknown so no promise is left hanging.
+  await t.clock.advance(245_000);
+  const outcomes = await Promise.all(waiting);
+  for (const res of outcomes) assert.equal(res.status, 200);
+  assert.equal(t.clock.pendingTimers(), 0);
+});

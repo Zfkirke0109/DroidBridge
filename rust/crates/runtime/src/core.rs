@@ -10,8 +10,8 @@ use crate::{
 };
 use chrono::DateTime;
 use contract::{
-    ErrorCode, MotherTool, PublicError, RequestId, RuntimeReadiness, TaskControlCall, TaskId,
-    TaskListResult, TaskSnapshot, TaskState, TaskSummary, UuidV4,
+    ErrorCode, ErrorDetailValue, MotherTool, PublicError, RequestId, RuntimeReadiness,
+    TaskControlCall, TaskId, TaskListResult, TaskSnapshot, TaskState, TaskSummary, UuidV4,
 };
 use domain::{
     DedupDecision, DomainError, ExecutorRequest, MAX_QUEUED_TASKS, MAX_RUNNING_TASKS, TaskEvent,
@@ -19,9 +19,17 @@ use domain::{
 };
 use std::{
     collections::{BTreeMap, HashSet},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::{Mutex, Notify, Semaphore, watch};
+
+/// The reason of a canonical commit the store refused for I/O; the settlement retry keys on it.
+pub(crate) const STORE_WRITE_FAILED: &str = "canonical store write failed";
+const STORE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(500);
+const STORE_RETRY_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 const MAX_TERMINAL_TASKS: usize = 500;
 const TASK_HISTORY_RETENTION_MS: u64 = 7 * 86_400_000;
@@ -72,6 +80,8 @@ pub struct RuntimeCore<P, A, E, C, H> {
     network_event_source: Arc<StdMutex<Option<Arc<dyn NetworkDefaultEventSource>>>>,
     automation_cancellations: Arc<StdMutex<BTreeMap<String, Arc<crate::AutomationCancellation>>>>,
     canonical_changes: Arc<Notify>,
+    /// The last canonical write failed and none has succeeded since.
+    store_failed: Arc<AtomicBool>,
 }
 
 impl<P, A, E, C, H> Clone for RuntimeCore<P, A, E, C, H> {
@@ -89,6 +99,7 @@ impl<P, A, E, C, H> Clone for RuntimeCore<P, A, E, C, H> {
             network_event_source: Arc::clone(&self.network_event_source),
             automation_cancellations: Arc::clone(&self.automation_cancellations),
             canonical_changes: Arc::clone(&self.canonical_changes),
+            store_failed: Arc::clone(&self.store_failed),
         }
     }
 }
@@ -121,6 +132,39 @@ where
             network_event_source: Arc::new(StdMutex::new(None)),
             automation_cancellations: Arc::new(StdMutex::new(BTreeMap::new())),
             canonical_changes: Arc::new(Notify::new()),
+            store_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Writes the current canonical state unchanged once the last write failed, proving the store
+    /// takes writes again; the successful commit lets the host restore readiness. A host loop
+    /// calls it, and a failed probe is that loop's failed pass.
+    pub async fn recover_store(&self) -> Result<(), DomainError> {
+        if !self.store_failed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.state_transition(|_, _| Ok(((), true))).await
+    }
+
+    /// Repeats a settlement whose outcome is known until the store takes it. Only a failed
+    /// canonical write is repeated; any other error is the settlement's own answer. It ends with
+    /// this instance, whose successor's recovery then settles what is left.
+    pub(crate) async fn until_stored<T, F, Fut>(&self, mut attempt: F) -> Result<T, DomainError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, DomainError>>,
+    {
+        let mut delay = STORE_RETRY_INITIAL;
+        loop {
+            match attempt().await {
+                Err(error)
+                    if error.code == ErrorCode::IoError && error.reason == STORE_WRITE_FAILED =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(STORE_RETRY_LIMIT);
+                }
+                answer => return answer,
+            }
         }
     }
 
@@ -248,8 +292,8 @@ where
                 let mut state = self
                     .persistence
                     .load()
-                    .map_err(|error| public_error(error.code, &admission.operation, false))?;
-                prune_synchronous_history(&mut state, admission.now_ms);
+                    .map_err(|error| domain_error(&error, &admission.operation))?;
+                prune_expired_requests(&mut state, admission.now_ms);
                 match state
                     .dedup
                     .decide_and_reserve(
@@ -258,7 +302,7 @@ where
                         admission.now_ms,
                         false,
                     )
-                    .map_err(|error| public_error(error.code, &admission.operation, false))?
+                    .map_err(|error| domain_error(&error, &admission.operation))?
                 {
                     DedupDecision::Replay => {
                         let existing = state
@@ -286,16 +330,14 @@ where
                         let permit = self.leaf_permits.try_acquire().map_err(|_| {
                             public_error(ErrorCode::ResourceLimit, &admission.operation, false)
                         })?;
-                        let capability = self.capabilities.current().map_err(|error| {
-                            public_error(error.code, &admission.operation, false)
-                        })?;
-                        require_ready(capability.context.readiness).map_err(|error| {
-                            public_error(error.code, &admission.operation, false)
-                        })?;
+                        let capability = self
+                            .capabilities
+                            .current()
+                            .map_err(|error| domain_error(&error, &admission.operation))?;
+                        require_ready(capability.context.readiness)
+                            .map_err(|error| domain_error(&error, &admission.operation))?;
                         let executor = crate::resolve_execution(&capability, admission.route)
-                            .map_err(|error| {
-                                public_error(error.code, &admission.operation, false)
-                            })?;
+                            .map_err(|error| domain_error(&error, &admission.operation))?;
                         let reservation = admission.settlement_bound_bytes.max(RESERVE_FLOOR_BYTES);
                         let total = state
                             .total_committed_and_reserved()
@@ -355,7 +397,7 @@ where
                                 .lock()
                                 .expect("synchronous waiter lock")
                                 .remove(admission.request_id.as_str());
-                            return Err(public_error(error.code, &admission.operation, false));
+                            return Err(domain_error(&error, &admission.operation));
                         }
                         break (execution, permit);
                     }
@@ -403,7 +445,7 @@ where
                     .settle_synchronous(
                         &admission.request_id,
                         ExecutionOutcome::Failed {
-                            error: public_error(error.code, &admission.operation, false),
+                            error: domain_error(&error, &admission.operation),
                             encoded_bytes: RESERVE_FLOOR_BYTES,
                         },
                         true,
@@ -445,10 +487,11 @@ where
                 .await
             }
             Err(failure) => {
+                log_failure(&admission.operation, &failure);
                 self.settle_synchronous(
                     &admission.request_id,
                     ExecutionOutcome::Failed {
-                        error: public_error(failure.error.code, &admission.operation, false),
+                        error: domain_error(&failure.error, &admission.operation),
                         encoded_bytes: RESERVE_FLOOR_BYTES,
                     },
                     failure.cleanup_verified,
@@ -466,6 +509,7 @@ where
     ) -> Result<TaskAdmissionResult, DomainError> {
         let _guard = self.mutation.lock().await;
         let mut state = self.persistence.load()?;
+        prune_expired_requests(&mut state, admission.now_ms);
         match state.dedup.decide_and_reserve(
             admission.request_id.clone(),
             admission.payload_sha256,
@@ -606,7 +650,7 @@ where
                         .settle(
                             task_id,
                             ExecutionOutcome::Failed {
-                                error: public_error(error.code, "runtime.execution", false),
+                                error: domain_error(&error, "runtime.execution"),
                                 encoded_bytes: RESERVE_FLOOR_BYTES,
                             },
                             true,
@@ -639,6 +683,7 @@ where
             Ok(completion) => completion,
             Err(failure) => {
                 drop(permit);
+                log_failure("runtime.execution", &failure);
                 let outcome = if failure.error.code == ErrorCode::Cancelled {
                     ExecutionOutcome::Cancelled {
                         error: public_error(ErrorCode::Cancelled, "runtime.execution", false),
@@ -646,7 +691,7 @@ where
                     }
                 } else {
                     ExecutionOutcome::Failed {
-                        error: public_error(failure.error.code, "runtime.execution", false),
+                        error: domain_error(&failure.error, "runtime.execution"),
                         encoded_bytes: RESERVE_FLOOR_BYTES,
                     }
                 };
@@ -1008,6 +1053,18 @@ where
         ended_at: String,
         terminal_at_ms: u64,
     ) -> Result<TaskSnapshot, DomainError> {
+        self.until_stored(|| {
+            self.interrupt_before_execution_once(task_id, ended_at.clone(), terminal_at_ms)
+        })
+        .await
+    }
+
+    async fn interrupt_before_execution_once(
+        &self,
+        task_id: &TaskId,
+        ended_at: String,
+        terminal_at_ms: u64,
+    ) -> Result<TaskSnapshot, DomainError> {
         let _guard = self.mutation.lock().await;
         let mut state = self.persistence.load()?;
         let task_index = state
@@ -1065,6 +1122,26 @@ where
     }
 
     async fn settle(
+        &self,
+        task_id: &TaskId,
+        outcome: ExecutionOutcome,
+        cleanup_verified: bool,
+        ended_at: String,
+        terminal_at_ms: u64,
+    ) -> Result<TaskSnapshot, DomainError> {
+        self.until_stored(|| {
+            self.settle_once(
+                task_id,
+                outcome.clone(),
+                cleanup_verified,
+                ended_at.clone(),
+                terminal_at_ms,
+            )
+        })
+        .await
+    }
+
+    async fn settle_once(
         &self,
         task_id: &TaskId,
         outcome: ExecutionOutcome,
@@ -1144,7 +1221,7 @@ where
             task.error = Some(if cleanup_verified {
                 public_error(ErrorCode::ResourceLimit, "runtime.execution", false)
             } else {
-                cleanup_unverified_error("runtime.execution")
+                cleanup_unverified_error("runtime.execution", error.and_then(|error| error.details))
             });
             RESERVE_FLOOR_BYTES.min(task.reserved_bytes)
         };
@@ -1184,7 +1261,7 @@ where
         let mut state = self
             .persistence
             .load()
-            .map_err(|error| public_error(error.code, "runtime.execution", false))?;
+            .map_err(|error| domain_error(&error, "runtime.execution"))?;
         let record_index = state
             .synchronous_executions
             .iter()
@@ -1207,11 +1284,17 @@ where
                     },
                     &record.execution_id,
                 )
-                .map_err(|error| public_error(error.code, &record.operation, false))?;
+                .map_err(|error| domain_error(&error, &record.operation))?;
         }
         let operation = state.synchronous_executions[record_index].operation.clone();
         let reservation = state.synchronous_executions[record_index].reserved_bytes;
         let outcome = measured_execution_outcome(outcome, &operation)?;
+        let cause = match &outcome {
+            ExecutionOutcome::Failed { error, .. } | ExecutionOutcome::Cancelled { error, .. } => {
+                error.details.clone()
+            }
+            _ => None,
+        };
         let (encoded_bytes, record_state, result, mut error) = match outcome {
             ExecutionOutcome::SynchronousCompleted {
                 result,
@@ -1239,7 +1322,7 @@ where
                 RESERVE_FLOOR_BYTES.min(reservation),
                 SynchronousExecutionState::Interrupted,
                 None,
-                Some(cleanup_unverified_error(&operation)),
+                Some(cleanup_unverified_error(&operation, cause)),
             ),
             _ => (
                 RESERVE_FLOOR_BYTES.min(reservation),
@@ -1286,9 +1369,9 @@ where
         state
             .dedup
             .settle(request_id, terminal_at_ms)
-            .map_err(|error| public_error(error.code, &operation, false))?;
+            .map_err(|error| domain_error(&error, &operation))?;
         self.commit(state)
-            .map_err(|error| public_error(error.code, &operation, false))?;
+            .map_err(|error| domain_error(&error, &operation))?;
         if let Some(sender) = self
             .synchronous_waiters
             .lock()
@@ -1342,8 +1425,7 @@ where
     ) -> Result<serde_json::Value, DomainError> {
         let _guard = self.mutation.lock().await;
         let mut state = self.persistence.load()?;
-        prune_synchronous_history(&mut state, now_ms);
-        prune_retained_mutations(&mut state, now_ms);
+        prune_expired_requests(&mut state, now_ms);
         match state
             .dedup
             .decide_and_reserve(request_id.clone(), payload_sha256, now_ms, false)?
@@ -1406,7 +1488,23 @@ where
             DomainError::new(ErrorCode::ResourceLimit, "store revision exhausted")
         })?;
         let canonical_revision = state.revision;
-        self.persistence.compare_and_commit(expected, state)?;
+        if let Err(error) = self.persistence.compare_and_commit(expected, state) {
+            // A conflict or a stale lease is another writer's turn; an I/O failure is this store's.
+            if error.code == ErrorCode::IoError {
+                self.store_failed.store(true, Ordering::Release);
+                self.host_control.store_write_failed(&error);
+                // The resident loop wakes to probe the store until it takes writes again.
+                self.canonical_changes.notify_one();
+                return Err(DomainError {
+                    reason: STORE_WRITE_FAILED,
+                    ..error
+                });
+            }
+            return Err(error);
+        }
+        if self.store_failed.swap(false, Ordering::AcqRel) {
+            self.host_control.store_write_recovered();
+        }
         self.host_control
             .task_activity_changed(active_tasks, canonical_revision);
         self.canonical_changes.notify_one();
@@ -1501,6 +1599,14 @@ fn task_is_pinned(state: &RuntimeState, task: &TaskRecord, now_ms: u64) -> bool 
         task.request_id() == Some(&entry.request_id)
             && entry.expires_at_ms.is_none_or(|expiry| expiry > now_ms)
     })
+}
+
+/// Removes every record an expired request owns. Reserving a request drops expired entries from
+/// the dedup table, and a synchronous result or retained mutation left without its entry makes the
+/// store unwritable, so every admission path runs this first with the same clock.
+fn prune_expired_requests(state: &mut RuntimeState, now_ms: u64) {
+    prune_synchronous_history(state, now_ms);
+    prune_retained_mutations(state, now_ms);
 }
 
 fn prune_synchronous_history(state: &mut RuntimeState, now_ms: u64) {
@@ -1679,17 +1785,76 @@ fn public_error(code: ErrorCode, operation: &str, retryable: bool) -> PublicErro
     }
 }
 
-fn cleanup_unverified_error(operation: &str) -> PublicError {
+/// The settled error data of a Runtime failure: the step that failed and, when the operating
+/// system refused it, the system's own description, so two failures sharing a code differ.
+pub(crate) fn failure_details(error: &DomainError) -> BTreeMap<String, ErrorDetailValue> {
+    let mut details = BTreeMap::from([(
+        "reason".to_owned(),
+        ErrorDetailValue::String(error.reason.to_owned()),
+    )]);
+    if let Some(peer_reason) = &error.peer_reason {
+        details.insert(
+            "peer_reason".to_owned(),
+            ErrorDetailValue::String(peer_reason.clone()),
+        );
+    }
+    if let Some(errno) = error.os_error {
+        details.insert(
+            "os_error".to_owned(),
+            ErrorDetailValue::String(std::io::Error::from_raw_os_error(errno).to_string()),
+        );
+    }
+    details
+}
+
+/// An execution that failed below the Runtime also goes to stderr, which the root supervisor
+/// keeps, so its cause outlives the pruned execution record.
+fn log_failure(operation: &str, failure: &crate::ExecutionFailure) {
+    if failure.error.code == ErrorCode::Cancelled {
+        return;
+    }
+    let peer_reason = failure
+        .error
+        .peer_reason
+        .as_ref()
+        .map(|reason| format!(": {reason}"))
+        .unwrap_or_default();
+    let os_error = failure
+        .error
+        .os_error
+        .map(|errno| format!(" ({})", std::io::Error::from_raw_os_error(errno)))
+        .unwrap_or_default();
+    eprintln!(
+        "droidbridge runtime: {operation} failed: {:?} {}{peer_reason}{os_error}; cleanup verified: {}",
+        failure.error.code, failure.error.reason, failure.cleanup_verified,
+    );
+}
+
+/// A stale reference is the one failure DroidBridge knows a fresh observation resolves.
+fn domain_error(error: &DomainError, operation: &str) -> PublicError {
     PublicError {
-        code: ErrorCode::IoError,
-        operation: operation.to_owned(),
-        retryable: false,
-        message: None,
-        capability: None,
-        details: Some(std::collections::BTreeMap::from([(
-            "cleanup_unverified".to_owned(),
-            contract::ErrorDetailValue::Boolean(true),
-        )])),
+        details: Some(failure_details(error)),
+        ..public_error(
+            error.code,
+            operation,
+            error.code == ErrorCode::StaleReference,
+        )
+    }
+}
+
+/// Unprovable cleanup keeps the details of the failure that led to it, when there was one.
+fn cleanup_unverified_error(
+    operation: &str,
+    cause: Option<BTreeMap<String, ErrorDetailValue>>,
+) -> PublicError {
+    let mut details = cause.unwrap_or_default();
+    details.insert(
+        "cleanup_unverified".to_owned(),
+        ErrorDetailValue::Boolean(true),
+    );
+    PublicError {
+        details: Some(details),
+        ..public_error(ErrorCode::IoError, operation, false)
     }
 }
 

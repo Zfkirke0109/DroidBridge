@@ -434,6 +434,11 @@
     },
     {
       "max": 256,
+      "min": 1,
+      "path": "context.status.device.name"
+    },
+    {
+      "max": 256,
       "path": "context.status.device.manufacturer"
     },
     {

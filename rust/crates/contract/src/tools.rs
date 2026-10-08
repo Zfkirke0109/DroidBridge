@@ -177,6 +177,9 @@ pub struct DeviceCompact {
     pub sdk_int: u32,
     pub abi: String,
     pub timezone: String,
+    /// The name the owner gave the phone in Settings, else its model, as of Runtime start; it
+    /// tells apart several phones connected to the same client.
+    pub name: String,
 }
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -184,6 +187,9 @@ pub struct DeviceFull {
     pub sdk_int: u32,
     pub abi: String,
     pub timezone: String,
+    /// The name the owner gave the phone in Settings, else its model, as of Runtime start; it
+    /// tells apart several phones connected to the same client.
+    pub name: String,
     pub manufacturer: String,
     pub model: String,
     pub device: String,
@@ -567,18 +573,28 @@ pub enum CommandCall {
 #[derive(Clone, Debug, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandRunInput {
+    /// The shell command, at most 32768 bytes of UTF-8. Every process it starts stays in its
+    /// process group (setsid and setpgid fail with EPERM) and is stopped when the command exits,
+    /// times out or is cancelled, background (`&`, `nohup`) ones included: nothing it starts
+    /// outlives it.
     pub command: String,
     pub run_as: RunAs,
+    /// An absolute working directory, at most 4096 bytes of UTF-8.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Text written to the command's standard input, at most 65536 bytes of UTF-8.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdin: Option<String>,
+    /// The deadline in milliseconds, 30000 unless set: at most 150000 for app and shell and
+    /// 3600000 for root. At the deadline the command and every process it started are stopped.
     #[serde(default = "d30s")]
     #[schemars(range(min = 1000, max = 3600000))]
     pub timeout_ms: u64,
     #[serde(default = "d64k")]
     #[schemars(range(min = 1024, max = 1048576))]
     pub max_output_bytes: u64,
+    /// Runs the command as a Task: the call returns a task_id at once and task_control waits for,
+    /// reads or cancels it. Use it for work that may outlast one tool call.
     #[serde(default)]
     pub as_task: bool,
 }

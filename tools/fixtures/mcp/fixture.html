@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>DroidBridge local practice fixture</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.45 system-ui, sans-serif; }
+    body { margin: 0; padding: 1rem; color: #152333; background: #f3f7fb; }
+    main { max-width: 34rem; margin: 0 auto; }
+    h1 { font-size: 1.35rem; }
+    label, input, button { display: block; width: 100%; box-sizing: border-box; }
+    input, button { min-height: 3rem; margin-top: .5rem; padding: .65rem; font: inherit; }
+    button { color: white; border: 0; border-radius: .35rem; background: #155eef; }
+    #result { min-height: 1.5rem; margin: .8rem 0; }
+    #list { height: 15rem; overflow-y: auto; padding: .5rem 2rem; background: white; border: 1px solid #b6c5d6; }
+    #list li { min-height: 2.2rem; padding: .35rem 0; overflow-wrap: anywhere; border-bottom: 1px solid #e2e8f0; }
+    .note { color: #425466; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>DroidBridge local practice fixture</h1>
+    <p class="note">Local-only test page. Entries stay in this tab and disappear when it closes.</p>
+    <label for="marker">Test marker</label>
+    <input id="marker" type="text" autocomplete="off" aria-label="Test marker">
+    <button id="add" type="button">Add marker</button>
+    <p id="result" aria-live="polite">Ready for a local test marker.</p>
+    <h2>Scrollable fixture rows</h2>
+    <ol id="list" aria-label="Local fixture rows"></ol>
+  </main>
+  <script>
+    (() => {
+      const list = document.getElementById('list');
+      const input = document.getElementById('marker');
+      const result = document.getElementById('result');
+      for (let i = 1; i <= 24; i += 1) {
+        const row = document.createElement('li');
+        row.textContent = `fixture-row-${String(i).padStart(2, '0')}`;
+        list.appendChild(row);
+      }
+      document.getElementById('add').addEventListener('click', () => {
+        const value = input.value.trim();
+        if (!value) {
+          result.textContent = 'Enter a non-empty test marker.';
+          return;
+        }
+        const row = document.createElement('li');
+        row.textContent = value;
+        row.dataset.testMarker = 'true';
+        list.appendChild(row);
+        result.textContent = `Added local marker: ${value}`;
+        input.value = '';
+      });
+    })();
+  </script>
+</body>
+</html>

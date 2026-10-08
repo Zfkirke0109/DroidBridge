@@ -17,6 +17,9 @@ pub const MCP_BODY_LIMIT_BYTES: usize = 262_144;
 pub const MCP_RESPONSE_LIMIT_BYTES: usize = 12_000_000;
 pub const MCP_STABLE_PORT: u16 = 8765;
 pub const MCP_DEBUG_PORT: u16 = 18765;
+/// The root edition listens on its own ports, so both editions can serve on one phone.
+pub const MCP_ROOT_STABLE_PORT: u16 = 8766;
+pub const MCP_ROOT_DEBUG_PORT: u16 = 18766;
 /// The R-TOOL-001 mother tools in their fixed `tools/list` order.
 pub const MCP_TOOL_NAMES: [&str; 8] = [
     "context",
@@ -806,6 +809,17 @@ impl<H: McpHost> McpFacade<H> {
         let Some(uri) = params["uri"].as_str() else {
             return invalid_params(id, field_detail("params.uri", "expected a string"));
         };
+        // A capture can be far larger than one response, so it is no resource; its own reader
+        // pages through it.
+        if uri.starts_with("dbref:capture:") || uri.starts_with("dbref:packet:") {
+            return invalid_params(
+                id,
+                field_detail(
+                    "params.uri",
+                    "a capture or packet reference is read with network action capture, operation read",
+                ),
+            );
+        }
         let reply = match self
             .host
             .artifact_query(json!({
@@ -1076,8 +1090,8 @@ fn next_step(code: &str) -> Option<&'static str> {
             "The referenced item does not exist or has expired. Obtain a fresh reference first."
         }
         "TIMEOUT" => concat!(
-            "It did not finish in time. Retry; for long-running commands use command run with ",
-            "as_task and follow the task with task_control."
+            "It did not finish in time. For a long command, set a larger timeout_ms (root allows ",
+            "up to 3600000) and run it with as_task, following the task with task_control."
         ),
         "RESOURCE_LIMIT" => concat!(
             "A size or count limit was reached. Ask for less, for example fewer nodes, no image ",

@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="action_check_for_updates">Check for updates</string>
+    <string name="action_confirm_allowed">Allowed</string>
+    <string name="action_confirm_locked">Locked</string>
+    <string name="action_continue">Continue</string>
+    <string name="action_download_update">Download update</string>
+    <string name="action_not_yet">Not yet</string>
+    <string name="agent_chatgpt">ChatGPT (official)</string>
+    <string name="agent_chatgpt_body">Connect ChatGPT on the web through the official OpenAI secure tunnel.</string>
+    <string name="agent_local_mcp">Local MCP</string>
+    <string name="agent_local_mcp_body">AI apps on this phone, or on a computer connected to it, use the local MCP endpoint.</string>
+    <string name="agent_other">Other agents</string>
+    <string name="agent_other_body">Not available yet.</string>
+    <string name="autostart_confirm_body">If you allowed this app to start automatically or run in the background on that page, confirm it here. Android does not report this setting back to apps.</string>
+    <string name="autostart_confirm_title">Did you allow autostart?</string>
+    <string name="capabilities_enter">Enter DroidBridge</string>
+    <string name="capabilities_enter_anyway">Continue anyway</string>
+    <string name="capabilities_section_access">Permissions and backends</string>
+    <string name="capabilities_section_background">Background running</string>
+    <string name="notification_screen_capture_body">DroidBridge can capture the screen for tools and automations.</string>
+    <string name="notification_screen_capture_title">Screen capture active</string>
+    <string name="notification_tasks_body">%1$d active task(s)</string>
+    <string name="recents_lock_body">Open recent apps, find the card of this app, then long-press it or open its menu and choose Lock. Clearing recent apps then leaves it running. The exact steps differ between manufacturers.</string>
+    <string name="recents_lock_title">Lock in recent apps</string>
+    <string name="restricted_settings_body">Android restricts accessibility for apps installed outside an app store. Open App info, tap the menu in the top corner, choose Allow restricted settings, then come back and turn on the accessibility service.</string>
+    <string name="restricted_settings_title">If the switch is greyed out</string>
+    <string name="route_accessibility">Accessibility only</string>
+    <string name="route_accessibility_body">No root. Limited features</string>
+    <string name="route_badge_installed">Installed</string>
+    <string name="route_shizuku">Shizuku</string>
+    <string name="cap_shizuku_plus_title" translatable="false">Shizuku+</string>
+    <string name="route_shizuku_body">No root. Reactivate after each reboot</string>
+    <string name="setup_choice_description">You can change these later in Settings</string>
+    <string name="setup_choice_start">Next</string>
+    <string name="setup_choice_title">Permissions and connection</string>
+    <string name="setup_exit_body">DroidBridge cannot be used until setup is finished.</string>
+    <string name="setup_exit_continue">Continue setup</string>
+    <string name="setup_exit_leave">Leave anyway</string>
+    <string name="setup_exit_title">Setup is not finished</string>
+    <string name="setup_section_agent">Connection</string>
+    <string name="setup_section_environment">Permission mode</string>
+    <string name="updates_available">Update available</string>
+    <string name="updates_configuration_unavailable">Release configuration unavailable</string>
+    <string name="updates_current_version">Current version</string>
+    <string name="updates_install_apk">Install update</string>
+    <string name="updates_title">Updates</string>
+    <string name="updates_up_to_date">Up to date</string>
+    <string name="welcome_description">A local execution bridge that lets an AI client operate this device through a small, explicit tool surface.</string>
+    <string name="welcome_start_setup">Start setup</string>
+</resources>

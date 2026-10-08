@@ -10,7 +10,7 @@ open the repository's **Security** tab and choose **Report a vulnerability**.
 
 Include what you can of:
 
-- the DroidBridge version (App and, if installed, the Magisk module);
+- the DroidBridge edition and version (the app, or the root module);
 - the device model, Android version, and root or Shizuku setup;
 - the connection involved (ChatGPT tunnel or local MCP);
 - steps to reproduce and the impact you observed.

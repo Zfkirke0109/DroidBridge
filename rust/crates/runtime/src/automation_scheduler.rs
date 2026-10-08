@@ -154,6 +154,9 @@ where
         armed: &mut Option<Option<String>>,
         network: &mut Option<NetworkDefaultSubscription>,
     ) -> Result<(), DomainError> {
+        // After a failed canonical write, each pass first proves the store takes writes again;
+        // until it does the pass fails and the loop's backoff paces the next probe.
+        self.core.recover_store().await?;
         // Requested runs need no time wake: the request itself is the canonical change.
         self.admit_requested_runs().await?;
         if let Some(projection) = projection {

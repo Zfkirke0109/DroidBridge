@@ -205,7 +205,7 @@ pub async fn handle_command_public<P, A, E, C, H>(
     call: CommandCall,
     timestamp: String,
     now_ms: u64,
-) -> Result<serde_json::Value, DomainError>
+) -> Result<serde_json::Value, crate::ToolFailure>
 where
     P: PersistencePort + 'static,
     A: ArtifactPort + Clone + 'static,
@@ -249,7 +249,9 @@ where
         serde_json::to_value(TaskAccepted {
             task_id: admitted_task_id,
         })
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "Task result encoding failed"))
+        .map_err(|_| {
+            DomainError::new(ErrorCode::InternalError, "Task result encoding failed").into()
+        })
     } else {
         core.run_synchronous(
             SynchronousAdmission {
@@ -266,7 +268,7 @@ where
             now_ms,
         )
         .await
-        .map_err(|error| DomainError::new(error.code, "command execution failed"))
+        .map_err(crate::ToolFailure::Settled)
     }
 }
 

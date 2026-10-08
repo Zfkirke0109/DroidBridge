@@ -969,7 +969,7 @@ pub async fn handle_network_public<P, A, E, C, H>(
     call: NetworkCall,
     timestamp: String,
     now_ms: u64,
-) -> Result<serde_json::Value, DomainError>
+) -> Result<serde_json::Value, crate::ToolFailure>
 where
     P: PersistencePort + 'static,
     A: ArtifactPort + Clone + 'static,
@@ -1027,7 +1027,9 @@ where
             capture_id: admitted_task_id.clone(),
             task_id: admitted_task_id,
         })
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "Task result encoding failed"));
+        .map_err(|_| {
+            DomainError::new(ErrorCode::InternalError, "Task result encoding failed").into()
+        });
     }
     core.run_synchronous(
         SynchronousAdmission {
@@ -1044,7 +1046,7 @@ where
         now_ms,
     )
     .await
-    .map_err(|error| DomainError::new(error.code, "network execution failed"))
+    .map_err(crate::ToolFailure::Settled)
 }
 
 /// S-NET-003 keeps one Contract response inside the S-CONTRACT-002 frame limit, so one
@@ -1083,7 +1085,7 @@ async fn stop_capture<P, A, E, C, H>(
     capture_id: CaptureId,
     timestamp: String,
     now_ms: u64,
-) -> Result<serde_json::Value, DomainError>
+) -> Result<serde_json::Value, crate::ToolFailure>
 where
     P: PersistencePort + 'static,
     A: ArtifactPort + Clone + 'static,
@@ -1096,7 +1098,7 @@ where
         return Ok(value);
     }
     if task_is_terminal(snapshot.state) {
-        return Err(capture_stop_failure(&snapshot));
+        return Err(capture_stop_failure(&snapshot).into());
     }
     let capability = core.capability_snapshot()?;
     let call = NetworkCall::Capture(NetworkCaptureInput::Stop {
@@ -1119,7 +1121,7 @@ where
         now_ms,
     )
     .await
-    .map_err(|error| DomainError::new(error.code, "network capture stop failed"))?;
+    .map_err(crate::ToolFailure::Settled)?;
     let deadline = Instant::now() + Duration::from_millis(NETWORK_CAPTURE_STOP_WAIT_MS);
     loop {
         let snapshot = capture_task(core, &capture_id, now_ms).await?;
@@ -1127,13 +1129,14 @@ where
             return Ok(value);
         }
         if task_is_terminal(snapshot.state) {
-            return Err(capture_stop_failure(&snapshot));
+            return Err(capture_stop_failure(&snapshot).into());
         }
         if Instant::now() >= deadline {
             return Err(DomainError::new(
                 ErrorCode::Timeout,
                 "network capture did not settle inside the stop bound",
-            ));
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

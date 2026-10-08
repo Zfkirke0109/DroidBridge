@@ -1,35 +1,28 @@
 use crate::{
     android::HelperPort,
     command::{RootCommandGuard, VisualRootPrimitive},
-    companion::{CompanionPort, CompanionPrimitiveRequest, CompanionPrimitiveResult},
+    content::RootContentPort,
 };
 use contract::{
     ErrorCode, FileTarget, FileTargetType, FilesystemCall, FilesystemInspectInput, ImageFormat,
     Region,
 };
-use domain::{DomainError, ExecutorRequest, Preflight, VisualRoute};
+use domain::{DomainError, Preflight};
 use runtime::{
-    AdmittedExecution, AndroidFrameworkFilesystemPort, CapabilityPort, ExecutionFailure,
-    ExecutorRecord, FilesystemCandidate, FilesystemFrameworkPort, FilesystemPreflightPort,
-    LocalExecutionClaim, ProviderToken, VisualDisplaySnapshot, VisualEncodedImage,
-    VisualHierarchySnapshot, VisualInteractionRequest, VisualPrimitivePort, VisualTransformSource,
-    input_text_delivers, meta_modifier_keys, parse_privileged_hierarchy,
+    AdmittedExecution, CapabilityPort, ExecutionFailure, ExecutorRecord, FilesystemCandidate,
+    FilesystemPreflightPort, LocalExecutionClaim, ProviderToken, VisualDisplaySnapshot,
+    VisualEncodedImage, VisualHierarchySnapshot, VisualInteractionRequest, VisualPrimitivePort,
+    VisualTransformSource, input_text_delivers, meta_modifier_keys, parse_privileged_hierarchy,
     resolve_filesystem_executor,
 };
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::{
-        fd::OwnedFd,
-        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, chown},
-    },
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, chown},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
 };
 
-const COMPANION_POLL: Duration = Duration::from_millis(25);
-const COMPANION_DEADLINE: Duration = Duration::from_millis(15_000);
 const PNG_LIMIT: usize = 8 * 1_024 * 1_024;
 
 #[derive(Clone)]
@@ -37,9 +30,10 @@ pub(crate) struct MagiskVisualPort<C> {
     canonical_base: PathBuf,
     capabilities: C,
     root: Arc<RootCommandGuard>,
-    companion: CompanionPort,
-    framework: AndroidFrameworkFilesystemPort<CompanionPort>,
+    content: RootContentPort,
     helper: HelperPort,
+    /// The jar whose hierarchy child reads the screen; it ships in the module for every API.
+    framework_jar: PathBuf,
 }
 
 /// `KEYCODE_PASTE`: the focused editor inserts the primary clip.
@@ -53,8 +47,9 @@ impl<C> MagiskVisualPort<C> {
         canonical_base: PathBuf,
         capabilities: C,
         root: Arc<RootCommandGuard>,
-        companion: CompanionPort,
+        content: RootContentPort,
         helper: HelperPort,
+        framework_jar: PathBuf,
     ) -> Self {
         cleanup_visual_temps(&canonical_base);
         Self {
@@ -62,8 +57,8 @@ impl<C> MagiskVisualPort<C> {
             capabilities,
             helper,
             root,
-            framework: AndroidFrameworkFilesystemPort::new(companion.clone()),
-            companion,
+            content,
+            framework_jar,
         }
     }
 }
@@ -81,16 +76,18 @@ where
         if execution.executor.provider != ProviderToken::MagiskNative {
             return Err(stale("Magisk display admission has a different provider"));
         }
-        let framework = self.framework_execution(execution).map_err(clean_failure)?;
-        let result = self.companion_call(
-            &framework,
-            "VisualDisplaySnapshot",
-            serde_json::json!({"operation":"display"}),
-            Vec::new(),
-            claim,
-        )?;
-        require_no_descriptors(&result)?;
-        runtime::decode_display_value(result.payload).map_err(clean_failure)
+        let display: contract::DisplayGeometry =
+            serde_json::from_value(self.helper.display_snapshot().map_err(clean_failure)?)
+                .map_err(|_| {
+                    clean_failure(DomainError::new(
+                        ErrorCode::IoError,
+                        "framework display snapshot is invalid",
+                    ))
+                })?;
+        Ok(VisualDisplaySnapshot {
+            display_generation: geometry_generation(&display),
+            display,
+        })
     }
 
     fn capture_image(
@@ -110,29 +107,11 @@ where
         &self,
         execution: &AdmittedExecution,
         display: &VisualDisplaySnapshot,
-        observation_id: &contract::UuidV4,
+        _observation_id: &contract::UuidV4,
         max_nodes: u32,
         claim: &LocalExecutionClaim,
     ) -> Result<VisualHierarchySnapshot, ExecutionFailure> {
         claim.checkpoint().map_err(clean_failure)?;
-        if execution.executor.provider == ProviderToken::Accessibility {
-            let result = self.companion_call(
-                execution,
-                "AccessibilityObserve",
-                serde_json::json!({
-                    "operation":"hierarchy",
-                    "observation_id":observation_id,
-                    "max_nodes":max_nodes,
-                    "display":display.display,
-                    "display_generation":display.display_generation,
-                }),
-                Vec::new(),
-                claim,
-            )?;
-            require_no_descriptors(&result)?;
-            return runtime::decode_accessibility_hierarchy_value(result.payload)
-                .map_err(clean_failure);
-        }
         if execution.executor.provider != ProviderToken::MagiskNative {
             return Err(stale("Magisk hierarchy admission has a different provider"));
         }
@@ -148,20 +127,17 @@ where
         claim: &LocalExecutionClaim,
     ) -> Result<VisualEncodedImage, ExecutionFailure> {
         claim.checkpoint().map_err(clean_failure)?;
-        if execution.executor.provider != ProviderToken::AppFramework {
-            return Err(stale(
-                "Magisk visual transform lost the App framework provider",
-            ));
+        if execution.executor.provider != ProviderToken::MagiskNative {
+            return Err(stale("Magisk visual transform has a different provider"));
         }
         let source = self.open_transform_source(execution, source, claim)?;
-        self.companion_image(
-            execution,
-            "VisualImageTransform",
-            serde_json::json!({"region":region}),
-            Some(("visual_source_image", source)),
-            false,
-            claim,
-        )
+        // The helper runs as root, so it reads the open source through this process's descriptor.
+        let path = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            std::os::fd::AsRawFd::as_raw_fd(&source)
+        ));
+        self.helper_image(execution, &path, region)
     }
 
     fn interact(
@@ -171,80 +147,10 @@ where
         claim: &LocalExecutionClaim,
     ) -> Result<(), ExecutionFailure> {
         claim.checkpoint().map_err(clean_failure)?;
-        match (&execution.executor.provider, request) {
-            (
-                ProviderToken::Accessibility,
-                VisualInteractionRequest::Node {
-                    observation_id,
-                    node_ref,
-                    operation,
-                    text,
-                    display,
-                    proof,
-                },
-            ) => {
-                let primitive = if operation == "text" {
-                    "AccessibilityText"
-                } else {
-                    "AccessibilityNodeAction"
-                };
-                self.companion_delivered(
-                    execution,
-                    primitive,
-                    serde_json::json!({
-                        "observation_id":observation_id,
-                        "node_ref":node_ref,
-                        "operation":operation,
-                        "text":text,
-                        "display":display.display,
-                        "display_generation":display.display_generation,
-                        "proof":runtime::accessibility_proof(&proof)
-                    .ok_or_else(|| stale("Accessibility interaction proof is invalid"))?,
-                    }),
-                    claim,
-                )
-            }
-            (
-                ProviderToken::Accessibility,
-                VisualInteractionRequest::Coordinate {
-                    observation_id,
-                    operation,
-                    from_x,
-                    from_y,
-                    to_x,
-                    to_y,
-                    duration_ms,
-                    display,
-                    proof,
-                },
-            ) => {
-                let proof = runtime::accessibility_proof(&proof)
-                    .ok_or_else(|| stale("Accessibility interaction proof is invalid"))?;
-                self.companion_delivered(
-                    execution,
-                    "AccessibilityGesture",
-                    serde_json::json!({
-                        "observation_id":observation_id,
-                        "operation":operation,
-                        "from_x":from_x,"from_y":from_y,"to_x":to_x,"to_y":to_y,
-                        "duration_ms":duration_ms,
-                        "display":display.display,
-                        "display_generation":display.display_generation,
-                        "proof":proof,
-                    }),
-                    claim,
-                )
-            }
-            (ProviderToken::Accessibility, VisualInteractionRequest::FocusedText { text }) => self
-                .companion_delivered(
-                    execution,
-                    "AccessibilityText",
-                    serde_json::json!({"operation":"focused","text":text}),
-                    claim,
-                ),
-            (ProviderToken::MagiskNative, request) => self.interact_root(execution, request, claim),
-            _ => Err(stale("Magisk visual interaction provider is invalid")),
+        if execution.executor.provider != ProviderToken::MagiskNative {
+            return Err(stale("Magisk visual interaction provider is invalid"));
         }
+        self.interact_root(execution, request, claim)
     }
 }
 
@@ -288,16 +194,7 @@ where
                     "PNG screen capture display changed",
                 )));
             }
-            let framework = self.framework_execution(execution).map_err(clean_failure)?;
-            let reader = temporary.read_only().map_err(clean_failure)?;
-            let encoded = self.companion_image(
-                &framework,
-                "VisualImageTransform",
-                serde_json::json!({"region":null}),
-                Some(("visual_source_image", reader)),
-                false,
-                claim,
-            )?;
+            let encoded = self.helper_image(execution, &temporary.path, None)?;
             if encoded.width != width || encoded.height != height {
                 return Err(clean_failure(DomainError::new(
                     ErrorCode::IoError,
@@ -324,7 +221,10 @@ where
         remove_if_present(&path).map_err(clean_failure)?;
         let run = self.root.run_visual(
             &execution.execution_id,
-            VisualRootPrimitive::HierarchyDump(path.clone()),
+            VisualRootPrimitive::HierarchyDump {
+                output: path.clone(),
+                jar: self.framework_jar.clone(),
+            },
             None,
             claim,
         );
@@ -362,26 +262,27 @@ where
                 duration_ms,
                 display,
                 proof,
+                target,
             } => {
                 let current_display = self.display(execution, claim)?;
                 if current_display != display {
-                    return Err(clean_failure(DomainError::new(
-                        ErrorCode::StaleReference,
-                        "privileged visual display changed",
-                    )));
+                    return Err(clean_failure(runtime::visual_stale(runtime::STALE_DISPLAY)));
                 }
                 let current_scene = parse_privileged_hierarchy(
                     &self.dump_hierarchy(execution, claim)?,
-                    1,
+                    target.as_ref().map_or(1, |target| target.max_nodes),
                     display.clone(),
                 )
                 .map_err(clean_failure)?;
-                if current_scene.proof != proof {
-                    return Err(clean_failure(DomainError::new(
-                        ErrorCode::StaleReference,
-                        "privileged visual scene changed",
-                    )));
-                }
+                runtime::verify_coordinate_scene(
+                    &current_scene,
+                    &proof,
+                    &operation,
+                    from_x,
+                    from_y,
+                    target.as_ref(),
+                )
+                .map_err(clean_failure)?;
                 match operation.as_str() {
                     "tap" => VisualRootPrimitive::Tap {
                         x: from_x,
@@ -505,23 +406,64 @@ where
         }
     }
 
-    fn framework_execution(
+    /// Encodes the image at [source] as the bounded JPEG the visual result carries, in the root
+    /// framework helper.
+    fn helper_image(
         &self,
         execution: &AdmittedExecution,
-    ) -> Result<AdmittedExecution, DomainError> {
-        let capability = self.capabilities.current()?;
-        let executor = domain::resolve_executor(
-            capability.context.host,
-            capability.fence,
-            capability.resolver_facts,
-            ExecutorRequest::Visual(VisualRoute::Transform),
-        )?;
-        Ok(AdmittedExecution {
-            execution_id: execution.execution_id.clone(),
-            task_id: execution.task_id.clone(),
-            executor: ExecutorRecord::from(&executor),
-            payload: execution.payload.clone(),
-        })
+        source: &Path,
+        region: Option<Region>,
+    ) -> Result<VisualEncodedImage, ExecutionFailure> {
+        let output = ExecutionTempFile::create(
+            &self.canonical_base,
+            &execution.execution_id,
+            "visual-encoded.jpg",
+        )
+        .map_err(clean_failure)?;
+        let result = (|| {
+            let wire = self
+                .helper
+                .image_transform(source, &output.path, region.as_ref())
+                .map_err(clean_failure)?;
+            let field = |name: &str| {
+                wire.get(name)
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or_else(|| {
+                        clean_failure(DomainError::new(
+                            ErrorCode::IoError,
+                            "framework image result is invalid",
+                        ))
+                    })
+            };
+            let (width, height, size) = (field("width")?, field("height")?, field("size")?);
+            let mut file = open_no_follow(&output.path).map_err(clean_failure)?;
+            let bytes = read_bounded(&mut file, PNG_LIMIT).map_err(clean_failure)?;
+            if bytes.len() as u64 != size {
+                return Err(clean_failure(DomainError::new(
+                    ErrorCode::IoError,
+                    "visual image size is invalid",
+                )));
+            }
+            runtime::validate_encoded_bytes(ImageFormat::Jpeg, &bytes).map_err(clean_failure)?;
+            Ok(VisualEncodedImage {
+                bytes,
+                format: ImageFormat::Jpeg,
+                width: u32::try_from(width).map_err(|_| {
+                    clean_failure(DomainError::new(
+                        ErrorCode::IoError,
+                        "framework image width is invalid",
+                    ))
+                })?,
+                height: u32::try_from(height).map_err(|_| {
+                    clean_failure(DomainError::new(
+                        ErrorCode::IoError,
+                        "framework image height is invalid",
+                    ))
+                })?,
+                captured_display: None,
+            })
+        })();
+        finish_temp(output, result)
     }
 
     fn open_transform_source(
@@ -541,17 +483,10 @@ where
                 temporary.writer().write_all(&bytes).map_err(io_failure)?;
                 temporary.persist_for_read().map_err(clean_failure)?
             }
-            VisualTransformSource::ContentUri(value) => self
-                .framework
-                .open_read(
-                    execution,
-                    &FileTarget {
-                        target_type: FileTargetType::ContentUri,
-                        value,
-                    },
-                )
-                .map(|source| source.file)
-                .map_err(clean_failure)?,
+            VisualTransformSource::ContentUri(value) => {
+                crate::content::open_content_image(&self.content, execution, value, claim)
+                    .map_err(clean_failure)?
+            }
             VisualTransformSource::Path {
                 path: value,
                 executor: admitted_executor,
@@ -585,143 +520,6 @@ where
         claim.checkpoint().map_err(clean_failure)?;
         Ok(file)
     }
-
-    fn companion_delivered(
-        &self,
-        execution: &AdmittedExecution,
-        primitive: &str,
-        payload: serde_json::Value,
-        claim: &LocalExecutionClaim,
-    ) -> Result<(), ExecutionFailure> {
-        let result = self.companion_call(execution, primitive, payload, Vec::new(), claim)?;
-        require_no_descriptors(&result)?;
-        if result.payload != serde_json::json!({"delivered":true}) {
-            return Err(clean_failure(DomainError::new(
-                ErrorCode::IoError,
-                "Android visual delivery result is invalid",
-            )));
-        }
-        Ok(())
-    }
-
-    fn companion_image(
-        &self,
-        execution: &AdmittedExecution,
-        primitive: &str,
-        payload: serde_json::Value,
-        descriptor: Option<(&str, File)>,
-        captured: bool,
-        claim: &LocalExecutionClaim,
-    ) -> Result<VisualEncodedImage, ExecutionFailure> {
-        let descriptors = descriptor
-            .map(|(role, file)| vec![(role.to_owned(), OwnedFd::from(file))])
-            .unwrap_or_default();
-        let mut result = self.companion_call(execution, primitive, payload, descriptors, claim)?;
-        if result.descriptors.len() != 1 || result.descriptors[0].0 != "visual_encoded_image" {
-            return Err(clean_failure(DomainError::new(
-                ErrorCode::IoError,
-                "visual image result descriptor set is invalid",
-            )));
-        }
-        let wire = runtime::decode_encoded_image_value(result.payload).map_err(clean_failure)?;
-        let (_, descriptor) = result.descriptors.remove(0);
-        let mut file = File::from(descriptor);
-        let bytes = read_bounded(&mut file, PNG_LIMIT).map_err(clean_failure)?;
-        if bytes.len() as u64 != wire.size {
-            return Err(clean_failure(DomainError::new(
-                ErrorCode::IoError,
-                "visual image size is invalid",
-            )));
-        }
-        runtime::validate_encoded_bytes(wire.format, &bytes).map_err(clean_failure)?;
-        if wire.format == ImageFormat::Png
-            && runtime::png_dimensions(&bytes).map_err(clean_failure)? != (wire.width, wire.height)
-        {
-            return Err(clean_failure(DomainError::new(
-                ErrorCode::IoError,
-                "visual PNG dimensions do not match metadata",
-            )));
-        }
-        let captured_display = if captured {
-            Some(VisualDisplaySnapshot {
-                display: wire.display.ok_or_else(|| {
-                    clean_failure(DomainError::new(
-                        ErrorCode::IoError,
-                        "captured display is missing",
-                    ))
-                })?,
-                display_generation: wire.display_generation.ok_or_else(|| {
-                    clean_failure(DomainError::new(
-                        ErrorCode::IoError,
-                        "captured display generation is missing",
-                    ))
-                })?,
-            })
-        } else {
-            if wire.display.is_some() || wire.display_generation.is_some() {
-                return Err(clean_failure(DomainError::new(
-                    ErrorCode::IoError,
-                    "transform returned a captured display",
-                )));
-            }
-            None
-        };
-        Ok(VisualEncodedImage {
-            bytes,
-            format: wire.format,
-            width: wire.width,
-            height: wire.height,
-            captured_display,
-        })
-    }
-
-    fn companion_call(
-        &self,
-        execution: &AdmittedExecution,
-        primitive: &str,
-        payload: serde_json::Value,
-        descriptors: Vec<(String, OwnedFd)>,
-        claim: &LocalExecutionClaim,
-    ) -> Result<CompanionPrimitiveResult, ExecutionFailure> {
-        let (_, mut transaction) = self
-            .companion
-            .submit(CompanionPrimitiveRequest {
-                primitive: primitive.to_owned(),
-                payload,
-                execution_id: execution.execution_id.clone(),
-                descriptors,
-            })
-            .map_err(clean_failure)?;
-        let deadline = Instant::now() + COMPANION_DEADLINE;
-        let mut cancelled = false;
-        let result = loop {
-            cancelled |= claim.checkpoint().is_err();
-            match transaction.poll(COMPANION_POLL) {
-                Some(result) => break result,
-                None if Instant::now() < deadline => {}
-                None => {
-                    return Err(ExecutionFailure {
-                        error: DomainError::new(
-                            ErrorCode::Timeout,
-                            "companion visual primitive did not settle within its deadline",
-                        ),
-                        cleanup_verified: false,
-                    });
-                }
-            }
-        };
-        let result = result.map_err(|error| ExecutionFailure {
-            cleanup_verified: error.reason == "companion execution reported a typed failure",
-            error,
-        })?;
-        if cancelled || claim.checkpoint().is_err() {
-            return Err(clean_failure(DomainError::new(
-                ErrorCode::Cancelled,
-                "visual execution was cancelled",
-            )));
-        }
-        Ok(result)
-    }
 }
 
 struct MagiskVisualPathPreflight;
@@ -736,13 +534,13 @@ impl FilesystemPreflightPort for MagiskVisualPathPreflight {
     }
 }
 
-struct ExecutionTempFile {
+pub(crate) struct ExecutionTempFile {
     path: PathBuf,
     writer: Option<File>,
 }
 
 impl ExecutionTempFile {
-    fn create(
+    pub(crate) fn create(
         base: &Path,
         execution_id: &contract::UuidV4,
         name: &str,
@@ -764,7 +562,7 @@ impl ExecutionTempFile {
         })
     }
 
-    fn writer(&self) -> &File {
+    pub(crate) fn writer(&self) -> &File {
         self.writer
             .as_ref()
             .expect("visual temp writer remains open")
@@ -778,11 +576,7 @@ impl ExecutionTempFile {
         read_bounded(&mut writer, limit)
     }
 
-    fn read_only(&self) -> Result<File, DomainError> {
-        open_no_follow(&self.path)
-    }
-
-    fn persist_for_read(mut self) -> Result<File, DomainError> {
+    pub(crate) fn persist_for_read(mut self) -> Result<File, DomainError> {
         let mut writer = self.writer.take().ok_or_else(|| {
             DomainError::new(ErrorCode::InternalError, "visual source writer is closed")
         })?;
@@ -814,6 +608,15 @@ impl Drop for ExecutionTempFile {
     }
 }
 
+/// The root path has no display-change callback. Its geometry names the display state instead, so
+/// an observation and an interaction agree exactly when the display they saw is the same.
+fn geometry_generation(display: &contract::DisplayGeometry) -> u64 {
+    (u64::from(display.width) << 31)
+        | (u64::from(display.height) << 16)
+        | (u64::from((display.rotation / 90) & 3) << 14)
+        | u64::from(display.density_dpi.unwrap_or(0).min(0x3FFF))
+}
+
 fn finish_temp<T>(
     mut temporary: ExecutionTempFile,
     result: Result<T, ExecutionFailure>,
@@ -825,16 +628,6 @@ fn finish_temp<T>(
             error,
             cleanup_verified: false,
         }),
-    }
-}
-
-fn require_no_descriptors(result: &CompanionPrimitiveResult) -> Result<(), ExecutionFailure> {
-    if result.descriptors.is_empty() {
-        Ok(())
-    } else {
-        Err(clean_failure(io_domain(
-            "Android visual result returned unexpected descriptors",
-        )))
     }
 }
 
@@ -935,6 +728,6 @@ fn io_domain(reason: &'static str) -> DomainError {
     DomainError::new(ErrorCode::IoError, reason)
 }
 
-fn io_error(_error: std::io::Error) -> DomainError {
-    io_domain("visual file operation failed")
+fn io_error(error: std::io::Error) -> DomainError {
+    DomainError::os(ErrorCode::IoError, "visual file operation failed", &error)
 }

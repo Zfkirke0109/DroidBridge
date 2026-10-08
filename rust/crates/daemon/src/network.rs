@@ -16,8 +16,6 @@ use contract::{
     PacketInjectResult, RouteEntry, SocketEntry, SocketProtocol,
 };
 use domain::DomainError;
-#[cfg(unix)]
-use runtime::AndroidExecutionDispatch;
 use runtime::{
     AdmittedExecution, ArtifactPort, CaptureSettlement, Established, ExecutionFailure,
     LocalExecutionClaim, NETWORK_MAX_CAPTURE_BYTES, NetworkDefaultChangedEvent,
@@ -1152,27 +1150,20 @@ const NETLINK_REPLY_BYTES: usize = 262_144;
 #[cfg(unix)]
 const SOCKET_TABLE_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The App primitive that answers with the Android network facts this daemon cannot observe
-/// itself, and the empty request it carries.
-#[cfg(unix)]
-const ANDROID_NETWORK_SNAPSHOT: &str = "AndroidNetworkSnapshot";
-#[cfg(unix)]
-const NETWORK_SNAPSHOT_REQUEST: &[u8] = b"{}";
-
 /// The Magisk host's own observation source. Interfaces, addresses and routes are this daemon's
 /// own netlink queries as S-NET-001 fixes them, sockets are its own `/proc/net` reads, and DNS
-/// is the authenticated companion's `LinkProperties` answer. Shizuku is never consulted for a
-/// family already assigned to Magisk.
+/// is the default network's `LinkProperties` read by its own framework helper. Shizuku is never
+/// consulted for a family already assigned to Magisk.
 #[cfg(unix)]
 #[derive(Clone)]
 pub struct MagiskNetworkSource {
-    companion: crate::companion::CompanionPort,
+    helper: crate::android::HelperPort,
 }
 
 #[cfg(unix)]
 impl MagiskNetworkSource {
-    pub fn new(companion: crate::companion::CompanionPort) -> Self {
-        Self { companion }
+    pub(crate) fn new(helper: crate::android::HelperPort) -> Self {
+        Self { helper }
     }
 
     /// One `RTM_GETLINK`/`RTM_GETADDR`/`RTM_GETROUTE` dump. Every raw syscall pointer stays
@@ -1527,31 +1518,22 @@ impl NetworkHostSource for MagiskNetworkSource {
         Self::table(table)
     }
 
-    /// S-NET-001 assigns `dns` to Android's `LinkProperties.getDnsServers()` while the APK
-    /// companion exists, so the daemon asks the companion it is already authenticated with,
-    /// through the same S-ANDROID-001 primitive the APK surface serves and under the fence of
-    /// the execution this observe belongs to. A companion that cannot answer, or an answer this
-    /// host cannot read, leaves the family unestablished.
+    /// S-NET-001 assigns `dns` to Android's `LinkProperties.getDnsServers()`, which the framework
+    /// helper reads for the default network. A helper that cannot answer, or an answer this host
+    /// cannot read, leaves the family unestablished.
     fn dns_servers(
         &self,
-        execution: &AdmittedExecution,
+        _execution: &AdmittedExecution,
     ) -> Result<Option<Vec<String>>, DomainError> {
-        let Ok(answer) = self.companion.dispatch(
-            ANDROID_NETWORK_SNAPSHOT,
-            NETWORK_SNAPSHOT_REQUEST,
-            execution,
-        ) else {
-            return Ok(None);
-        };
-        let Ok(reply) = serde_json::from_slice::<serde_json::Value>(&answer.payload) else {
+        let Ok(reply) = self.helper.network_dns() else {
             return Ok(None);
         };
         Ok(dns_servers_from_snapshot(&reply))
     }
 }
 
-/// The companion's `LinkProperties` DNS servers, in the `{"dns":[{"server":"..."}]}` reply shape
-/// the APK surface encodes. A snapshot without a usable `dns` array, or with an entry that
+/// `LinkProperties` DNS servers, in the `{"dns":[{"server":"..."}]}` reply shape the APK surface
+/// and the framework helper encode. A snapshot without a usable `dns` array, or with an entry that
 /// carries no server, leaves the family unestablished rather than reporting a shortened one.
 pub fn dns_servers_from_snapshot(payload: &serde_json::Value) -> Option<Vec<String>> {
     payload

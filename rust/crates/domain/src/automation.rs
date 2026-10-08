@@ -1,11 +1,11 @@
 use crate::DomainError;
 use contract::{
     AndroidClipboardInput, AndroidLaunchInput, Automation, AutomationAction, AutomationAndroidCall,
-    AutomationCommandCall, AutomationCompatibleCall, AutomationFilesystemCall, AutomationId,
-    AutomationElementInput, AutomationNetworkCall, AutomationTrigger, AutomationVisualCall,
-    CommandRunInput, ElementOperation,
-    ConditionOperator, ExecutionId, FileTarget, FilesystemDownloadInput, FilesystemManageInput,
-    NetworkDiagnoseInput, PointTarget, RunAs, ScalarValue, TaskId, VisualInteractInput,
+    AutomationCommandCall, AutomationCompatibleCall, AutomationElementInput,
+    AutomationFilesystemCall, AutomationId, AutomationNetworkCall, AutomationTrigger,
+    AutomationVisualCall, CommandRunInput, ConditionOperator, ElementOperation, ExecutionId,
+    FileTarget, FilesystemDownloadInput, FilesystemManageInput, NetworkDiagnoseInput, PointTarget,
+    RunAs, ScalarValue, TaskId, VisualInteractInput,
 };
 use std::collections::BTreeMap;
 
@@ -192,7 +192,12 @@ fn validate_visual(input: &VisualInteractInput) -> Result<(), DomainError> {
 pub const MAX_ELEMENT_WAIT_MS: u64 = 60_000;
 
 fn validate_element(input: &AutomationElementInput) -> Result<(), DomainError> {
-    bounded(&input.value, 1, 1024, "element match value is out of bounds")?;
+    bounded(
+        &input.value,
+        1,
+        1024,
+        "element match value is out of bounds",
+    )?;
     match (input.operation, &input.text) {
         (ElementOperation::Text, Some(text)) => {
             bounded(text, 0, 65_536, "element text is out of bounds")?;

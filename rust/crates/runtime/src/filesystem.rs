@@ -1,8 +1,8 @@
 use crate::{
     AdmittedExecution, ArtifactPort, CapabilityPort, ExecutionCancelOutcome, ExecutionCompletion,
     ExecutionFailure, ExecutionOutcome, ExecutionPayload, ExecutionPort, HostControlPort,
-    LocalExecutionClaims, PersistencePort, PortFuture, ProviderToken, RESERVE_FLOOR_BYTES,
-    RuntimeCore, SynchronousAdmission, TaskAdmission, TaskAdmissionResult, UI_ENVELOPE_LIMIT_BYTES,
+    LocalExecutionClaims, PersistencePort, PortFuture, ProviderToken, RuntimeCore,
+    SynchronousAdmission, TaskAdmission, TaskAdmissionResult, UI_ENVELOPE_LIMIT_BYTES,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use contract::{
@@ -60,7 +60,7 @@ pub async fn handle_filesystem_public<P, A, E, C, H>(
     call: contract::FilesystemCall,
     timestamp: String,
     now_ms: u64,
-) -> Result<serde_json::Value, DomainError>
+) -> Result<serde_json::Value, crate::ToolFailure>
 where
     P: PersistencePort + 'static,
     A: ArtifactPort + Clone + 'static,
@@ -79,7 +79,8 @@ where
             FilesystemExecutionResult::Task(_) => Err(DomainError::new(
                 ErrorCode::InternalError,
                 "executor-free filesystem request produced a Task",
-            )),
+            )
+            .into()),
         };
     };
     let action = filesystem_action(&call);
@@ -98,7 +99,7 @@ where
                 route,
                 payload,
                 created_at: timestamp.clone(),
-                settlement_bound_bytes: RESERVE_FLOOR_BYTES,
+                settlement_bound_bytes: filesystem_settlement_bound_bytes(),
                 now_ms,
             })
             .await?;
@@ -117,7 +118,9 @@ where
         serde_json::to_value(TaskAccepted {
             task_id: admitted_task_id,
         })
-        .map_err(|_| DomainError::new(ErrorCode::InternalError, "Task result encoding failed"))
+        .map_err(|_| {
+            DomainError::new(ErrorCode::InternalError, "Task result encoding failed").into()
+        })
     } else {
         core.run_synchronous(
             SynchronousAdmission {
@@ -127,15 +130,21 @@ where
                 operation: format!("filesystem.{action}"),
                 route,
                 payload,
-                settlement_bound_bytes: RESERVE_FLOOR_BYTES,
+                settlement_bound_bytes: filesystem_settlement_bound_bytes(),
                 now_ms,
             },
             timestamp,
             now_ms,
         )
         .await
-        .map_err(|error| DomainError::new(error.code, "filesystem execution failed"))
+        .map_err(crate::ToolFailure::Settled)
     }
+}
+
+/// An inline read or listing may fill the S-CONTRACT-002 frame, so one admitted filesystem call
+/// reserves that frame for its settlement rather than the store's floor.
+pub const fn filesystem_settlement_bound_bytes() -> u64 {
+    UI_ENVELOPE_LIMIT_BYTES as u64
 }
 
 fn filesystem_action(call: &contract::FilesystemCall) -> &'static str {
@@ -170,17 +179,21 @@ pub struct FilesystemFrameworkSource {
     pub total_size: Option<u64>,
 }
 
+/// Serves `content://` targets. An implementation that starts processes records any cleanup it
+/// cannot verify on [claim].
 pub trait FilesystemFrameworkPort: Send + Sync {
     fn inspect(
         &self,
         execution: &AdmittedExecution,
         input: FilesystemInspectInput,
+        claim: &crate::LocalExecutionClaim,
     ) -> Result<FilesystemInspectResult, DomainError>;
 
     fn open_read(
         &self,
         execution: &AdmittedExecution,
         target: &FileTarget,
+        claim: &crate::LocalExecutionClaim,
     ) -> Result<FilesystemFrameworkSource, DomainError>;
 }
 
@@ -360,6 +373,7 @@ impl FilesystemFrameworkPort for UnavailableFilesystemFrameworkPort {
         &self,
         _execution: &AdmittedExecution,
         _input: FilesystemInspectInput,
+        _claim: &crate::LocalExecutionClaim,
     ) -> Result<FilesystemInspectResult, DomainError> {
         Err(DomainError::new(
             ErrorCode::CapabilityUnavailable,
@@ -371,6 +385,7 @@ impl FilesystemFrameworkPort for UnavailableFilesystemFrameworkPort {
         &self,
         _execution: &AdmittedExecution,
         _target: &FileTarget,
+        _claim: &crate::LocalExecutionClaim,
     ) -> Result<FilesystemFrameworkSource, DomainError> {
         Err(DomainError::new(
             ErrorCode::CapabilityUnavailable,
@@ -405,6 +420,7 @@ impl<D: AndroidExecutionDispatch> FilesystemFrameworkPort for AndroidFrameworkFi
         &self,
         execution: &AdmittedExecution,
         input: FilesystemInspectInput,
+        _claim: &crate::LocalExecutionClaim,
     ) -> Result<FilesystemInspectResult, DomainError> {
         let payload = serde_json::to_vec(&input).map_err(|_| {
             DomainError::new(ErrorCode::InternalError, "content inspect encoding failed")
@@ -435,6 +451,7 @@ impl<D: AndroidExecutionDispatch> FilesystemFrameworkPort for AndroidFrameworkFi
         &self,
         execution: &AdmittedExecution,
         target: &FileTarget,
+        _claim: &crate::LocalExecutionClaim,
     ) -> Result<FilesystemFrameworkSource, DomainError> {
         let payload = serde_json::to_vec(target).map_err(|_| {
             DomainError::new(ErrorCode::InternalError, "content target encoding failed")
@@ -777,13 +794,16 @@ fn preflight_existing_mutation(target: &FileTarget) -> Result<bool, DomainError>
     Ok(preflight_sticky_allows(&path))
 }
 
+/// A destination this identity sees already present keeps it eligible: existence is the same for
+/// every identity, so the operation's own exclusive publication answers `ALREADY_EXISTS`. Absence
+/// is not treated the same way, because scoped storage hides paths from the App that exist.
 fn preflight_destination(target: &FileTarget, overwrite: bool) -> Result<bool, DomainError> {
     let path = preflight_path(target)?;
     if !preflight_mutation_parent(&path)? {
         return Ok(false);
     }
     match fs::symlink_metadata(&path) {
-        Ok(_) if !overwrite => Ok(false),
+        Ok(_) if !overwrite => Ok(true),
         Ok(_) => Ok(preflight_sticky_allows(&path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(_) => Ok(false),
@@ -793,7 +813,8 @@ fn preflight_destination(target: &FileTarget, overwrite: bool) -> Result<bool, D
 fn preflight_mkdir(target: &FileTarget, parents: bool) -> Result<bool, DomainError> {
     let path = preflight_path(target)?;
     match fs::symlink_metadata(&path) {
-        Ok(metadata) => Ok(parents && metadata.is_dir()),
+        Ok(metadata) if parents && metadata.is_dir() => Ok(true),
+        Ok(_) => preflight_mutation_parent(&path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if parents {
                 let Some(existing) = path.ancestors().skip(1).find(|ancestor| ancestor.exists())
@@ -1091,7 +1112,12 @@ where
     let kernel = FilesystemKernel::new(artifacts);
     let operation = filesystem_call_operation(&call);
     let execution_result = match execution.executor.provider {
+        // Content URIs are served by the framework port on either host; the root host's port
+        // reaches the provider through its own root identity.
         ProviderToken::AppFramework => {
+            execute_framework_filesystem(&kernel, &framework, execution, call, claim)
+        }
+        _ if targets_content_uri(&call) => {
             execute_framework_filesystem(&kernel, &framework, execution, call, claim)
         }
         ProviderToken::Shizuku => {
@@ -1410,7 +1436,7 @@ fn primitive_preflight_destination<P: FilesystemPrimitivePort>(
         return Ok(false);
     }
     match primitives.lstat(execution, &path) {
-        Ok(_) if !overwrite => Ok(false),
+        Ok(_) if !overwrite => Ok(true),
         Ok(_) => Ok(primitive_preflight_sticky_allows(
             primitives, execution, &path,
         )),
@@ -1427,7 +1453,12 @@ fn primitive_preflight_mkdir<P: FilesystemPrimitivePort>(
 ) -> Result<bool, DomainError> {
     let path = preflight_path(target)?;
     match primitives.lstat(execution, &path) {
-        Ok(metadata) => Ok(parents && remote_file_type(metadata.mode) == FileType::Directory),
+        Ok(metadata) if parents && remote_file_type(metadata.mode) == FileType::Directory => {
+            Ok(true)
+        }
+        Ok(_) => Ok(primitive_preflight_mutation_parent(
+            primitives, execution, &path,
+        )),
         Err(error) if error.code == ErrorCode::NotFound => {
             if !parents {
                 return Ok(primitive_preflight_mutation_parent(
@@ -2973,7 +3004,7 @@ where
         contract::FilesystemCall::Inspect(input) => {
             validate_inspect_input(&input)?;
             require_content_uri(&input.target)?;
-            serde_json::to_value(framework.inspect(execution, input)?)
+            serde_json::to_value(framework.inspect(execution, input, claim)?)
         }
         contract::FilesystemCall::Read(input) => {
             let ReadSource::Target { target } = &input.source else {
@@ -2983,7 +3014,7 @@ where
                 ));
             };
             require_content_uri(target)?;
-            let source = framework.open_read(execution, target)?;
+            let source = framework.open_read(execution, target, claim)?;
             cancellation_checkpoint(Some(claim))?;
             serde_json::to_value(kernel.read_opened(input, source.file, source.total_size)?)
         }
@@ -3833,6 +3864,19 @@ fn require_path(target: &FileTarget) -> Result<(), DomainError> {
             ErrorCode::Unsupported,
             "content URI requires the Android framework filesystem adapter",
         ))
+    }
+}
+
+fn targets_content_uri(call: &contract::FilesystemCall) -> bool {
+    match call {
+        contract::FilesystemCall::Inspect(input) => {
+            input.target.target_type == FileTargetType::ContentUri
+        }
+        contract::FilesystemCall::Read(input) => matches!(
+            &input.source,
+            ReadSource::Target { target } if target.target_type == FileTargetType::ContentUri
+        ),
+        _ => false,
     }
 }
 
