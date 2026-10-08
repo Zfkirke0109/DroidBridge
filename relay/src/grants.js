@@ -15,6 +15,7 @@
  *   client:<client_id>    dynamically registered client
  *   cimd:<sha256(url)>    cached client ID metadata document, at most 1 h
  *   rl:register           registration timestamps of the last hour
+ *   rl:register-source:<salted IP hash>  source registration times, expires after 1 h
  *
  * Every collection is bounded: pending consents (50), clients (100), cached documents (20),
  * and per family 8 access and 16 refresh hashes; codes need the phone's pairing code.
@@ -33,7 +34,7 @@ export const TTL = {
 
 const FAMILY_ACCESS_KEEP = 8;
 const FAMILY_REFRESH_KEEP = 16;
-const EXPIRING_PREFIXES = ['pending:', 'code:', 'at:', 'rt:', 'cimd:'];
+const EXPIRING_PREFIXES = ['pending:', 'code:', 'at:', 'rt:', 'cimd:', 'rl:register-source:'];
 /** `dbrr_<family id: 16 random bytes>.<secret: 32 random bytes>`, both base64url. */
 const REFRESH_TOKEN = /^dbrr_([A-Za-z0-9_-]{22})\.[A-Za-z0-9_-]{43}$/;
 

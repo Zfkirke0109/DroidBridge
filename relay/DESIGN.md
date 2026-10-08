@@ -260,7 +260,11 @@ Follows the MCP 2026-07-28 authorization spec.
   Cached for at most 1 hour.
 - **Dynamic Client Registration** (`POST /register`, kept for compatibility): public clients only
   (`token_endpoint_auth_method` absent or `none`), every redirect URI must pass the redirect
-  policy, at most 20 registrations per hour and 100 stored clients.
+  policy, at most 5 registrations per Cloudflare source IP per hour, 20 in all per hour, and
+  100 stored clients. Source history uses the same salted hash and missing/malformed-IP fallback
+  as pending consents. Its record expires after one hour and is purged by the next sweep; a
+  distributed set of sources can still fill the global 20-per-hour allowance. Rate limiting
+  new registrations does not remove existing clients.
 - **Redirect policy** (applies to both): exactly `https://claude.ai/api/mcp/auth_callback`,
   `https://claude.com/api/mcp/auth_callback`, loopback `http://localhost:<port>/callback` or
   `http://127.0.0.1:<port>/callback` (Claude Code), or an exact URI in `EXTRA_REDIRECT_URIS`
@@ -282,7 +286,7 @@ Follows the MCP 2026-07-28 authorization spec.
   Cloudflare normally sets this header at the edge; same-zone Worker subrequests can derive it
   from a script-modifiable `x-real-ip`, while cross-zone Worker subrequests share Cloudflare's
   Worker client IP. People behind one NAT may share a bucket, and distributed sources can still
-  fill the 50-request global cap. The global 20-per-hour client-registration cap is separate.
+  fill the 50-request global cap. Client registration has separate hourly limits above.
   The page answers a wrong code and a missing or expired pairing code identically, so it never
   reveals whether a pairing is active. The phone sends the relay only the code's SHA-256 (of
   the normalized uppercase code without the dash), and that hash is all the relay stores. The

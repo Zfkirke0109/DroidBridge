@@ -272,12 +272,13 @@ export async function pair(t, normalizedCode, ttlSeconds = 600) {
 /**
  * @param {ReturnType<typeof makeRelay>} t
  * @param {Record<string, unknown>} metadata
+ * @param {Record<string, string>} [headers]
  */
-export async function register(t, metadata = {}) {
+export async function register(t, metadata = {}, headers = {}) {
   return t.relay.fetch(
     req('/register', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...headers },
       body: JSON.stringify({ client_name: 'Claude', redirect_uris: [CLAUDE_CALLBACK], ...metadata }),
     }),
   );

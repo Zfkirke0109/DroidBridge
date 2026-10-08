@@ -216,8 +216,10 @@ with HTTP 400 or 413 before delivery. A request's `id` is a string or an integer
 message with a `result` or `error` member besides its `method` is refused with 400 too
 (DroidBridge would refuse it without running it). Phone responses up to 13,048,576 bytes (the
 phone's 12,000,000-byte MCP response limit plus 1 MiB of envelope; a larger reply is refused and
-Claude gets the invalid-reply error at once), 20 client registrations per hour, 100 registered
-clients, 50 waiting consent requests (10 per client).
+Claude gets the invalid-reply error at once), 20 client registrations per hour (5 per Cloudflare
+source IP), 100 registered clients, 50 waiting consent requests (10 per client and source IP).
+Requests without a usable source IP share a bounded fallback bucket. Several source IPs can
+still reach the global limits; registrations already made remain usable.
 
 ## Costs
 

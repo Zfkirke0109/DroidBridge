@@ -438,13 +438,46 @@ test('/register validation, rate limit and client cap', async () => {
   const big = await register(t, { pad: 'x'.repeat(17 * 1024) });
   assert.equal(big.status, 413);
 
-  // 20 registrations per hour.
-  for (let i = 0; i < 20; i += 1) assert.equal((await register(t)).status, 201);
-  const limited = await register(t);
+  // 20 registrations per hour overall, even when several sources each stay within their cap.
+  const source = (n) => ({ 'cf-connecting-ip': `198.51.100.${n}` });
+  for (let i = 0; i < 20; i += 1) {
+    assert.equal((await register(t, {}, source(1 + Math.floor(i / 5)))).status, 201);
+  }
+  const limited = await register(t, {}, source(5));
   assert.equal(limited.status, 429);
   assert.ok(Number(limited.headers.get('retry-after')) > 0);
   await t.clock.advance(60 * 60 * 1000 + 1);
-  assert.equal((await register(t)).status, 201);
+  assert.equal((await register(t, {}, source(1))).status, 201);
+});
+
+test('/register: one source cannot exhaust the global hourly allowance', async () => {
+  const t = makeRelay();
+  const attacker = { 'cf-connecting-ip': '198.51.100.10' };
+  const legitimate = { 'cf-connecting-ip': '203.0.113.25' };
+  const first = await register(t, {}, attacker);
+  assert.equal(first.status, 201);
+  const existingClientId = (await first.json()).client_id;
+  for (let i = 1; i < 5; i += 1) assert.equal((await register(t, {}, attacker)).status, 201);
+  const limited = await register(t, {}, attacker);
+  assert.equal(limited.status, 429);
+  assert.ok(Number(limited.headers.get('retry-after')) > 0);
+  assert.equal((await authorizeGet(t, cimdParams(existingClientId), attacker)).status, 200,
+    'an existing client remains usable after its source reaches the registration limit');
+  assert.equal((await register(t, {}, legitimate)).status, 201);
+  assert.equal(t.storage.keys('client:').length, 6);
+  const keys = t.storage.keys('rl:register-source:');
+  assert.equal(keys.length, 2);
+  assert.ok(keys.every((key) => !key.includes('198.51.100.10') && !key.includes('203.0.113.25')));
+  await t.clock.advance(60 * 60 * 1000 + 1);
+  await t.relay.maybeSweep();
+  assert.equal(t.storage.keys('rl:register-source:').length, 0, 'source hashes expire after one hour');
+});
+
+test('/register: missing and malformed edge IP values share a bounded fallback', async () => {
+  const t = makeRelay();
+  for (let i = 0; i < 5; i += 1) assert.equal((await register(t)).status, 201);
+  assert.equal((await register(t, {}, { 'cf-connecting-ip': '999.999.999.999' })).status, 429);
+  assert.equal((await register(t, {}, { 'cf-connecting-ip': '2001:db8::26' })).status, 201);
 });
 
 test('/register evicts the oldest client without live tokens at 100 clients', async () => {

@@ -50,6 +50,7 @@ export const OAUTH_LIMITS = Object.freeze({
   pendingPerSourceMax: 10,
   clientsMax: 100,
   registrationsPerHour: 20,
+  registrationsPerSourcePerHour: 5,
   /** failed submissions before one consent request is discarded */
   requestMaxAttempts: 3,
   stateMaxLength: 2048,
@@ -152,6 +153,17 @@ function sourceAddress(value) {
     }
   }
   return 'unknown';
+}
+
+/**
+ * A short-lived, deployment-specific pseudonym for one Cloudflare source IP. The raw address
+ * never enters Durable Object storage.
+ * @param {import('./relay.js').Relay} relay
+ * @param {Request} request
+ */
+function sourceHashForRequest(relay, request) {
+  const source = sourceAddress(request.headers.get('cf-connecting-ip'));
+  return sha256Hex(`${relay.config.deviceKeyHash}\0${source}`);
 }
 
 /**
@@ -464,8 +476,7 @@ export class OAuthServer {
     // CF-Connecting-IP is set by Cloudflare's edge for ordinary incoming requests. A missing or
     // malformed value shares one bounded fallback bucket. Never persist the raw address; the
     // device-key hash is a deployment-specific secret salt for this short-lived pending record.
-    const source = sourceAddress(request.headers.get('cf-connecting-ip'));
-    const sourceHash = await sha256Hex(`${this.relay.config.deviceKeyHash}\0${source}`);
+    const sourceHash = await sourceHashForRequest(this.relay, request);
     await this.relay.maybeSweep();
     return this.relay.lock.run(async () => {
       const now = this.relay.now();
@@ -818,6 +829,7 @@ export class OAuthServer {
       return fail(400, 'invalid_client_metadata', `client_name must be plain text of at most ${OAUTH_LIMITS.clientNameMax} characters.`);
     }
 
+    const sourceHash = await sourceHashForRequest(this.relay, request);
     await this.relay.maybeSweep();
     return this.relay.lock.run(async () => {
       const now = this.relay.now();
@@ -826,8 +838,18 @@ export class OAuthServer {
       const recent = ((await this.storage.get('rl:register')) ?? []).filter(
         (/** @type {unknown} */ at) => typeof at === 'number' && at > hourAgo,
       );
-      if (recent.length >= OAUTH_LIMITS.registrationsPerHour) {
-        const retryAfter = Math.max(1, Math.ceil((Math.min(...recent) - hourAgo) / 1000));
+      const sourceKey = `rl:register-source:${sourceHash}`;
+      const sourceRecord = await this.storage.get(sourceKey);
+      /** @type {number[]} */
+      const sourceRecent = (Array.isArray(sourceRecord?.times) ? sourceRecord.times : []).filter(
+        (/** @type {unknown} */ at) => typeof at === 'number' && at > hourAgo,
+      );
+      const globalFull = recent.length >= OAUTH_LIMITS.registrationsPerHour;
+      const sourceFull = sourceRecent.length >= OAUTH_LIMITS.registrationsPerSourcePerHour;
+      if (globalFull || sourceFull) {
+        const globalWait = globalFull ? Math.min(...recent) - hourAgo : 0;
+        const sourceWait = sourceFull ? Math.min(...sourceRecent) - hourAgo : 0;
+        const retryAfter = Math.max(1, Math.ceil(Math.max(globalWait, sourceWait) / 1000));
         return json(
           429,
           { error: 'too_many_requests', error_description: 'Too many client registrations. Try again later.' },
@@ -857,6 +879,8 @@ export class OAuthServer {
       await this.storage.put(`client:${record.client_id}`, { ...record, created_ms: now });
       recent.push(now);
       await this.storage.put('rl:register', recent);
+      sourceRecent.push(now);
+      await this.storage.put(sourceKey, { times: sourceRecent, expiresAt: now + 60 * 60 * 1000 });
       return json(201, record);
     });
   }

@@ -266,10 +266,10 @@ test('consent page: at most 10 pending requests per client and 50 overall', asyn
     code_challenge: pkcePair().challenge,
     code_challenge_method: 'S256',
   });
-  const clients = [];
-  for (let i = 0; i < 6; i += 1) clients.push((await (await register(t)).json()).client_id);
-  // Per client: 10, then refused, while another client still gets in.
   const source = (n) => ({ 'cf-connecting-ip': `198.51.100.${n}` });
+  const clients = [];
+  for (let i = 0; i < 6; i += 1) clients.push((await (await register(t, {}, source(i + 1))).json()).client_id);
+  // Per client: 10, then refused, while another client still gets in.
   for (let i = 0; i < 10; i += 1) assert.equal((await authorizeGet(t, params(clients[0]), source(1))).status, 200);
   const perClient = await authorizeGet(t, params(clients[0]), source(1));
   assert.equal(perClient.status, 429);
@@ -290,7 +290,9 @@ test('consent page: at most 10 pending requests per client and 50 overall', asyn
 test('consent page: one source cannot fill all slots through multiple public clients', async () => {
   const t = makeRelay();
   const clients = [];
-  for (let i = 0; i < 6; i += 1) clients.push((await (await register(t)).json()).client_id);
+  for (let i = 0; i < 6; i += 1) {
+    clients.push((await (await register(t, {}, { 'cf-connecting-ip': `198.51.100.${i + 1}` })).json()).client_id);
+  }
   const params = (clientId) => ({
     response_type: 'code', client_id: clientId, redirect_uri: CLAUDE_CALLBACK,
     code_challenge: pkcePair().challenge, code_challenge_method: 'S256',
