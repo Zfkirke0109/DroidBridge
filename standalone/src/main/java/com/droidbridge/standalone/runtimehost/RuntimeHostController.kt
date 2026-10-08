@@ -255,7 +255,10 @@ internal class RuntimeHostController(
                 NativeRuntime.nativeRecordHostFault("CLEANUP_UNVERIFIED", "app_guard_probe")
             }
             guardScopeSink.get()?.invoke()
-            if (!guardReady) return false
+            if (!guardReady) {
+                healthGate.withdraw(session, NativeHostHealth.ProbeFailed, HostHealthPhase.Admission)
+                return false
+            }
             completedStartupFence = fence
         }
         return healthGate.admissionCompleted(session)
