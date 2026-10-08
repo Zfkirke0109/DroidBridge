@@ -34,3 +34,4 @@ captures/
 # Secrets never belong in the tree; keep them outside the repository
 secrets/
 *.secret
+__pycache__/
