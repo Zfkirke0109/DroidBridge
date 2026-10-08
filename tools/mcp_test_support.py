@@ -143,6 +143,64 @@ def selected_verdict(attempts, selected):
     raise CheckFailed("Selected attempts have incompatible or unfinished verdicts")
 
 
+def save_visual_image(response, stem):
+    """Save the inline image from one successful visual response; never fetch it again."""
+    result = require_reply(response)
+    if not isinstance(result.get("image_ref"), str) or not result["image_ref"]:
+        raise CheckFailed("Visual result has no image reference")
+    images = [item for item in response["result"].get("content", [])
+              if isinstance(item, dict) and item.get("type") == "image"]
+    if len(images) != 1:
+        raise CheckFailed("Visual response must contain exactly one inline image")
+    image = images[0]
+    formats = {"image/jpeg": ("jpeg", ".jpg"), "image/png": ("png", ".png"),
+               "image/heic": ("heic", ".heic")}
+    if image.get("mimeType") not in formats:
+        raise CheckFailed("Visual image MIME type is unsupported")
+    format_name, suffix = formats[image["mimeType"]]
+    if result.get("image_format", format_name) != format_name:
+        raise CheckFailed("Visual image format disagrees with its MIME type")
+    try:
+        value = base64.b64decode(image["data"], validate=True)
+    except (ValueError, KeyError, TypeError) as error:
+        raise CheckFailed("Visual image is not valid base64") from error
+    if not value or len(value) > 8 * 1024 * 1024:
+        raise CheckFailed("Visual image exceeds its byte bound")
+    valid = {"jpeg": value.startswith(b"\xff\xd8") and value.endswith(b"\xff\xd9"),
+             "png": value.startswith(b"\x89PNG\r\n\x1a\n"),
+             "heic": len(value) >= 12 and value[4:8] == b"ftyp"}[format_name]
+    if not valid:
+        raise CheckFailed("Visual image bytes disagree with their MIME type")
+    destination = Path(stem).with_suffix(suffix)
+    with destination.open("xb") as output:
+        output.write(value)
+    return destination
+
+
+def _redacted(value, token, omit_images=False):
+    if isinstance(value, dict):
+        image_key = None
+        if omit_images:
+            if value.get("type") == "image":
+                image_key = "data"
+            elif isinstance(value.get("mimeType"), str) and value["mimeType"].startswith("image/"):
+                image_key = "blob"
+        result = {}
+        for key, item in value.items():
+            if key == image_key:
+                result[key + "_omitted"] = True
+                if isinstance(item, str):
+                    result["base64_chars"] = len(item)
+            else:
+                result[key.replace(token, "[REDACTED]")] = _redacted(item, token, omit_images)
+        return result
+    if isinstance(value, list):
+        return [_redacted(item, token, omit_images) for item in value]
+    if isinstance(value, str):
+        return value.replace(token, "[REDACTED]")
+    return value
+
+
 class Client:
     """No ADB or environment mutations; credentials come from the test operator."""
 
@@ -202,13 +260,13 @@ class Client:
             if isinstance(error, urllib.error.URLError):
                 response["transport_cause"] = type(error.reason).__name__
                 response["transport_errno"] = getattr(error.reason, "errno", None)
-        safe_response = json.loads(json.dumps(response).replace(self.token, "[REDACTED]"))
+        safe_response = _redacted(response, self.token)
         record = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "edition": self.edition,
                   "label": label or method, "request_id": request_id, "method": method,
                   "params": args, "http_status": status,
                   "elapsed_ms": round((time.monotonic() - started) * 1000, 1),
                   "response": safe_response}
-        safe_record = json.dumps(record).replace(self.token, "[REDACTED]")
+        safe_record = json.dumps(_redacted(record, self.token, omit_images=True))
         with (self.output / "calls.jsonl").open("a", encoding="utf-8") as log:
             log.write(safe_record + "\n")
         return safe_response

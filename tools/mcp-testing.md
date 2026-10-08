@@ -46,7 +46,10 @@ The runner uses an 80-second deadline with 20 seconds reserved for cleanup,
 reads 1024-byte pages and refuses a pre-existing device
 directory. It settles only owned Tasks, removes only its created directory and
 verifies NOT_FOUND. A failed cleanup prevents PASS. calls.jsonl preserves
-redacted calls; fixture-result.json separates cases, task outcomes and cleanup.
+redacted calls, omitting inline image data and image resource blobs while keeping
+their MIME type and Base64 character count. Structured results, references,
+errors and request timings remain available; fixture-result.json separates cases,
+task outcomes and cleanup.
 An output directory with an earlier result is refused instead of overwriting it.
 
 After all cases, the operator closes the managed server, removes only the
@@ -59,6 +62,33 @@ A pipe into nc over adb reverse may terminate before an HTTP response is read.
 Diagnose such a command with matching identity/command controls before changing
 the product's output collection. The capture case uses the already verified
 download mechanism instead of depending on nc's stdin EOF behavior.
+
+## Screenshot-only observation
+
+With an operator-assigned Client and an existing ignored output directory:
+
+```python
+from mcp_test_support import require_reply, save_visual_image
+
+response = client.call("visual", "observe",
+                       {"include_image": True, "include_nodes": False})
+observation = require_reply(response)
+image_path = save_visual_image(response, output / "screen-unique-run-id")
+```
+
+An observe response already includes the MCP image content block. Read that
+block directly; another visual.view call would transfer the same image again.
+save_visual_image checks the reply, image count, Base64, MIME and format signature,
+then creates a new .jpg, .png or .heic file without overwriting an existing file.
+It fails on a missing image instead of issuing a second request. The full image
+remains in the returned response; the transport log omits its Base64 data.
+Save screenshots only when needed and remove the run's images after inspection.
+
+For screenshot-only interaction, use coordinates in observation.display's native
+pixel dimensions. A preview may be scaled. Pass the current observation_id with
+coordinate actions and observe again after a screen, orientation or focus change.
+Keep recipient/body checks before sending and verify the app's resulting state;
+an accepted interaction does not prove the external action completed.
 
 ## Native wake regression
 

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from mcp_test_support import (CheckFailed, Client, capture_result, command_succeeded,
                               command_timed_out, filtered_packets, page_bytes,
-                              require_reply, selected_verdict, task_failed_with, task_record)
+                              require_reply, save_visual_image, selected_verdict, task_failed_with, task_record)
 from mcp_fixture_test import run
 
 
@@ -131,6 +131,127 @@ class TransportChecks(unittest.TestCase):
             log = (Path(temporary) / "calls.jsonl").read_text(encoding="utf-8")
             self.assertNotIn(token, log)
             self.assertIn("[REDACTED]", log)
+
+
+def image_response(value=b"\xff\xd8private-screen-data\xff\xd9", mime="image/jpeg"):
+    return {"result": {
+        "structuredContent": {"image_ref": "dbref:image:owned", "image_format": mime.split("/")[1]},
+        "content": [{"type": "image", "mimeType": mime,
+                     "data": base64.b64encode(value).decode("ascii")}],
+        "isError": False}}
+
+
+class VisualChecks(unittest.TestCase):
+    def test_one_observe_returns_the_image_and_log_omits_its_data(self):
+        original = image_response()
+        encoded = original["result"]["content"][0]["data"]
+
+        class Connection:
+            code = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                pass
+            def read(self, _):
+                return json.dumps(original).encode()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            token = "test-only-credential"
+            client = Client("root", {"root": {"port": 18766, "token": token}}, temporary)
+            def send(request, **_):
+                original["id"] = json.loads(request.data)["id"]
+                return Connection()
+            with patch.object(client.opener, "open", side_effect=send) as transport:
+                result = client.call("visual", "observe",
+                                     {"include_image": True, "include_nodes": False})
+                destination = save_visual_image(result, Path(temporary) / "screen")
+                transport.assert_called_once()
+            self.assertEqual(destination.suffix, ".jpg")
+            self.assertEqual(destination.read_bytes(), base64.b64decode(encoded))
+            self.assertEqual(result["result"]["content"][0]["data"], encoded)
+            record = json.loads((Path(temporary) / "calls.jsonl").read_text(encoding="utf-8"))
+            logged = record["response"]["result"]["content"][0]
+            self.assertNotIn("data", logged)
+            self.assertNotIn(encoded, json.dumps(record))
+            self.assertTrue(logged["data_omitted"])
+            self.assertEqual(logged["base64_chars"], len(encoded))
+            self.assertEqual(logged["mimeType"], "image/jpeg")
+            self.assertEqual(record["response"]["result"]["structuredContent"]["image_ref"],
+                             "dbref:image:owned")
+            self.assertEqual(record["http_status"], 200)
+            self.assertIsInstance(record["elapsed_ms"], (int, float))
+
+    def test_format_controls_extension_and_existing_file_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for mime, value, suffix in [
+                    ("image/jpeg", b"\xff\xd8example\xff\xd9", ".jpg"),
+                    ("image/png", b"\x89PNG\r\n\x1a\nexample", ".png"),
+                    ("image/heic", b"\x00\x00\x00\x18ftypheic", ".heic")]:
+                with self.subTest(mime=mime):
+                    result = image_response(value, mime)
+                    stem = Path(temporary) / mime.split("/")[1]
+                    destination = save_visual_image(result, stem)
+                    self.assertEqual(destination.suffix, suffix)
+                    self.assertEqual(destination.read_bytes(), value)
+                    with self.assertRaises(FileExistsError):
+                        save_visual_image(image_response(value[:-2] + b"replacement" + value[-2:], mime), stem)
+                    self.assertEqual(destination.read_bytes(), value)
+
+    def test_missing_multiple_invalid_or_mislabelled_images_are_rejected(self):
+        missing = image_response()
+        missing["result"]["content"] = []
+        multiple = image_response()
+        multiple["result"]["content"] *= 2
+        invalid = image_response()
+        invalid["result"]["content"][0]["data"] = "not base64!"
+        wrong_format = image_response()
+        wrong_format["result"]["structuredContent"]["image_format"] = "png"
+        unknown = image_response()
+        unknown["result"]["content"][0]["mimeType"] = "image/gif"
+        missing_ref = image_response()
+        missing_ref["result"]["structuredContent"].pop("image_ref")
+        refused = image_response()
+        refused["result"]["isError"] = True
+        with tempfile.TemporaryDirectory() as temporary:
+            for result in [missing, multiple, invalid, wrong_format, unknown, missing_ref,
+                           refused, image_response(b"PNG bytes", "image/png")]:
+                with self.subTest(result=result):
+                    with self.assertRaises(CheckFailed):
+                        save_visual_image(result, Path(temporary) / "screen")
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_image_resource_blob_is_omitted_without_changing_the_returned_bytes(self):
+        encoded = base64.b64encode(b"private-resource-image").decode()
+        class Connection:
+            code = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                pass
+            def read(self, _):
+                return json.dumps({
+                    "id": request_id,
+                    "result": {"contents": [
+                        {"uri": "dbref:image:owned", "mimeType": "image/png", "blob": encoded},
+                        {"uri": "dbref:data:owned", "mimeType": "application/octet-stream",
+                         "blob": "Zm9v"}]}}).encode()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            client = Client("root", {"root": {"port": 18766, "token": "test-only-credential"}}, temporary)
+            def send(request, **_):
+                nonlocal request_id
+                request_id = json.loads(request.data)["id"]
+                return Connection()
+            request_id = None
+            with patch.object(client.opener, "open", side_effect=send):
+                result = client.rpc("resources/read", {"uri": "dbref:image:owned"})
+            self.assertEqual(result["result"]["contents"][0]["blob"], encoded)
+            record = json.loads((Path(temporary) / "calls.jsonl").read_text(encoding="utf-8"))
+            logged = record["response"]["result"]["contents"]
+            self.assertNotIn("blob", logged[0])
+            self.assertEqual(logged[0]["base64_chars"], len(encoded))
+            self.assertTrue(logged[0]["blob_omitted"])
+            self.assertEqual(logged[1]["blob"], "Zm9v")
 
 
 class FixtureClient:
