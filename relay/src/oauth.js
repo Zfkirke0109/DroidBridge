@@ -726,7 +726,15 @@ export class OAuthServer {
     const clientId = param(form, 'client_id');
     if (!refreshToken) return tokenError(400, 'invalid_request', 'refresh_token and client_id are required.');
     const key = `rt:${await sha256Hex(refreshToken)}`;
-    const record = await this.storage.get(key);
+    const presentedFamilyId = refreshTokenFamily(refreshToken);
+    let record;
+    try {
+      record = await this.storage.get(key);
+    } catch {
+      // If this was a live token, a failed record read must not leave its access tokens
+      // authorized. The random family id carried in the token lets us withdraw it.
+      return this.#failClosedRefreshRead(presentedFamilyId);
+    }
     const now = this.relay.now();
     if (!record || record.used) {
       // A rotated refresh token came back: someone holds a copy. Revoke the whole grant. Its
@@ -735,8 +743,13 @@ export class OAuthServer {
       // and scope come with it, or none. Only a live grant counts: a family past its expiry
       // (its newest refresh token has expired, so none of its tokens is live) is just waiting
       // for the sweep, and there is nothing to revoke.
-      const familyId = record ? record.family : refreshTokenFamily(refreshToken);
-      const family = familyId ? await this.storage.get(`family:${familyId}`) : undefined;
+      const familyId = record ? record.family : presentedFamilyId;
+      let family;
+      try {
+        family = familyId ? await this.storage.get(`family:${familyId}`) : undefined;
+      } catch {
+        return this.#failClosedRefreshRead(familyId);
+      }
       if (family && typeof family.expiresAt === 'number' && family.expiresAt > now) {
         this.relay.hub.revokeFamily(familyId);
         await this.relay.grants.revokeFamily(familyId);
@@ -759,7 +772,12 @@ export class OAuthServer {
     if (record.client_id !== clientId) {
       return tokenError(400, 'invalid_grant', 'The refresh token was issued to another client.');
     }
-    const family = await this.storage.get(`family:${record.family}`);
+    let family;
+    try {
+      family = await this.storage.get(`family:${record.family}`);
+    } catch {
+      return this.#failClosedRefreshRead(record.family);
+    }
     if (!family) return tokenError(400, 'invalid_grant', 'The grant was revoked.');
     const resource = param(form, 'resource');
     if (resource !== undefined && normalizeResource(resource) !== family.resource) {
@@ -768,6 +786,19 @@ export class OAuthServer {
     await this.storage.put(key, { ...record, used: true });
     const tokens = await this.relay.grants.issue(family);
     return this.#tokenResponse(tokens, family.scope);
+  }
+
+  /**
+   * A failed read cannot prove whether a refresh token's family is still live. Remove the
+   * family's authority when its id is available, then give the same answer as an unknown token.
+   * @param {string | null | undefined} familyId
+   */
+  async #failClosedRefreshRead(familyId) {
+    if (familyId) {
+      this.relay.hub.revokeFamily(familyId);
+      await this.relay.grants.revokeFamily(familyId);
+    }
+    return tokenError(400, 'invalid_grant', 'The refresh token is not valid.');
   }
 
   /**

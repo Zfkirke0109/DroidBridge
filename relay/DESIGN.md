@@ -317,7 +317,8 @@ Follows the MCP 2026-07-28 authorization spec.
   grant and pairing record on device disconnect. A code or refresh replay deletes its family
   record before cleaning up token hashes. Access checks, refresh checks and the authorized-client
   count require a live family, so a cleanup failure or object restart cannot revive orphan tokens;
-  the next sweep removes them.
+  the next sweep removes them. If a refresh-token or family read fails, the relay withdraws the
+  family named by the token when possible and returns a generic invalid-grant answer.
 - **Replay detection survives trimming.** A presented refresh token with no record, or whose
   record is already used, counts as a replay when the grant it names (from its record, or else
   from the family id inside the token) is still live, that is, its family exists and has not

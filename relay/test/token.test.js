@@ -453,6 +453,69 @@ test('refresh replay commits revocation before a selective token-record read can
   }
 });
 
+test('a failed initial refresh-token record read withdraws the family named by the token', async () => {
+  const t = makeRelay();
+  const tokens = await obtainTokens(t);
+  assert.equal((await poll(t, 0)).status, 204);
+  const queued = mcp(t, tokens.access_token, toolsCall('initial-refresh-read-error'));
+  await waitFor(() => t.relay.hub.inspect().handoff === 1);
+  const originalGet = t.storage.get.bind(t.storage);
+  const refreshKey = `rt:${sha256HexSync(tokens.refresh_token)}`;
+  t.storage.get = async (key) => {
+    if (key === refreshKey) throw new Error('selective refresh-token read failure');
+    return originalGet(key);
+  };
+
+  const failed = await tokenPost(t, {
+    grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+  });
+  assert.equal(failed.status, 400);
+  assert.deepEqual(await failed.json(), {
+    error: 'invalid_grant', error_description: 'The refresh token is not valid.',
+  });
+  assert.equal((await promptly(queued)).status, 403);
+  assert.equal(t.storage.keys('family:').length, 0);
+  t.storage.get = originalGet;
+  assert.equal((await mcp(t, tokens.access_token, toolsCall())).status, 401);
+  assert.equal((await tokenPost(t, {
+    grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+  })).status, 400);
+});
+
+test('a failed refresh-family read withdraws both active-token and replayed-token grants', async () => {
+  for (const replayed of [false, true]) {
+    const t = makeRelay();
+    const tokens = await obtainTokens(t);
+    const rotated = replayed ? await (await tokenPost(t, {
+      grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+    })).json() : tokens;
+    assert.equal((await poll(t, 0)).status, 204);
+    const queued = mcp(t, rotated.access_token, toolsCall(`family-read-error-${replayed}`));
+    await waitFor(() => t.relay.hub.inspect().handoff === 1);
+    const originalGet = t.storage.get.bind(t.storage);
+    const familyKey = t.storage.keys('family:')[0];
+    t.storage.get = async (key) => {
+      if (key === familyKey) throw new Error('selective refresh-family read failure');
+      return originalGet(key);
+    };
+
+    const failed = await tokenPost(t, {
+      grant_type: 'refresh_token', refresh_token: tokens.refresh_token, client_id: tokens.clientId,
+    });
+    assert.equal(failed.status, 400, String(replayed));
+    assert.deepEqual(await failed.json(), {
+      error: 'invalid_grant', error_description: 'The refresh token is not valid.',
+    }, String(replayed));
+    assert.equal((await promptly(queued)).status, 403, String(replayed));
+    assert.equal(t.storage.keys('family:').length, 0, String(replayed));
+    t.storage.get = originalGet;
+    assert.equal((await mcp(t, rotated.access_token, toolsCall())).status, 401, String(replayed));
+    assert.equal((await tokenPost(t, {
+      grant_type: 'refresh_token', refresh_token: rotated.refresh_token, client_id: tokens.clientId,
+    })).status, 400, String(replayed));
+  }
+});
+
 test('a replayed refresh token withdraws only its family\'s queued commands', async () => {
   const t = makeRelay();
   const first = await obtainTokens(t);
