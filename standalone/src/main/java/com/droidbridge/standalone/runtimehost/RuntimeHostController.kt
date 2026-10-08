@@ -92,6 +92,7 @@ internal class RuntimeHostController(
     private val guardScopeSink = AtomicReference<(() -> Unit)?>(null)
     private val apkProjectionReleasedSink = AtomicReference<(() -> Unit)?>(null)
     private val platformGeneration = AtomicLong(0)
+    private var completedStartupFence: RuntimeFence? = null
     private val capabilityFacts = CapabilityFacts()
     private val deepProbeBudget = RuntimeDeepProbeBudget()
     private val maintenanceExecutor = AtomicReference<ExecutorService?>(null)
@@ -152,7 +153,7 @@ internal class RuntimeHostController(
                     }.getOrNull()
                     if (retried == "READY") {
                         healthGate.markInitialProbeHealthy(fence)
-                        return healthGate.admissionCompleted(observedSession)
+                        return completeStart(observedSession)
                     }
                 }
                 val failure = if (deep == NativeHostHealth.Healthy) NativeHostHealth.NotReady else deep
@@ -176,7 +177,7 @@ internal class RuntimeHostController(
                 }
                 healthGate.markInitialProbeHealthy(fence)
             }
-            return healthGate.admissionCompleted(observedSession)
+            return completeStart(observedSession)
         }
         if (!healthGate.mayEstablish()) return false
         // A reset in progress owns the store until it activates the fresh instance itself.
@@ -239,14 +240,25 @@ internal class RuntimeHostController(
             return false
         }
         healthGate.markInitialProbeHealthy(requireNotNull(activated.activeFence))
-        if (!healthGate.admissionCompleted(activated)) return false
-        recoverMaintenance()
-        val guard = File(application.applicationInfo.nativeLibraryDir, "libdroidbridge_exec_guard.so")
-        if (!NativeRuntime.nativeProbeAppGuard(guard.absolutePath)) {
-            NativeRuntime.nativeRecordHostFault("CLEANUP_UNVERIFIED", "app_guard_probe")
+        return completeStart(activated)
+    }
+
+    /** An initially deferred deep probe must still perform the once-per-instance guard setup. */
+    private fun completeStart(session: RuntimeSessionState): Boolean {
+        if (!healthGate.admissionCompleted(session)) return false
+        val fence = requireNotNull(session.activeFence)
+        if (completedStartupFence != fence) {
+            recoverMaintenance()
+            val guard = File(application.applicationInfo.nativeLibraryDir, "libdroidbridge_exec_guard.so")
+            val guardReady = NativeRuntime.nativeProbeAppGuard(guard.absolutePath)
+            if (!guardReady) {
+                NativeRuntime.nativeRecordHostFault("CLEANUP_UNVERIFIED", "app_guard_probe")
+            }
+            guardScopeSink.get()?.invoke()
+            if (!guardReady) return false
+            completedStartupFence = fence
         }
-        guardScopeSink.get()?.invoke()
-        return healthGate.admissionCompleted(activated)
+        return healthGate.admissionCompleted(session)
     }
 
     /**
