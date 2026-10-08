@@ -41,14 +41,14 @@ class I16RuntimeHealthDeviceGateTest {
     fun ordinaryTrafficNeverWithdrawsAHealthyApkRuntime() {
         withDebugRuntime { runtime ->
             awaitHealthyRuntime(runtime)
-            val faultsBefore = healthFaults()
+            val faultsBefore = healthFaultRecords()
             repeat(ORDINARY_CALLS) { index ->
                 served(submit(runtime, request("context", "status", JSONObject().put("detail", "full"))))
                 val command = served(submit(runtime, commandRequest("printf health-$index")))
                 assertEquals(command.toString(), "completed", command.getString("state"))
                 assertEquals(command.toString(), "health-$index", command.getString("stdout"))
             }
-            assertEquals("ordinary traffic created a health fault", faultsBefore, healthFaults())
+            assertEquals("ordinary traffic created a health fault", faultsBefore, healthFaultRecords())
         }
     }
 
@@ -56,7 +56,7 @@ class I16RuntimeHealthDeviceGateTest {
     fun aStaleLeaseIsRefusedRecordedAndReplacedByTheNextRequest() {
         withDebugRuntime { runtime ->
             awaitHealthyRuntime(runtime)
-            val faultsBefore = healthFaults().toSet()
+            val faultsBefore = healthFaultRecords().map { it.first }.toSet()
             val live = File(canonicalBase, "runtime-live.json")
             assertTrue("debug Runtime has no live lease", live.isFile)
             val stale = JSONObject(live.readText())
@@ -76,7 +76,9 @@ class I16RuntimeHealthDeviceGateTest {
             assertEquals(refused.toString(), "STALE_AUTHORITY", refused.getJSONObject("error").getString("code"))
             assertTrue(
                 "the stale lease was not recorded",
-                (healthFaults().toSet() - faultsBefore).contains("health_admission:lease_stale@g$generation"),
+                healthFaultRecords().any { (recordId, phase) ->
+                    recordId !in faultsBefore && phase == "health_admission:lease_stale@g$generation"
+                },
             )
             reportDiagnostic(runtime, "after_refusal")
 
@@ -106,14 +108,14 @@ class I16RuntimeHealthDeviceGateTest {
         }
     }
 
-    private fun healthFaults(): List<String> {
+    private fun healthFaultRecords(): List<Pair<String, String>> {
         val file = File(canonicalBase, "diagnostics/host.json")
         if (!file.exists()) return emptyList()
         val records = JSONObject(file.readText()).getJSONArray("records")
         return (0 until records.length())
             .map { records.getJSONObject(it) }
             .filter { it.getString("component") == "apk_runtime_health" }
-            .map { it.getString("phase") }
+            .map { it.getString("record_id") to it.getString("phase") }
     }
 
     private fun awaitHealthyRuntime(runtime: IDroidBridgeRuntime) {
