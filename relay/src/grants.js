@@ -5,7 +5,7 @@
  *
  * Keys (Durable Object storage):
  *   pairing               { hash, expiresAt }
- *   pending:<sha256(id)>  pending consent request, 10 min
+ *   pending:<sha256(id)>  pending consent request with salted source hash, 10 min
  *   code:<sha256(code)>   authorization code, 60 s (kept 10 more minutes for reuse detection,
  *                         and once redeemed for as long as the grant it started exists)
  *   at:<sha256(token)>    access token { family, client_id, resource, scope, expiresAt }

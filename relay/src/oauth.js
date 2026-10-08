@@ -47,6 +47,7 @@ export const OAUTH_LIMITS = Object.freeze({
   cimdCacheMax: 20,
   pendingMax: 50,
   pendingPerClientMax: 10,
+  pendingPerSourceMax: 10,
   clientsMax: 100,
   registrationsPerHour: 20,
   /** failed submissions before one consent request is discarded */
@@ -130,6 +131,27 @@ function parseScope(value) {
   const parts = value.split(' ').filter(Boolean);
   if (parts.some((part) => part !== SCOPE)) return null;
   return SCOPE;
+}
+
+/**
+ * Canonical IP from Cloudflare's edge header, or the shared fallback bucket. The edge supplies
+ * one address, never a forwarded chain; reject anything else instead of giving it a new quota.
+ * @param {string | null} value
+ */
+function sourceAddress(value) {
+  if (!value || value.length > 64) return 'unknown';
+  if (/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(value)) {
+    const octets = value.split('.');
+    if (octets.every((octet) => String(Number(octet)) === octet && Number(octet) <= 255)) return value;
+  }
+  if (value.includes(':') && /^[0-9a-f:.]+$/i.test(value)) {
+    try {
+      return new URL(`http://[${value}]/`).hostname.toLowerCase();
+    } catch {
+      // The header was not a valid IPv6 address.
+    }
+  }
+  return 'unknown';
 }
 
 /**
@@ -372,16 +394,17 @@ export class OAuthServer {
    * @param {string} origin
    */
   authorize(request, url, origin) {
-    if (request.method === 'GET') return this.#authorizeGet(url, origin);
+    if (request.method === 'GET') return this.#authorizeGet(request, url, origin);
     if (request.method === 'POST') return this.#authorizePost(request, url, origin);
     return methodNotAllowed(['GET', 'POST']);
   }
 
   /**
+   * @param {Request} request
    * @param {URL} url
    * @param {string} origin
    */
-  async #authorizeGet(url, origin) {
+  async #authorizeGet(request, url, origin) {
     const params = uniqueParams(url.searchParams);
     if (!params) {
       return messagePage(400, 'Invalid authorization request', 'A parameter was repeated in the authorization request.');
@@ -438,21 +461,32 @@ export class OAuthServer {
       return fail('invalid_target', `The resource must be ${origin}/mcp.`);
     }
 
+    // CF-Connecting-IP is set by Cloudflare's edge for ordinary incoming requests. A missing or
+    // malformed value shares one bounded fallback bucket. Never persist the raw address; the
+    // device-key hash is a deployment-specific secret salt for this short-lived pending record.
+    const source = sourceAddress(request.headers.get('cf-connecting-ip'));
+    const sourceHash = await sha256Hex(`${this.relay.config.deviceKeyHash}\0${source}`);
     await this.relay.maybeSweep();
     return this.relay.lock.run(async () => {
       const now = this.relay.now();
       let live = 0;
       let liveForClient = 0;
+      let liveForSource = 0;
       for (const [key, record] of await this.storage.list({ prefix: 'pending:' })) {
-        if (!record || record.expiresAt <= now) {
+        // Pre-upgrade requests have no source attribution. Remove those short-lived requests
+        // rather than letting a prefilled global cap block everyone until their TTL ends.
+        if (!record || record.expiresAt <= now || typeof record.sourceHash !== 'string') {
           await this.storage.delete(key);
           continue;
         }
         live += 1;
         if (record.client_id === client.client_id) liveForClient += 1;
+        if (record.sourceHash === sourceHash) liveForSource += 1;
       }
-      // A global cap, and a per-client cap so one client cannot take every slot.
-      if (live >= OAUTH_LIMITS.pendingMax || liveForClient >= OAUTH_LIMITS.pendingPerClientMax) {
+      // Keep the storage cap, while one public source or client cannot take every slot.
+      if (live >= OAUTH_LIMITS.pendingMax ||
+          liveForClient >= OAUTH_LIMITS.pendingPerClientMax ||
+          liveForSource >= OAUTH_LIMITS.pendingPerSourceMax) {
         return messagePage(
           429,
           'Too many waiting requests',
@@ -469,6 +503,7 @@ export class OAuthServer {
         state,
         resource,
         scope,
+        sourceHash,
         attempts: 0,
         expiresAt: now + TTL.pendingMs,
       };

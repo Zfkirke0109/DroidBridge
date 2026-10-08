@@ -269,20 +269,77 @@ test('consent page: at most 10 pending requests per client and 50 overall', asyn
   const clients = [];
   for (let i = 0; i < 6; i += 1) clients.push((await (await register(t)).json()).client_id);
   // Per client: 10, then refused, while another client still gets in.
-  for (let i = 0; i < 10; i += 1) assert.equal((await authorizeGet(t, params(clients[0]))).status, 200);
-  const perClient = await authorizeGet(t, params(clients[0]));
+  const source = (n) => ({ 'cf-connecting-ip': `198.51.100.${n}` });
+  for (let i = 0; i < 10; i += 1) assert.equal((await authorizeGet(t, params(clients[0]), source(1))).status, 200);
+  const perClient = await authorizeGet(t, params(clients[0]), source(1));
   assert.equal(perClient.status, 429);
   assert.equal(perClient.headers.get('location'), null);
-  assert.equal((await authorizeGet(t, params(clients[1]))).status, 200);
+  assert.equal((await authorizeGet(t, params(clients[1]), source(2))).status, 200);
   // Overall: 50.
-  for (let i = 0; i < 9; i += 1) assert.equal((await authorizeGet(t, params(clients[1]))).status, 200);
-  for (const clientId of clients.slice(2, 5)) {
-    for (let i = 0; i < 10; i += 1) assert.equal((await authorizeGet(t, params(clientId))).status, 200);
+  for (let i = 0; i < 9; i += 1) assert.equal((await authorizeGet(t, params(clients[1]), source(2))).status, 200);
+  for (const [index, clientId] of clients.slice(2, 5).entries()) {
+    for (let i = 0; i < 10; i += 1) assert.equal((await authorizeGet(t, params(clientId), source(index + 3))).status, 200);
   }
   assert.equal(t.storage.keys('pending:').length, 50);
-  assert.equal((await authorizeGet(t, params(clients[5]))).status, 429);
+  assert.equal((await authorizeGet(t, params(clients[5]), source(6))).status, 429);
   await t.clock.advance(10 * 60 * 1000);
-  assert.equal((await authorizeGet(t, params(clients[0]))).status, 200, 'expired requests are pruned first');
+  assert.equal((await authorizeGet(t, params(clients[0]), source(1))).status, 200, 'expired requests are pruned first');
+  assert.equal(t.storage.keys('pending:').length, 1);
+});
+
+test('consent page: one source cannot fill all slots through multiple public clients', async () => {
+  const t = makeRelay();
+  const clients = [];
+  for (let i = 0; i < 6; i += 1) clients.push((await (await register(t)).json()).client_id);
+  const params = (clientId) => ({
+    response_type: 'code', client_id: clientId, redirect_uri: CLAUDE_CALLBACK,
+    code_challenge: pkcePair().challenge, code_challenge_method: 'S256',
+  });
+  const attacker = { 'cf-connecting-ip': '198.51.100.10' };
+  const legitimate = { 'cf-connecting-ip': '203.0.113.25' };
+  for (let i = 0; i < 10; i += 1) {
+    assert.equal((await authorizeGet(t, params(clients[0]), attacker)).status, 200);
+  }
+  for (const clientId of clients.slice(1, 5)) {
+    assert.equal((await authorizeGet(t, params(clientId), attacker)).status, 429);
+  }
+  assert.equal(t.storage.keys('pending:').length, 10);
+  assert.equal((await authorizeGet(t, params(clients[5]), legitimate)).status, 200);
+  assert.equal(t.storage.keys('pending:').length, 11);
+  for (const key of t.storage.keys('pending:')) {
+    const record = await t.storage.get(key);
+    assert.equal(typeof record.sourceHash, 'string');
+    assert.equal(record.sourceHash.length, 64);
+    assert.ok(!JSON.stringify(record).includes('198.51.100.10'), 'no raw client IP is persisted');
+  }
+});
+
+test('consent page: missing or malformed edge IP shares a bounded fallback bucket', async () => {
+  const t = makeRelay();
+  const a = (await (await register(t)).json()).client_id;
+  const b = (await (await register(t)).json()).client_id;
+  const params = (clientId) => ({
+    response_type: 'code', client_id: clientId, redirect_uri: CLAUDE_CALLBACK,
+    code_challenge: pkcePair().challenge, code_challenge_method: 'S256',
+  });
+  for (let i = 0; i < 10; i += 1) assert.equal((await authorizeGet(t, params(a))).status, 200);
+  assert.equal((await authorizeGet(t, params(b), { 'cf-connecting-ip': 'not-an-ip' })).status, 429);
+  assert.equal((await authorizeGet(t, params(b), { 'cf-connecting-ip': '999.999.999.999' })).status, 429);
+  assert.equal((await authorizeGet(t, params(b), { 'cf-connecting-ip': '203.0.113.26' })).status, 200);
+  assert.equal((await authorizeGet(t, params(b), { 'cf-connecting-ip': '2001:db8::26' })).status, 200);
+});
+
+test('consent page: pre-upgrade pending records cannot keep the global cap full', async () => {
+  const t = makeRelay();
+  const clientId = (await (await register(t)).json()).client_id;
+  for (let i = 0; i < 50; i += 1) {
+    await t.storage.put(`pending:legacy-${i}`, { client_id: 'old-client', expiresAt: t.clock.now() + 600_000 });
+  }
+  const page = await authorizeGet(t, {
+    response_type: 'code', client_id: clientId, redirect_uri: CLAUDE_CALLBACK,
+    code_challenge: pkcePair().challenge, code_challenge_method: 'S256',
+  }, { 'cf-connecting-ip': '203.0.113.27' });
+  assert.equal(page.status, 200);
   assert.equal(t.storage.keys('pending:').length, 1);
 });
 test('revoke: tokens stop working, clients are removed, status shows 0 authorized clients', async () => {

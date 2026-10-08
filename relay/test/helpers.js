@@ -295,9 +295,10 @@ export function authorizeQuery(params) {
 /**
  * @param {ReturnType<typeof makeRelay>} t
  * @param {Record<string, string | undefined>} params
+ * @param {Record<string, string>} [headers]
  */
-export function authorizeGet(t, params) {
-  return t.relay.fetch(req(authorizeQuery(params)));
+export function authorizeGet(t, params, headers = {}) {
+  return t.relay.fetch(req(authorizeQuery(params), { headers }));
 }
 
 /** @param {string} html */

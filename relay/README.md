@@ -77,6 +77,9 @@ start connecting again from Claude. Wrong entries on another client's page canno
 phone's code. A wrong code and a missing or expired one get the same message, so the
 page never reveals whether a pairing code is active. Only allow a consent page that you opened
 yourself by connecting Claude: whoever started the flow receives the access.
+The relay allows 10 waiting consent pages per client and per Cloudflare source IP, and 50 overall.
+If Cloudflare does not supply a usable source IP, those requests share one 10-page bucket. People
+behind one network address may share the limit; a distributed flood can still fill the global cap.
 
 ## Revoke access
 

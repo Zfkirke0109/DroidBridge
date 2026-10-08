@@ -501,7 +501,9 @@ test('CIMD: the document cache holds at most 20 entries', async () => {
     new Response(JSON.stringify({ client_id: url, redirect_uris: [CLAUDE_CALLBACK] }));
   const t = makeRelay({ fetchFn });
   for (let i = 0; i < 25; i += 1) {
-    const res = await authorizeGet(t, cimdParams(`https://claude.ai/clients/${i}`));
+    const res = await authorizeGet(t, cimdParams(`https://claude.ai/clients/${i}`), {
+      'cf-connecting-ip': `203.0.113.${1 + Math.floor(i / 10)}`,
+    });
     assert.equal(res.status, 200);
     await t.clock.advance(1000);
   }

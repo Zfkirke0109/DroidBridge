@@ -274,7 +274,15 @@ Follows the MCP 2026-07-28 authorization spec.
   client and its redirect host, asking for the pairing code shown in DroidBridge. The code is
   8 characters of Crockford base32 (shown `XXXX-XXXX`, 40 bits), lives at most 10 minutes, is
   single-use. Each consent request is discarded after 3 failed attempts, and at most 10
-  requests per client (50 in all) wait at once.
+  requests per client or Cloudflare source IP (50 in all) wait at once. The relay stores only
+  a device-key-salted SHA-256 of the source IP in each pending request, never the raw address;
+  it is deleted when the request is answered or expires within 10 minutes. Missing or malformed
+  `CF-Connecting-IP` values share one 10-request fallback bucket. Pre-upgrade pending records
+  without source attribution are discarded when the next consent page is opened.
+  Cloudflare normally sets this header at the edge; same-zone Worker subrequests can derive it
+  from a script-modifiable `x-real-ip`, while cross-zone Worker subrequests share Cloudflare's
+  Worker client IP. People behind one NAT may share a bucket, and distributed sources can still
+  fill the 50-request global cap. The global 20-per-hour client-registration cap is separate.
   The page answers a wrong code and a missing or expired pairing code identically, so it never
   reveals whether a pairing is active. The phone sends the relay only the code's SHA-256 (of
   the normalized uppercase code without the dash), and that hash is all the relay stores. The
